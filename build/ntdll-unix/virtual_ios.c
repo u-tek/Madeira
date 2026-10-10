@@ -2882,13 +2882,41 @@ int ios_fast_footprint = 0;                    /* ml670: set when d3d11 loads */
  */
 void *ios_jit_teb_trampoline = NULL;  /* RX address of slot 0 trampoline (offset 8) */
 #define IOS_JIT_TRAMPOLINE_SIZE 16    /* Bytes per trampoline slot */
-#define IOS_JIT_MAX_SLOTS 256         /* Max threads with trampolines */
+#define IOS_JIT_MAX_SLOTS 1024        /* the whole reserved 16KB page: 0x4000 / 16 */
 static volatile int32_t ios_jit_next_slot = 0;  /* Next slot to allocate */
+/* Slots released by exited threads (ios_jit_free_trampoline_slot). Slots were
+ * held for the life of the app: past 256 every new thread got slot 0 and wrote
+ * its TEB over slot 0's, so a signal return through slot 0 loaded ANOTHER
+ * thread's TEB into x18. Stellar Blade starts ~1,300 threads in 2.5 minutes. */
+static volatile uint8_t ios_jit_slot_freed[IOS_JIT_MAX_SLOTS];
+
+/* An exited thread's slot, found by the TEB it holds. Slot 0 stays reserved. */
+void ios_jit_free_trampoline_slot( uintptr_t teb )
+{
+    int slot, n = ios_jit_next_slot;
+
+    if (!ios_jit_rw_base_global || !teb) return;
+    if (n > IOS_JIT_MAX_SLOTS) n = IOS_JIT_MAX_SLOTS;
+    for (slot = 1; slot < n; slot++)
+    {
+        volatile uint64_t *teb_slot = (volatile uint64_t *)((char *)ios_jit_rw_base_global + slot * 16);
+        if (*teb_slot != teb) continue;
+        *teb_slot = 0;
+        __sync_synchronize();
+        ios_jit_slot_freed[slot] = 1;
+    }
+}
 
 /* Allocate a per-thread trampoline slot. Returns slot index (0-based). */
 int ios_jit_alloc_trampoline_slot(void)
 {
-    int slot = __sync_fetch_and_add(&ios_jit_next_slot, 1);
+    int slot, n = ios_jit_next_slot;
+
+    if (n > IOS_JIT_MAX_SLOTS) n = IOS_JIT_MAX_SLOTS;
+    for (slot = 1; slot < n; slot++)
+        if (ios_jit_slot_freed[slot] && __sync_bool_compare_and_swap( &ios_jit_slot_freed[slot], 1, 0 ))
+            return slot;   /* its code words are already in place */
+    slot = __sync_fetch_and_add(&ios_jit_next_slot, 1);
     if (slot >= IOS_JIT_MAX_SLOTS) return 0;  /* fallback to slot 0 */
 
     /* Write trampoline code to this slot's RW view */

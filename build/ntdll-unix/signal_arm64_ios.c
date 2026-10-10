@@ -540,7 +540,7 @@ static __thread int ios_my_slot = -1;
  * ntdll pool copy — services.exe died in LdrShutdownThread with wm=NULL that
  * way (ml383). The lookup also iterated to ios_thread_count (92+), reading
  * past the 64-entry array. */
-#define IOS_MAX_WINE_THREADS 512
+#define IOS_MAX_WINE_THREADS 2048
 
 struct ios_thread_entry {
     thread_t mach_thread;
@@ -6243,6 +6243,19 @@ static void ios_setup_mach_exception_handler( thread_t pe_thread, uintptr_t teb,
     if (reg_count > IOS_MAX_WINE_THREADS) reg_count = IOS_MAX_WINE_THREADS;
     for (idx = 0; idx < reg_count; idx++)
         if (ios_thread_registry[idx].mach_thread == pe_thread) break;
+    if (idx == reg_count)
+    {
+        /* Reuse a slot signal_free_thread released. Slots used to be held for
+         * the life of the app: Stellar Blade creates ~1,300 threads in two and a
+         * half minutes with ~130 alive, the table filled at 512, and every later
+         * thread's Mach faults resolved to slot 0's TEB. The game stalled with
+         * the loader lock held by one of those threads. The CAS on teb claims
+         * the slot against a concurrent registration. */
+        for (idx = 0; idx < reg_count; idx++)
+            if (!ios_thread_registry[idx].mach_thread && !ios_thread_registry[idx].teb &&
+                __sync_bool_compare_and_swap( &ios_thread_registry[idx].teb, (uintptr_t)0, teb ))
+                break;
+    }
     if (idx == reg_count)
     {
         idx = __sync_fetch_and_add(&ios_thread_count, 1);
@@ -13452,6 +13465,23 @@ NTSTATUS signal_alloc_thread( TEB *teb )
  */
 void signal_free_thread( TEB *teb )
 {
+    /* The thread is gone (joined, its TEB being freed): release its Mach
+     * registry slot for reuse. mach_thread first, so a lookup never pairs the
+     * old port with a cleared or new TEB; teb last, which frees the slot. */
+    extern void ios_jit_free_trampoline_slot( uintptr_t teb );
+    int i, n = ios_thread_count;
+
+    ios_jit_free_trampoline_slot( (uintptr_t)teb );
+    if (n > IOS_MAX_WINE_THREADS) n = IOS_MAX_WINE_THREADS;
+    for (i = 0; i < n; i++)
+    {
+        if (ios_thread_registry[i].teb != (uintptr_t)teb) continue;
+        ios_thread_registry[i].mach_thread = 0;
+        __sync_synchronize();
+        ios_thread_registry[i].trampoline = NULL;
+        __sync_synchronize();
+        ios_thread_registry[i].teb = 0;
+    }
 }
 
 
