@@ -2126,8 +2126,18 @@ static void *ios_mach_exception_thread( void *arg )
             int srcwatch_hit = ios_srcwatch_handle( &state, fault_addr );
             if (srcwatch_hit) handled = 1;
 
-            /* 1. Redirect user_shared_data accesses (0x7FFE0000) */
-            if (!srcwatch_hit && fault_addr >= 0x7FFE0000 && fault_addr < 0x7FFF0000 && ios_exc_usd)
+            /* 1. Redirect user_shared_data accesses (0x7FFE0000)
+             *
+             * Only when nothing above serviced the fault. This rewrites EVERY
+             * register that holds 0x7FFE****, guest registers included, and it
+             * used to run after the ml953 sub-floor service had already
+             * emulated the access. Stellar Blade's DRM keeps the KUSER pointer
+             * 0x7ffe02e8 in r15: the rewrite turned it into 0x70380002e8, the
+             * guest then did 32-bit arithmetic on it and read 0x38000270
+             * (unmapped) -> c0000005. The sub-floor service leaves the guest's
+             * registers alone, so the old rewrite is now only a fallback for
+             * encodings that service does not cover. */
+            if (!handled && !srcwatch_hit && fault_addr >= 0x7FFE0000 && fault_addr < 0x7FFF0000 && ios_exc_usd)
             {
                 for (int reg = 0; reg <= 28; reg++)
                 {
@@ -9154,6 +9164,25 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * Find the register holding 0x7FFE* and replace with real address. */
         {
             uintptr_t fault_addr = (uintptr_t)siginfo->si_addr;
+            if (fault_addr >= 0x7FFE0000 && fault_addr < 0x7FFF0000)
+            {
+                extern void *ios_jit_rx_base_global;
+                extern size_t ios_jit_pool_size_global;
+                uintptr_t usd_rx = (uintptr_t)ios_jit_rx_base_global;
+
+                /* The ml952 window first, as in the Mach handler: it emulates
+                 * the one access and leaves every other register holding
+                 * 0x7FFE**** as the guest wrote it (see "1. Redirect
+                 * user_shared_data" there). Pool PCs stay on the old path, as
+                 * in the ml938 block below (x17 clobber). */
+                if (!(usd_rx && (uintptr_t)pc >= usd_rx && (uintptr_t)pc < usd_rx + ios_jit_pool_size_global) &&
+                    ios_subfloor_service( context, siginfo->si_addr, "segv", ios_jit_current_peb() ))
+                {
+                    PC_sig(context) = PC_sig(context) + 4;
+                    ios_fixup_x18_for_return( context );
+                    return;
+                }
+            }
             if (fault_addr >= 0x7FFE0000 && fault_addr < 0x7FFF0000)
             {
                 extern struct _KUSER_SHARED_DATA *user_shared_data;
