@@ -23216,10 +23216,22 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
              * now what the pool can actually afford: up to 128 MB (the branch
              * range FEX itself limits a buffer to) while HEAD_RESERVE stays free
              * between the image head and the tail. */
-            enum { TAIL_SMALL = 0x1000000, TAIL_MAX = 0x8000000, HEAD_RESERVE = 48u * 1024 * 1024 };
+            enum { TAIL_SMALL = 0x1000000, TAIL_MAX = 0x8000000 };
+            /* madeira.cfg env.MADEIRA_POOL_HEAD_RESERVE_MB (default 48): pool kept
+             * free for image copies before a code buffer may grow past TAIL_SMALL.
+             * A larger reserve trades FEX retranslation for room to load DLLs:
+             * Stellar Blade under Steam ran the head out at 688MB of a 784MB pool
+             * while the tail held 96MB, and the failed imm32.dll load killed it. */
+            static size_t head_reserve;
+            if (!head_reserve)
+            {
+                const char *e = getenv( "MADEIRA_POOL_HEAD_RESERVE_MB" );
+                long mb = e ? strtol( e, NULL, 10 ) : 0;
+                head_reserve = (size_t)(mb > 0 ? mb : 48) << 20;
+            }
             size_t head_now = jit_pool_offset, tail_now = ios_jit_tail_reserved;
-            size_t room = ios_jit_pool_size_global > head_now + tail_now + HEAD_RESERVE
-                        ? ios_jit_pool_size_global - head_now - tail_now - HEAD_RESERVE : 0;
+            size_t room = ios_jit_pool_size_global > head_now + tail_now + head_reserve
+                        ? ios_jit_pool_size_global - head_now - tail_now - head_reserve : 0;
             size_t cap = TAIL_SMALL;
             while (cap < TAIL_MAX && cap * 2 <= room) cap *= 2;
             /* A retired generation of this size already sitting on the carve
