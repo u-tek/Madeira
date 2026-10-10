@@ -13,12 +13,14 @@ OBJ_DIR="$BUILD_DIR/obj"
 mkdir -p "$OBJ_DIR"
 
 # Copy the base library if we don't have one yet
+BUILD_BASE=0
 if [ ! -f "$OBJ_DIR/libwineserver.a" ]; then
     if [ -f "$APP_LIB" ]; then
         cp "$APP_LIB" "$OBJ_DIR/libwineserver.a"
     else
-        echo "ERROR: No base libwineserver.a found"
-        exit 1
+        # A fresh checkout has none (it is gitignored): built below from the
+        # upstream server sources, once REPLACEMENTS says which ones are ours.
+        BUILD_BASE=1
     fi
 fi
 
@@ -189,6 +191,30 @@ REPLACEMENTS=(
     "hidpad_ios.o:hidpad_ios.o"     # ml2101
     "hidparse_ios.o:hidparse_ios.o" # ml2101
 )
+
+# The base archive for a fresh checkout: every source of wine/server/Makefile.in
+# that REPLACEMENTS does not swap out, built with the same flags. All failures
+# are listed before exiting.
+if [ "$BUILD_BASE" = 1 ]; then
+    echo "=== Building the base libwineserver.a from $WINE_SRC/server ==="
+    REPLACED=" "
+    for entry in "${REPLACEMENTS[@]}"; do REPLACED+="${entry##*:} "; done
+    BASE_DIR="$OBJ_DIR/base"
+    rm -rf "$BASE_DIR" && mkdir -p "$BASE_DIR"
+    BASE_FAILED=""
+    for src in $(sed -n '/^SOURCES = /,/^$/p' "$WINE_SRC/server/Makefile.in" | grep -oE '[A-Za-z0-9_]+\.c'); do
+        obj="${src%.c}.o"
+        case "$REPLACED" in *" $obj "*) continue ;; esac
+        echo -n "  base $obj... "
+        if xcrun -sdk iphoneos clang "${CC_FLAGS[@]}" -c "$WINE_SRC/server/$src" -o "$BASE_DIR/$obj" 2>"$BASE_DIR/${obj%.o}.err"; then
+            echo "OK"
+        else
+            echo "FAILED"; cat "$BASE_DIR/${obj%.o}.err"; BASE_FAILED+=" $src"
+        fi
+    done
+    [ -z "$BASE_FAILED" ] || { echo "ERROR: base sources failed:$BASE_FAILED"; exit 1; }
+    ar rcs "$OBJ_DIR/libwineserver.a" "$BASE_DIR"/*.o
+fi
 
 for entry in "${REPLACEMENTS[@]}"; do
     new_obj="${entry%%:*}"

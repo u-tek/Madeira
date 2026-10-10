@@ -11,6 +11,8 @@ DD="$R/build/xcode-derived"
 # Folder references the project expects; WoW64 (i386-windows) is not built here
 # yet, and x86_64-vcruntime is optional (tools/fetch-vcruntime.md).
 mkdir -p "$R/app/Madeira/i386-windows" "$R/app/Madeira/x86_64-vcruntime"
+# The generated licence copies (gitignored); the build fails without them.
+bash "$R/build/stage-licenses.sh"
 
 xcodebuild -project "$R/app/Madeira.xcodeproj" -scheme Madeira -configuration Debug \
     -destination 'generic/platform=iOS' -derivedDataPath "$DD" \

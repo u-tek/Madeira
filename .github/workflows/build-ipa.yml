@@ -2,7 +2,7 @@ name: Build IPA
 
 on:
   push:
-    branches: [main, ci]
+    branches: [main, ci, pool-high]
     paths-ignore: ['docs/**', '**/*.md']
   workflow_dispatch:
 
@@ -13,13 +13,15 @@ concurrency:
 env:
   # CMake 4 refuses projects that declare a minimum below 3.5 (some of FEX's externals do).
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  # The Xcode the 0.1.3 release was built with (its Info.plist: DTXcodeBuild 27A266a,
+  # iphoneos27.0); the code uses iOS 27 SDK declarations.
+  DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
   LLVM_MINGW: llvm-mingw-20260421-ucrt-macos-universal
 
 jobs:
   llvm:
     name: LLVM 15 for iOS
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
@@ -48,7 +50,7 @@ jobs:
   build:
     name: Madeira IPA
     needs: llvm
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 300
     permissions:
       contents: write
@@ -152,9 +154,10 @@ jobs:
           path: FEX/build-ios
           key: fex-ios-${{ steps.rev.outputs.FEX }}-${{ hashFiles('build/fex-ios/build.sh') }}
       - name: FEX (iOS)
-        if: steps.fex.outputs.cache-hit != 'true'
+        id: fexbuild
+        if: ${{ !cancelled() && steps.fex.outputs.cache-hit != 'true' }}
         run: bash build/fex-ios/build.sh
-      - if: steps.fex.outputs.cache-hit != 'true'
+      - if: ${{ !cancelled() && steps.fexbuild.outcome == 'success' }}
         uses: actions/cache/save@v4
         with:
           path: FEX/build-ios
@@ -168,9 +171,10 @@ jobs:
             wine/build-arm64ec
           key: wine-trees-${{ steps.rev.outputs.wine }}-${{ hashFiles('ci/wine-trees.sh') }}
       - name: Wine build trees
-        if: steps.winetrees.outputs.cache-hit != 'true'
+        id: winebuild
+        if: ${{ !cancelled() && steps.winetrees.outputs.cache-hit != 'true' }}
         run: bash ci/wine-trees.sh
-      - if: steps.winetrees.outputs.cache-hit != 'true'
+      - if: ${{ !cancelled() && steps.winebuild.outcome == 'success' }}
         uses: actions/cache/save@v4
         with:
           path: |
@@ -178,6 +182,7 @@ jobs:
             wine/build-arm64ec
           key: wine-trees-${{ steps.rev.outputs.wine }}-${{ hashFiles('ci/wine-trees.sh') }}
       - name: Wine aarch64 programs
+        if: ${{ !cancelled() }}
         run: |
           for p in plugplay svchost winedevice; do
             toolchains/$LLVM_MINGW/bin/aarch64-w64-mingw32-strip --strip-debug \
@@ -185,20 +190,26 @@ jobs:
           done
 
       - name: Wine unix side
+        if: ${{ !cancelled() }}
         run: |
+          # wineserver's symbol renames use llvm-objcopy (Mach-O capable); llvm-mingw has one.
+          export PATH="$PATH:$PWD/toolchains/$LLVM_MINGW/bin"
           bash build/ntdll-unix/build.sh
           bash build/wineserver/build.sh
           bash build/win32u-unix/build.sh
 
       - name: In-app pairing (Rust)
+        if: ${{ !cancelled() }}
         run: bash build/rppairing-ios/build.sh
 
       - name: DXMT unix side
+        if: ${{ !cancelled() }}
         run: |
           bash build/dxmt-ios/build.sh
           bash ci/dxmt-combined.sh
 
       - name: Madeira Dock
+        if: ${{ !cancelled() }}
         run: bash build/madeira-dock/build.sh
 
       - name: App
@@ -215,7 +226,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "build-${{ github.run_number }}" "Madeira-${{ steps.rev.outputs.short }}.ipa" \
-            --prerelease --target "${{ github.sha }}" --title "Build ${{ github.run_number }} (${{ steps.rev.outputs.short }})" \
+            --prerelease --target "${{ github.sha }}" --title "Build ${{ github.run_number }} ${{ github.ref_name }} (${{ steps.rev.outputs.short }})" \
             --notes "Unsigned CI build of ${{ github.ref_name }} at ${{ github.sha }}. Sideload with AltStore over the existing Madeira (same bundle ID, keeps games and saves)."
 
       - name: Logs on failure
@@ -225,6 +236,8 @@ jobs:
           name: logs-${{ github.run_number }}
           path: |
             build/*/obj/*.err
+            build/*/obj/*.txt
+            build/*/obj/base/*.err
             wine/build-*/config.log
             FEX/build-ios/CMakeFiles/*.log
             toolchains/llvm-ios-build/CMakeFiles/*.log
