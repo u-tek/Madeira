@@ -215,7 +215,7 @@ struct ios_pool_alloc
 static struct ios_pool_alloc ios_pool_ledger[IOS_POOL_LEDGER_MAX];
 static int ios_pool_ledger_count;
 
-#define IOS_POOL_FREE_MAX 256
+#define IOS_POOL_FREE_MAX 1024   /* per-block anon RWX releases land here too */
 #define IOS_POOL_REUSE_GRACE_SEC 3
 /* Darwin madvise: MADV_FREE marks pages volatile; MADV_FREE_REUSE is the
  * documented cancel. Guard for older SDK headers. */
@@ -3695,6 +3695,81 @@ int ios_jit_anon_alias_add(void *user_va, size_t size, void *jit_rw_alias)
     }
     pthread_mutex_unlock( &ios_pool_lock );
     return 1;
+}
+
+/* The RW alias of the anonymous RWX block that starts at user_va, or 0. */
+static uintptr_t ios_jit_anon_alias_rw_for( const void *user_va )
+{
+    int i, n = ios_jit_anon_alias_count;
+
+    for (i = 0; i < n; i++)
+        if (ios_jit_anon_aliases[i].user_va == (uintptr_t)user_va && ios_jit_anon_aliases[i].user_va_end)
+            return ios_jit_anon_aliases[i].jit_rw_alias;
+    return 0;
+}
+
+/* The guest released an anonymous RWX block: retire its alias and put its pool
+ * range on the free list (after the usual reuse grace), as RECLAIM does when a
+ * process exits. Pool ranges used to come back only then, so a live process
+ * leaked one per freed block: Stellar Blade gives every thread a 1 MB RWX block,
+ * its threads come and go, the 936 MB pool ran out ~90 s in, and from then on
+ * every new thread's block failed, the thread died and was replaced -- ~30
+ * thread creations a second for the rest of the session. rw_alias is the alias
+ * read before the free, so a block registered at the same VA since is left
+ * alone; a partial release (the block not wholly inside it) keeps the range. */
+static void ios_jit_anon_alias_release( const void *user_va, size_t freed, uintptr_t rw_alias )
+{
+    extern void *ios_jit_rw_base_global;
+    static unsigned long released_n;
+    size_t off, size = 0;
+    int i, j, found = 0;
+
+    if (!rw_alias || !ios_jit_rw_base_global || rw_alias < (uintptr_t)ios_jit_rw_base_global) return;
+    off = rw_alias - (uintptr_t)ios_jit_rw_base_global;
+
+    pthread_mutex_lock( &ios_pool_lock );
+    for (i = 0; i < ios_jit_anon_alias_count; i++)
+    {
+        if (ios_jit_anon_aliases[i].user_va != (uintptr_t)user_va ||
+            ios_jit_anon_aliases[i].jit_rw_alias != rw_alias) continue;
+        if (ios_jit_anon_aliases[i].user_va_end > (uintptr_t)user_va + freed) break;   /* partial */
+        ios_jit_anon_aliases[i].user_va_end = 0;
+        __sync_synchronize();
+        ios_mono_alias_retire( ios_jit_anon_aliases[i].user_va );
+        ios_jit_anon_aliases[i].user_va = 0;
+        ios_jit_anon_alias_live--;
+        found = 1;
+        break;
+    }
+    if (found)
+    {
+        for (j = 0; j < ios_pool_ledger_count; j++)
+        {
+            if (ios_pool_ledger[j].off != off) continue;
+            size = ios_pool_ledger[j].size;
+            if (ios_pool_free_count < IOS_POOL_FREE_MAX)
+            {
+                ios_pool_freelist[ios_pool_free_count].off = off;
+                ios_pool_freelist[ios_pool_free_count].size = size;
+                ios_pool_freelist[ios_pool_free_count].freed_at = time( NULL );
+                ios_pool_freelist[ios_pool_free_count].advised = 0;
+                ios_pool_free_count++;
+            }
+            else
+            {
+                dprintf( 2, "[jit-pool] freelist FULL -- leaking anon range off=0x%lx size=0x%lx\n",
+                         (unsigned long)off, (unsigned long)size );
+                size = 0;
+            }
+            ios_pool_ledger[j] = ios_pool_ledger[--ios_pool_ledger_count];
+            break;
+        }
+    }
+    pthread_mutex_unlock( &ios_pool_lock );
+
+    if (size && (++released_n <= 16 || (released_n & 0xff) == 0))
+        dprintf( 2, "[jit-pool] anon RWX %p released: pool off=0x%lx+0x%lx -> free-list (grace %ds), #%lu\n",
+                 user_va, (unsigned long)off, (unsigned long)size, IOS_POOL_REUSE_GRACE_SEC, released_n );
 }
 
 /* iOS-Madeira ml625: is [user_va, user_va+size) ALREADY backed by a live anon
@@ -23868,6 +23943,9 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     unsigned int status = STATUS_SUCCESS;
     LPVOID addr = *addr_ptr;
     SIZE_T size = *size_ptr;
+#ifdef WINE_IOS
+    uintptr_t ios_anon_rw = 0;
+#endif
 
     TRACE("%p %p %08lx %x\n", process, addr, size, type );
 
@@ -24047,6 +24125,11 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         /* pool address but not a live tail carve — fall through unchanged */
     }
 
+#ifdef WINE_IOS
+    /* The pool range behind an anonymous RWX block, captured before the free so
+     * the release below cannot hit a new block registered at the same VA. */
+    ios_anon_rw = (type == MEM_RELEASE && base) ? ios_jit_anon_alias_rw_for( base ) : 0;
+#endif
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
     /* avoid freeing the DOS area when a broken app passes a NULL pointer */
@@ -24111,6 +24194,9 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     }
 #endif
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#ifdef WINE_IOS
+    if (ios_anon_rw && status == STATUS_SUCCESS) ios_jit_anon_alias_release( base, size, ios_anon_rw );
+#endif
     return status;
 }
 
