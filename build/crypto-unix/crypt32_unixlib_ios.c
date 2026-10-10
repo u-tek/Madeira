@@ -867,30 +867,18 @@ static void ios_load_roots_locked(void)
     ios_roots_loaded = TRUE;
 }
 
+static NTSTATUS ios_enum_root_certs_wow( struct enum_root_certs_params *params );
+
+/* 64-bit callers walk the list with the same per-thread position as WoW64 ones.
+ * Upstream removes each certificate as it is returned, which on iOS hands the
+ * whole list to the first process: every later one enumerated nothing, and
+ * rootstore.c's sync then deleted every host-imported root from the shared
+ * registry ("deleted on host"). Stellar Blade's process, started after the
+ * Dock, had no roots left: wininet chased each issuer over AIA, failed at
+ * x.ss2.us, and its activation reported "The server is not reachable". */
 static NTSTATUS enum_root_certs( void *args )
 {
-    struct enum_root_certs_params *params = args;
-    struct list *ptr;
-    struct root_cert *cert;
-    NTSTATUS status = STATUS_SUCCESS;
-
-    pthread_mutex_lock( &ios_root_lock );
-    ios_load_roots_locked();
-
-    if (!(ptr = list_head( &root_cert_list ))) status = STATUS_NO_MORE_ENTRIES;
-    else
-    {
-        cert = LIST_ENTRY( ptr, struct root_cert, entry );
-        *params->needed = cert->size;
-        if (cert->size <= params->size)
-        {
-            memcpy( params->buffer, cert->data, cert->size );
-            list_remove( &cert->entry );
-            free( cert );
-        }
-    }
-    pthread_mutex_unlock( &ios_root_lock );
-    return status;
+    return ios_enum_root_certs_wow( args );
 }
 
 /* The WoW64 enumeration: each thread keeps its own position; the rootstore
