@@ -12,5 +12,13 @@ if [ ! -f "$B/CMakeCache.txt" ]; then
         -DENABLE_FEX_ALLOCATOR=OFF -DENABLE_ASSERTIONS=OFF -DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON \
         -DTUNE_CPU=cortex-a78
 fi
-cmake --build "$B" --target FEXCore FEXCore_Base
-ls "$B/FEXCore/Source/"*.a
+# JemallocLibs (Utils/AllocatorHooks.cpp) is its own target: only FEXCore_shared
+# links it, so building FEXCore alone leaves it out, and the app links it.
+cmake --build "$B" --target FEXCore FEXCore_Base JemallocLibs
+# Every FEX archive app/Madeira.xcodeproj links.
+for a in FEXCore/Source/libFEXCore.a FEXCore/Source/libFEXCore_Base.a FEXCore/Source/libJemallocLibs.a \
+         External/fmt/libfmt.a External/xxhash/cmake_unofficial/libxxhash.a \
+         External/SoftFloat-3e/libsoftfloat_3e.a External/cephes/libcephes_128bit.a; do
+    [ -f "$B/$a" ] || { echo "missing $B/$a" >&2; exit 1; }
+    ls -l "$B/$a"
+done
