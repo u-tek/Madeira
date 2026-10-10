@@ -189,8 +189,19 @@ for s in air_msad air_samplepos air_tessellation; do
     src="$DXMT_SRC/airconv/shaders/$s.metal"
     if [ ! -f "$BUILD_DIR/shader-headers/$s.h" ] || [ "$src" -nt "$BUILD_DIR/shader-headers/$s.h" ] \
        || [ "$0" -nt "$BUILD_DIR/shader-headers/$s.h" ]; then
+        in="$src"
+        # air_tessellation.metal calls the raw builtin behind atomic_fetch_add_explicit
+        # with four arguments; Xcode 27's Metal compiler requires five. The public
+        # function emits the same relaxed threadgroup add with any compiler.
+        RAW='__metal_atomic_fetch_add_explicit(out_count, 1, int(memory_order_relaxed), __METAL_MEMORY_SCOPE_THREADGROUP__)'
+        if grep -qF "$RAW" "$src"; then
+            in="$BUILD_DIR/shader-headers/$s.metal"
+            sed 's/__metal_atomic_fetch_add_explicit(out_count, 1, int(memory_order_relaxed), __METAL_MEMORY_SCOPE_THREADGROUP__)/atomic_fetch_add_explicit((threadgroup atomic_int *)out_count, 1, memory_order_relaxed)/' \
+                "$src" > "$in"
+            if grep -qF "$RAW" "$in"; then echo "air_tessellation: rewrite did not apply"; exit 1; fi
+        fi
         (cd "$BUILD_DIR/shader-headers" \
-         && xcrun -sdk macosx metal -std=metal3.1 --target=air64-apple-macos14.0 -o "$s.air" -c "$src" \
+         && xcrun -sdk macosx metal -std=metal3.1 --target=air64-apple-macos14.0 -o "$s.air" -c "$in" \
          && xxd -n "$s" -i "$s.air" "$s.h")
         echo "  $s.h OK"
     else
