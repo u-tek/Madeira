@@ -1081,8 +1081,22 @@ static NTSTATUS ios_main_loop(void *args) {
 static NTSTATUS ios_get_endpoint_ids(void *args) {
     LOG_FN_CALL(3, "get_endpoint_ids");
     struct get_endpoint_ids_params *p = args;
+    /* madeira.cfg env.MADEIRA_AUDIO_OFF = 1: no render endpoint either, so a
+     * game finds no audio device and takes its own no-device path. Stellar
+     * Blade's XAudio2 engine was torn down and rebuilt every ~1.5 s (121 times
+     * in one session), each time starting ~31 worker threads that cost a FEX
+     * thread setup and a 1 MB RWX block apiece: 4,000+ threads, the JIT pool
+     * exhausted and memory at the jetsam limit. With no device Unreal renders
+     * into its null device instead. Sound is lost; the game is not. */
+    static int audio_off = -1;
+    if (audio_off < 0)
+    {
+        const char *e = getenv( "MADEIRA_AUDIO_OFF" );
+        audio_off = (e && e[0] == '1');
+        if (audio_off) fprintf( stderr, "[ios_audio] MADEIRA_AUDIO_OFF=1: reporting no audio endpoints\n" );
+    }
     /* Only render endpoints; refuse capture entirely. */
-    if (p->flow != eRender) {
+    if (p->flow != eRender || audio_off) {
         p->num = 0;
         p->default_idx = 0;
         p->result = S_OK;
