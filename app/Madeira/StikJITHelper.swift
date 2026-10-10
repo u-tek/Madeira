@@ -189,7 +189,23 @@ enum StikJITHelper {
         // reserve-only, so extra chunks don't add resident footprint.
         // The BAD POOL check below stays as the safety net for non-
         // sequential placements.
-        let pinTarget: vm_address_t = 0x119000000
+        // The pool's low bound. 0x119000000 dates from FEX's dispatcher sitting
+        // ~128MB into the pool; FEX's code now comes from the pool's top (the
+        // "tail EC_CODE" allocations right under 0x140000000), so a lower pool
+        // base may be fine. madeira.cfg env.MADEIRA_POOL_FLOOR = <address> moves
+        // the bound, and 0 means the start of the image's placeholder (~820-880MB
+        // of pool instead of 624MB). Never below that start.
+        let poolFloor: Int = {
+            let dflt = 0x119000000
+            guard madeira_early_pool_base != 0, let v = MadeiraConfig.get("env.MADEIRA_POOL_FLOOR"), !v.isEmpty else { return dflt }
+            let t = v.lowercased()
+            guard let n = t.hasPrefix("0x") ? Int(t.dropFirst(2), radix: 16) : Int(t) else { return dflt }
+            return max(n, Int(madeira_early_pool_base))
+        }()
+        if poolFloor != 0x119000000 {
+            LogStore.shared.log(String(format: "[pool-floor] madeira.cfg MADEIRA_POOL_FLOOR: the pool may start at 0x%lx (default 0x119000000)", poolFloor))
+        }
+        let pinTarget = vm_address_t(poolFloor)
         let maxChunks = 32                 // safety cap (512 MB of reservation)
         for i in 0..<maxChunks {
             var addr: vm_address_t = 0
@@ -338,7 +354,7 @@ enum StikJITHelper {
             }
         }
 
-        let goodLow = 0x119000000
+        let goodLow = poolFloor
         let guestLo = 0x7000000000
         let guestHi = 0x8000000000
 
@@ -398,10 +414,25 @@ enum StikJITHelper {
             LogStore.shared.log(String(format: "ml1234: the early pool placeholder 0x%lx+%luMB was released by an earlier pool request in this run; not unmapped again",
                                        Int(earlyPoolBase), Int(earlyPoolSize >> 20)))
         } else if earlyPoolBase != 0 {
-            vm_deallocate(mach_task_self_, earlyPoolBase, vm_size_t(earlyPoolSize))
+            // The placeholder starts at the image's segment; the pool may only start
+            // at poolFloor. What lies under the floor goes back to the system except
+            // a 16MB guard right under it: the debugger's allocator is first-fit, and
+            // free space adjoining the released range would start the pool below the
+            // floor (a placeholder at 0x120000000 once got its pool at 0x11ff9c000).
+            var relBase = earlyPoolBase, relSize = earlyPoolSize
+            let floorA = min(max(vm_address_t(poolFloor), earlyPoolBase), earlyPoolBase + earlyPoolSize)
+            if floorA > earlyPoolBase {
+                let guardSize = vm_address_t(16 << 20)
+                if floorA - earlyPoolBase > guardSize {
+                    vm_deallocate(mach_task_self_, earlyPoolBase, vm_size_t(floorA - guardSize - earlyPoolBase))
+                }
+                relBase = floorA
+                relSize = earlyPoolBase + earlyPoolSize - floorA
+            }
+            vm_deallocate(mach_task_self_, relBase, vm_size_t(relSize))
             earlyPoolReleased = true
-            LogStore.shared.log(String(format: "ml1040: released the early pool placeholder 0x%lx+%luMB for the debugger",
-                                       Int(earlyPoolBase), Int(earlyPoolSize >> 20)))
+            LogStore.shared.log(String(format: "ml1040: released the early pool placeholder 0x%lx+%luMB for the debugger (image placeholder from 0x%lx)",
+                                       Int(relBase), Int(relSize >> 20), Int(earlyPoolBase)))
         } else {
             LogStore.shared.log("ml1040: no early pool placeholder was obtained — placement is left to chance", level: .error)
             // ml1135: what was already mapped above the window at image load (user_tag
@@ -433,7 +464,7 @@ enum StikJITHelper {
                 addr = prevEnd
             }
             let desc = holes.map { String(format: "0x%lx+%luMB", Int($0.base), Int($0.size >> 20)) }.joined(separator: " ")
-            LogStore.shared.log("ml1036: free holes >=64MB in [0x119000000,0x7000000000) with the window held: "
+            LogStore.shared.log(String(format: "ml1036: free holes >=64MB in [0x%lx,0x7000000000) with the window held: ", goodLow)
                 + (desc.isEmpty ? "NONE" : desc))
             let largest = holes.map { $0.size }.max() ?? 0
             if highPool {
