@@ -1,0 +1,231 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main, ci]
+    paths-ignore: ['docs/**', '**/*.md']
+  workflow_dispatch:
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # CMake 4 refuses projects that declare a minimum below 3.5 (some of FEX's externals do).
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  LLVM_MINGW: llvm-mingw-20260421-ucrt-macos-universal
+
+jobs:
+  llvm:
+    name: LLVM 15 for iOS
+    runs-on: macos-26
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: ci
+      - id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains/llvm-project/llvm/include
+            toolchains/llvm-ios-build/include
+            toolchains/llvm-ios-build/lib/*.a
+          key: llvm-ios-${{ hashFiles('ci/llvm-ios.sh', 'ci/llvm-libs.txt') }}
+          lookup-only: true
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: bash ci/llvm-ios.sh
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/llvm-project/llvm/include
+            toolchains/llvm-ios-build/include
+            toolchains/llvm-ios-build/lib/*.a
+          key: llvm-ios-${{ hashFiles('ci/llvm-ios.sh', 'ci/llvm-libs.txt') }}
+
+  build:
+    name: Madeira IPA
+    needs: llvm
+    runs-on: macos-26
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Submodule revisions
+        id: rev
+        run: |
+          for m in FEX wine dxmt; do echo "$m=$(git -C $m rev-parse HEAD)" >> "$GITHUB_OUTPUT"; done
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          # Tree hashes of the tracked inputs: stable across the build, unlike hashFiles
+          # once the build has written its obj/ directories.
+          echo "gnutls=$(git rev-parse HEAD:build/gnutls-ios)" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg=$(git rev-parse HEAD:build/ffmpeg)" >> "$GITHUB_OUTPUT"
+
+      - name: Host tools
+        run: |
+          brew install bison flex meson ccache pkgconf freetype
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+          rustup target add aarch64-apple-ios
+          xcodebuild -downloadComponent MetalToolchain || true
+          xcrun -sdk iphoneos metal --version
+
+      - name: llvm-mingw
+        run: |
+          F="$LLVM_MINGW.tar.xz"
+          curl -fsSL -o "$RUNNER_TEMP/$F" "https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/$F"
+          echo "bd85a3975723815cef28dbbd2ca2cb0c926f6b348a12a0453f39f7af273cb3f7  $RUNNER_TEMP/$F" | shasum -a 256 -c
+          mkdir -p toolchains && tar -xJf "$RUNNER_TEMP/$F" -C toolchains
+
+      - name: LLVM 15 for iOS (from the llvm job)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains/llvm-project/llvm/include
+            toolchains/llvm-ios-build/include
+            toolchains/llvm-ios-build/lib/*.a
+          key: llvm-ios-${{ hashFiles('ci/llvm-ios.sh', 'ci/llvm-libs.txt') }}
+          fail-on-cache-miss: true
+
+      - name: FreeType
+        run: |
+          git clone -q --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
+          bash build/freetype-ios/build.sh
+
+      - id: gnutls
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains/gnutls-ios
+            app/Madeira/libgmp.a
+            app/Madeira/libnettle.a
+            app/Madeira/libhogweed.a
+            app/Madeira/libgnutls.a
+          key: gnutls-${{ steps.rev.outputs.gnutls }}
+      - name: GnuTLS
+        if: steps.gnutls.outputs.cache-hit != 'true'
+        run: bash build/gnutls-ios/build.sh
+      - if: steps.gnutls.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/gnutls-ios
+            app/Madeira/libgmp.a
+            app/Madeira/libnettle.a
+            app/Madeira/libhogweed.a
+            app/Madeira/libgnutls.a
+          key: gnutls-${{ steps.rev.outputs.gnutls }}
+
+      - id: ffmpeg
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains/ffmpeg-ios
+            app/Madeira/libavformat.a
+            app/Madeira/libavcodec.a
+            app/Madeira/libswresample.a
+            app/Madeira/libavutil.a
+          key: ffmpeg-${{ steps.rev.outputs.ffmpeg }}
+      - name: FFmpeg
+        if: steps.ffmpeg.outputs.cache-hit != 'true'
+        run: bash build/ffmpeg/build.sh
+      - if: steps.ffmpeg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/ffmpeg-ios
+            app/Madeira/libavformat.a
+            app/Madeira/libavcodec.a
+            app/Madeira/libswresample.a
+            app/Madeira/libavutil.a
+          key: ffmpeg-${{ steps.rev.outputs.ffmpeg }}
+
+      - id: fex
+        uses: actions/cache/restore@v4
+        with:
+          path: FEX/build-ios
+          key: fex-ios-${{ steps.rev.outputs.FEX }}-${{ hashFiles('build/fex-ios/build.sh') }}
+      - name: FEX (iOS)
+        if: steps.fex.outputs.cache-hit != 'true'
+        run: bash build/fex-ios/build.sh
+      - if: steps.fex.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: FEX/build-ios
+          key: fex-ios-${{ steps.rev.outputs.FEX }}-${{ hashFiles('build/fex-ios/build.sh') }}
+
+      - id: winetrees
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            wine/build-macos
+            wine/build-arm64ec
+          key: wine-trees-${{ steps.rev.outputs.wine }}-${{ hashFiles('ci/wine-trees.sh') }}
+      - name: Wine build trees
+        if: steps.winetrees.outputs.cache-hit != 'true'
+        run: bash ci/wine-trees.sh
+      - if: steps.winetrees.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            wine/build-macos
+            wine/build-arm64ec
+          key: wine-trees-${{ steps.rev.outputs.wine }}-${{ hashFiles('ci/wine-trees.sh') }}
+      - name: Wine aarch64 programs
+        run: |
+          for p in plugplay svchost winedevice; do
+            toolchains/$LLVM_MINGW/bin/aarch64-w64-mingw32-strip --strip-debug \
+              -o app/Madeira/aarch64-windows/$p.exe wine/build-macos/programs/$p/aarch64-windows/$p.exe
+          done
+
+      - name: Wine unix side
+        run: |
+          bash build/ntdll-unix/build.sh
+          bash build/wineserver/build.sh
+          bash build/win32u-unix/build.sh
+
+      - name: In-app pairing (Rust)
+        run: bash build/rppairing-ios/build.sh
+
+      - name: DXMT unix side
+        run: |
+          bash build/dxmt-ios/build.sh
+          bash ci/dxmt-combined.sh
+
+      - name: Madeira Dock
+        run: bash build/madeira-dock/build.sh
+
+      - name: App
+        run: bash ci/package-ipa.sh "Madeira-${{ steps.rev.outputs.short }}.ipa"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-${{ steps.rev.outputs.short }}
+          path: Madeira-${{ steps.rev.outputs.short }}.ipa
+          compression-level: 0
+
+      - name: Release (phone download)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" "Madeira-${{ steps.rev.outputs.short }}.ipa" \
+            --prerelease --target "${{ github.sha }}" --title "Build ${{ github.run_number }} (${{ steps.rev.outputs.short }})" \
+            --notes "Unsigned CI build of ${{ github.ref_name }} at ${{ github.sha }}. Sideload with AltStore over the existing Madeira (same bundle ID, keeps games and saves)."
+
+      - name: Logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_number }}
+          path: |
+            build/*/obj/*.err
+            wine/build-*/config.log
+            FEX/build-ios/CMakeFiles/*.log
+            toolchains/llvm-ios-build/CMakeFiles/*.log
+          if-no-files-found: ignore
