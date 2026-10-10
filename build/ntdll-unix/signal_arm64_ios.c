@@ -9817,7 +9817,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                      * stack is visible rather than silently mistaken for evidence. */
                     {
                         uint64_t cr[2] = { 0, 0 };
-                        uint64_t ents[8];
+                        uint64_t ents[8] = { 0 };
                         mach_vm_size_t g2 = 0;
 
                         if (mach_vm_read_overwrite( mach_task_self(),
@@ -9863,6 +9863,62 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 
                                     for (k = n; k-- > 0; )
                                         ERR("  [callret]   [-%u] %p\n", n - k, (void *)ents[k]);
+                                }
+                            }
+                        }
+                        /* Stellar Blade: a deterministic jump to heap data (AV EXEC of
+                         * a heap address holding floats) on the main thread, through
+                         * the same game frames in every run. Name the slot it came
+                         * from: the guest stack around RSP, the live call-ret entries
+                         * above sp (the [-n] lines are the popped ones below it), and
+                         * the x86 bytes before every return RIP inside the main image,
+                         * which show the call that made each one. Twice per session. */
+                        {
+                            static int gdump_n;
+                            uint64_t grsp = 0, stk[40], live[8];
+                            mach_vm_size_t g3 = 0;
+                            unsigned k;
+
+                            if (gdump_n < 2 &&
+                                mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(state + 0x20 + 4 * 8), 8,
+                                                        (mach_vm_address_t)&grsp, &g3 ) == KERN_SUCCESS && g3 == 8 &&
+                                grsp > 0x1000 &&
+                                mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(grsp - 0xA0), sizeof(stk),
+                                                        (mach_vm_address_t)stk, &g3 ) == KERN_SUCCESS && g3 == sizeof(stk))
+                            {
+                                uint64_t rips[24];
+                                unsigned nr = 0, j;
+
+                                gdump_n++;
+                                for (k = 0; k < 40; k += 4)
+                                    ERR("  [gstack] rsp%+05d: %016llx %016llx %016llx %016llx\n",
+                                        (int)(k * 8) - 0xA0, (unsigned long long)stk[k], (unsigned long long)stk[k + 1],
+                                        (unsigned long long)stk[k + 2], (unsigned long long)stk[k + 3]);
+                                if (cr[0] && mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)cr[0], sizeof(live),
+                                                                     (mach_vm_address_t)live, &g3 ) == KERN_SUCCESS && g3 == sizeof(live))
+                                {
+                                    ERR("  [callret-live] %p %p %p %p %p %p %p %p\n",
+                                        (void *)live[0], (void *)live[1], (void *)live[2], (void *)live[3],
+                                        (void *)live[4], (void *)live[5], (void *)live[6], (void *)live[7]);
+                                    for (k = 0; k < 8 && nr < 24; k++) rips[nr++] = live[k];
+                                }
+                                for (k = 0; k < 8 && nr < 24; k++) rips[nr++] = ents[k];
+                                for (k = 0; k < 40 && nr < 24; k++) rips[nr++] = stk[k];
+                                for (j = 0; j < nr; j++)
+                                {
+                                    unsigned char cb[24];
+                                    unsigned d;
+
+                                    if (rips[j] < 0x140000010ull || rips[j] >= 0x156000000ull) continue;
+                                    for (d = 0; d < j; d++) if (rips[d] == rips[j]) break;
+                                    if (d < j) continue;
+                                    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(rips[j] - 16), sizeof(cb),
+                                                                (mach_vm_address_t)cb, &g3 ) != KERN_SUCCESS || g3 != sizeof(cb))
+                                        continue;
+                                    ERR("  [ret-site] %p-16: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x"
+                                        " | %02x %02x %02x %02x %02x %02x %02x %02x\n", (void *)rips[j],
+                                        cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6], cb[7], cb[8], cb[9], cb[10], cb[11],
+                                        cb[12], cb[13], cb[14], cb[15], cb[16], cb[17], cb[18], cb[19], cb[20], cb[21], cb[22], cb[23]);
                                 }
                             }
                         }
