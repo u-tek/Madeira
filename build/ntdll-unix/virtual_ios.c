@@ -15502,8 +15502,19 @@ static uint64_t ios_swap_cap, ios_swap_bump;
  * decommit inside it punches the file in place (ml1257). key: the size asked for
  * (reservation or commit), the churn filter's unit; born: ns when it was backed
  * (ml1258). */
-static struct { char *va; size_t len; uint64_t off; int resv; size_t key; uint64_t born; } ios_swap_ext[16384];
+/* Stellar Blade with a 64 KB floor filled 16384 extents and the tier refused
+ * 8.2 GB of commits, which stayed anonymous and counted against jetsam. */
+#define IOS_SWAP_EXT_MAX 65536
+static struct { char *va; size_t len; uint64_t off; int resv; size_t key; uint64_t born; } ios_swap_ext[IOS_SWAP_EXT_MAX];
 static unsigned ios_swap_n;
+/* Every extent lies inside [ios_swap_lo, ios_swap_hi): widened on each add,
+ * never narrowed, so a free outside it (FEX's band, which broad never backs)
+ * skips the scans below instead of walking up to IOS_SWAP_EXT_MAX entries. */
+static char *ios_swap_lo = (char *)~(uintptr_t)0, *ios_swap_hi;
+static inline int ios_swap_outside( const char *lo, const char *hi )
+{
+    return hi <= ios_swap_lo || lo >= ios_swap_hi;
+}
 static struct { uint64_t off, len; } ios_swap_free[8192];
 static unsigned ios_swap_nfree;
 static unsigned long long ios_swap_bytes, ios_swap_peak, ios_swap_backs, ios_swap_releases, ios_swap_unbacks, ios_swap_refused;
@@ -15824,7 +15835,7 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
     char *he = (char *)(((uintptr_t)base + size) & ~(uintptr_t)host_page_mask);
     size_t len; uint64_t off; void *p;
     if (he <= hs) return IOS_SW_SMALL;
-    if (ios_swap_n >= 16384) { if (ios_swap_v2) ios_swap_refused++; return IOS_SW_REFUSED; }
+    if (ios_swap_n >= IOS_SWAP_EXT_MAX) { if (ios_swap_v2) ios_swap_refused++; return IOS_SW_REFUSED; }
     /* ml1257: in broad the cap is the disk the sparse file really occupies */
     if (ios_swap_broad && ios_swap_disk_used() >= ios_swap_cap) { ios_swap_disk_refused++; ios_swap_refused++; return IOS_SW_REFUSED; }
     len = he - hs;
@@ -15841,6 +15852,8 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
     ios_swap_ext[ios_swap_n].va = hs; ios_swap_ext[ios_swap_n].len = len; ios_swap_ext[ios_swap_n].off = off;
     ios_swap_ext[ios_swap_n].resv = 0; ios_swap_ext[ios_swap_n].key = size;
     ios_swap_ext[ios_swap_n].born = ios_swap_broad ? ios_swap_now_ns() : 0; ios_swap_n++;
+    if (hs < ios_swap_lo) ios_swap_lo = hs;
+    if (hs + len > ios_swap_hi) ios_swap_hi = hs + len;
     ios_swap_churn_backed( size );   /* ml1226 */
     ios_swap_bytes += len; if (ios_swap_bytes > ios_swap_peak) ios_swap_peak = ios_swap_bytes;
     ios_swap_backs++;
@@ -15890,6 +15903,7 @@ static void ios_swap_release_range( void *base, size_t size, int copy_back )
     unsigned long long releases_before = ios_swap_releases;
     uint64_t noted_born = 0;   /* ml1258: pieces of one split extent are one death */
     if (ios_swap_fd < 0 || !ios_swap_n) return;
+    if (ios_swap_outside( lo - host_page_mask, hi + host_page_mask )) return;
     if (copy_back)
     {
         lo = (char *)((uintptr_t)lo & ~(uintptr_t)host_page_mask);
@@ -15948,7 +15962,7 @@ static void ios_swap_release_range( void *base, size_t size, int copy_back )
             }
             if (oa == a) { ios_swap_ext[i].va = ob; ios_swap_ext[i].off += olen; ios_swap_ext[i].len -= olen; i++; continue; }
             if (ob == b) { ios_swap_ext[i].len = oa - a; i++; continue; }
-            if (ios_swap_n < 16384)
+            if (ios_swap_n < IOS_SWAP_EXT_MAX)
             {
                 ios_swap_ext[ios_swap_n] = ios_swap_ext[i];   /* resv, key, born carry over */
                 ios_swap_ext[ios_swap_n].va = ob; ios_swap_ext[ios_swap_n].off = ios_swap_ext[i].off + (ob - a);
@@ -15971,6 +15985,7 @@ static int ios_swap_punch_resv( char *lo, size_t len )
 {
     unsigned i;
     if (ios_swap_fd < 0 || !ios_swap_n) return 0;
+    if (ios_swap_outside( lo, lo + len )) return 0;
     for (i = 0; i < ios_swap_n; i++)
     {
         char *a = ios_swap_ext[i].va;
@@ -15995,6 +16010,7 @@ static int ios_swap_punch_resv( char *lo, size_t len )
 static int ios_swap_overlaps( const void *base, size_t size )
 {
     unsigned i; const char *lo = base, *hi = (const char *)base + size;
+    if (ios_swap_outside( lo, hi )) return 0;
     for (i = 0; i < ios_swap_n; i++)
         if (ios_swap_ext[i].va < hi && ios_swap_ext[i].va + ios_swap_ext[i].len > lo) return 1;
     return 0;
