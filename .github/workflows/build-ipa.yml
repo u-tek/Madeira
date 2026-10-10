@@ -68,6 +68,8 @@ jobs:
           # once the build has written its obj/ directories.
           echo "gnutls=$(git rev-parse HEAD:build/gnutls-ios)" >> "$GITHUB_OUTPUT"
           echo "ffmpeg=$(git rev-parse HEAD:build/ffmpeg)" >> "$GITHUB_OUTPUT"
+          echo "dxmtios=$(git rev-parse HEAD:build/dxmt-ios)" >> "$GITHUB_OUTPUT"
+          echo "rppairing=$(git rev-parse HEAD:build/rppairing-ios)" >> "$GITHUB_OUTPUT"
 
       - name: Host tools
         run: |
@@ -198,15 +200,44 @@ jobs:
           bash build/wineserver/build.sh
           bash build/win32u-unix/build.sh
 
+      # The pairing library and DXMT only change with their own sources, so both are
+      # cached like FEX: about three minutes of every build otherwise.
+      - id: rpp
+        if: ${{ !cancelled() }}
+        uses: actions/cache/restore@v4
+        with:
+          path: app/Madeira/libmadeira_rppairing.a
+          key: rppairing-${{ steps.rev.outputs.rppairing }}
       - name: In-app pairing (Rust)
-        if: ${{ !cancelled() }}
+        id: rppbuild
+        if: ${{ !cancelled() && steps.rpp.outputs.cache-hit != 'true' }}
         run: bash build/rppairing-ios/build.sh
+      - if: ${{ !cancelled() && steps.rppbuild.outcome == 'success' }}
+        uses: actions/cache/save@v4
+        with:
+          path: app/Madeira/libmadeira_rppairing.a
+          key: rppairing-${{ steps.rev.outputs.rppairing }}
 
-      - name: DXMT unix side
+      - id: dxmt
         if: ${{ !cancelled() }}
+        uses: actions/cache/restore@v4
+        with:
+          path: build/dxmt-ios/libdxmt_combined.a
+          key: dxmt-${{ steps.rev.outputs.dxmt }}-${{ steps.rev.outputs.dxmtios }}-${{ hashFiles('ci/dxmt-combined.sh', 'ci/llvm-libs.txt', 'ci/llvm-ios.sh') }}
+      - name: DXMT unix side
+        id: dxmtbuild
+        if: ${{ !cancelled() && steps.dxmt.outputs.cache-hit != 'true' }}
         run: |
           bash build/dxmt-ios/build.sh
           bash ci/dxmt-combined.sh
+      - if: ${{ !cancelled() && steps.dxmtbuild.outcome == 'success' }}
+        uses: actions/cache/save@v4
+        with:
+          path: build/dxmt-ios/libdxmt_combined.a
+          key: dxmt-${{ steps.rev.outputs.dxmt }}-${{ steps.rev.outputs.dxmtios }}-${{ hashFiles('ci/dxmt-combined.sh', 'ci/llvm-libs.txt', 'ci/llvm-ios.sh') }}
+      - name: DXMT (cached)
+        if: ${{ !cancelled() && steps.dxmt.outputs.cache-hit == 'true' }}
+        run: cp build/dxmt-ios/libdxmt_combined.a app/Madeira/libdxmt_combined.a
 
       - name: Madeira Dock
         if: ${{ !cancelled() }}
