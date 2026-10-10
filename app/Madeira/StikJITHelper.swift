@@ -795,6 +795,66 @@ enum StikJITHelper {
         // the UI view. Detail (kr / footprint delta) is in the jit_log lines.
         LogStore.shared.log("[no-footprint] pool applied=\(exempt)", level: exempt ? .success : .error)
 
+        // Second JIT code region (madeira.cfg env.MADEIRA_JIT_CODE_REGION = 1): a debugger RX
+        // block outside the pool for FEX's large code buffers, which the pool can only give
+        // 16 MB once the image copies are in (Stellar Blade: ~4.4M retranslations, ~2 fps
+        // while busy). FEX writes code through ONE DualMap::WriteOffset, so the block's RW
+        // alias must sit at exactly the pool's RX->RW offset. First-fit puts it in the free
+        // block above the executable window. Anything else and it is given back: Madeira
+        // then runs as without it. ntdll reads WINE_IOS_JIT2_RX / WINE_IOS_JIT2_SIZE.
+        if MadeiraConfig.flag("MADEIRA_JIT_CODE_REGION", fallback: false) {
+            let delta = Int(rwAddr) - Int(rxAddrV)
+            let poolEnd = Int(rxAddrV) + poolSize
+            for mb in [192, 160, 128, 96, 64] {
+                let sz = mb << 20
+                guard let p2 = jit26_prepare_region(nil, sz), p2 != UnsafeMutableRawPointer(bitPattern: 0) else {
+                    LogStore.shared.log("[jit2] the debugger did not allocate \(mb)MB; no code region", level: .error)
+                    break
+                }
+                let a2 = Int(bitPattern: p2)
+                var ra = vm_address_t(a2)
+                var rs: vm_size_t = 0
+                var info = vm_region_basic_info_data_64_t()
+                var cnt = mach_msg_type_number_t(MemoryLayout<vm_region_basic_info_data_64_t>.size / MemoryLayout<Int32>.size)
+                var obj: mach_port_t = 0
+                let rkr = withUnsafeMutablePointer(to: &info) {
+                    $0.withMemoryRebound(to: Int32.self, capacity: Int(cnt)) {
+                        vm_region_64(mach_task_self_, &ra, &rs, VM_REGION_BASIC_INFO_64, $0, &cnt, &obj)
+                    }
+                }
+                let exec = rkr == KERN_SUCCESS && ra == vm_address_t(a2) && (info.protection & VM_PROT_EXECUTE) != 0
+                if a2 < poolEnd || a2 + sz > 0x7000000000 || overlapsExeWindow(vm_address_t(a2), vm_address_t(sz)) || !exec {
+                    LogStore.shared.log(String(format: "[jit2] %dMB landed at 0x%lx (prot %d, exec %@): not usable, given back",
+                                               mb, a2, Int(info.protection), exec ? "yes" : "no"), level: .error)
+                    vm_deallocate(mach_task_self_, vm_address_t(a2), vm_size_t(sz))
+                    continue
+                }
+                var rw2 = vm_address_t(a2 + delta)
+                var cur2: vm_prot_t = 0
+                var max2: vm_prot_t = 0
+                let krm = vm_remap(mach_task_self_, &rw2, vm_size_t(sz), 0, 0 /* VM_FLAGS_FIXED */,
+                                   mach_task_self_, vm_address_t(a2), 0, &cur2, &max2, VM_INHERIT_NONE)
+                if krm != KERN_SUCCESS || rw2 != vm_address_t(a2 + delta) {
+                    LogStore.shared.log(String(format: "[jit2] RW alias at 0x%lx refused (kr=%d); code region given back",
+                                               a2 + delta, krm), level: .error)
+                    if krm == KERN_SUCCESS { vm_deallocate(mach_task_self_, rw2, vm_size_t(sz)) }
+                    vm_deallocate(mach_task_self_, vm_address_t(a2), vm_size_t(sz))
+                    break
+                }
+                if vm_protect(mach_task_self_, rw2, vm_size_t(sz), 0, VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS {
+                    LogStore.shared.log("[jit2] RW alias could not be made writable; code region given back", level: .error)
+                    vm_deallocate(mach_task_self_, rw2, vm_size_t(sz))
+                    vm_deallocate(mach_task_self_, vm_address_t(a2), vm_size_t(sz))
+                    break
+                }
+                setenv("WINE_IOS_JIT2_RX", String(format: "%lx", a2), 1)
+                setenv("WINE_IOS_JIT2_SIZE", String(format: "%lx", sz), 1)
+                LogStore.shared.log(String(format: "[jit2] %dMB code region RX=0x%lx RW=0x%lx (pool RX->RW offset kept)",
+                                           mb, a2, Int(rw2)), level: .success)
+                break
+            }
+        }
+
         LogStore.shared.log("JIT pool ready (debugger still attached).", level: .success)
         poolTaken = true
 

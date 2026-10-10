@@ -313,6 +313,18 @@ static int ios_exc_handler_started = 0;
  * turns it off. */
 static int ios_mach_align_fault_enabled = 1;
 static uintptr_t ios_exc_usd = 0;
+/* The second JIT code region (madeira.cfg env.MADEIRA_JIT_CODE_REGION = 1):
+ * FEX's code buffers outside the pool, RW alias at the pool's RX->RW offset,
+ * so `rw + (addr - rx)` holds there too. Every check below that asks "is this
+ * pc / address JIT code" has to answer yes for it, exactly as for the pool's
+ * tail carves it replaces. 0 when the region is off. */
+extern uintptr_t ios_jit2_rx_base_global;
+extern size_t ios_jit2_size_global;
+static inline int ios_in_jit2( uint64_t a )
+{
+    return ios_jit2_rx_base_global && a >= ios_jit2_rx_base_global &&
+           a < ios_jit2_rx_base_global + ios_jit2_size_global;
+}
 volatile int64_t ios_exc_x18_fixes = 0;
 volatile int64_t ios_exc_usd_fixes = 0;
 volatile int ios_exc_thread_alive = 0;
@@ -2173,7 +2185,7 @@ static void *ios_mach_exception_thread( void *arg )
                     uintptr_t jit_rx = (uintptr_t)ios_jit_rx_base_global;
                     size_t jit_sz = ios_jit_pool_size_global;
 
-                    if (fault_pc >= jit_rx && fault_pc < jit_rx + jit_sz)
+                    if ((fault_pc >= jit_rx && fault_pc < jit_rx + jit_sz) || ios_in_jit2(fault_pc))
                     {
                         /* Exec fault IN JIT pool — only fixable if in .text (x18 issue) */
                         if (ios_jit_addr_is_text(fault_pc) && state.__x[18] == 0 && thread_teb && thread_trampoline)
@@ -2264,8 +2276,9 @@ static void *ios_mach_exception_thread( void *arg )
                             uintptr_t rw_base = (uintptr_t)ios_jit_rw_base_global;
                             uintptr_t rx_base2 = (uintptr_t)ios_jit_rx_base_global;
                             if (rw_base && rx_base2 && ios_jit_pool_size_global &&
-                                fault_pc >= rw_base &&
-                                fault_pc < rw_base + ios_jit_pool_size_global)
+                                ((fault_pc >= rw_base &&
+                                  fault_pc < rw_base + ios_jit_pool_size_global) ||
+                                 ios_in_jit2(fault_pc - rw_base + rx_base2)))
                             {
                                 uintptr_t rx_pc = (uintptr_t)fault_pc - rw_base + rx_base2;
                                 jit_pc = (void *)rx_pc;
@@ -2635,7 +2648,7 @@ static void *ios_mach_exception_thread( void *arg )
                 size_t sz = ios_jit_pool_size_global;
                 uint64_t fault_pc = (uint64_t)__darwin_arm_thread_state64_get_pc(state);
 
-                if (rx && rw && sz && fault_pc >= rx && fault_pc < rx + sz)
+                if (rx && rw && sz && ((fault_pc >= rx && fault_pc < rx + sz) || ios_in_jit2(fault_pc)))
                 {
                     uintptr_t rw_pc = rw + (fault_pc - rx);
                     uint32_t insn; ios_fault_read_insn( (uint64_t)(uintptr_t)fault_pc, &insn );  /* ml982 */
@@ -3121,7 +3134,7 @@ static void *ios_mach_exception_thread( void *arg )
                 uintptr_t rw_addr = 0;
                 int smc_trap = 0;
                 int in_jit = (rx && rw && sz &&
-                              fault_addr >= rx && fault_addr < rx + sz);
+                              ((fault_addr >= rx && fault_addr < rx + sz) || ios_in_jit2(fault_addr)));
                 if (in_jit) {
                     rw_addr = rw + (fault_addr - rx);
                 } else {
@@ -3141,7 +3154,7 @@ static void *ios_mach_exception_thread( void *arg )
                  * lands here again and is emulated. A genuinely read-only guest
                  * page gets the access violation Windows would raise. */
                 if (rw_addr && !in_jit && rx && sz &&
-                    fault_pc >= (uint64_t)rx && fault_pc < (uint64_t)rx + sz)   /* guest code (pool), not Wine's own */
+                    ((fault_pc >= (uint64_t)rx && fault_pc < (uint64_t)rx + sz) || ios_in_jit2(fault_pc)))   /* guest code (pool), not Wine's own */
                 {
                     extern int ios_page_expected_prot( const void *addr );
                     int want = ios_page_expected_prot( (const void *)fault_addr );
@@ -6549,7 +6562,7 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
         uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
         size_t psz = ios_jit_pool_size_global;
 
-        if (rx && psz && frame->pc >= rx && frame->pc < rx + psz)
+        if ((rx && psz && frame->pc >= rx && frame->pc < rx + psz) || ios_in_jit2(frame->pc))
         {
             static int bounce_saved;
             if (bounce_saved < 16 && ++bounce_saved <= 16)
@@ -7345,7 +7358,7 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
              *     host/system code (guest code runs from the pool, and PE
              *     modules are not Mach-O images so dladdr cannot name them) */
             {
-                int in_pool = rxb && pc >= rxb && pc < rxb + ios_jit_pool_size_global;
+                int in_pool = (rxb && pc >= rxb && pc < rxb + ios_jit_pool_size_global) || ios_in_jit2(pc);
                 Dl_info dli;
 
                 if (!ios_thread_is_registered( thread ) && state->__x[18] == 0 && !in_pool
@@ -7752,7 +7765,7 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
      *   - the guest VA band (PE VAs / guest pointers as branch targets).
      * Host dylib and unix-side pcs keep the old decline path —
      * dispatching a guest exception on those contexts would be wrong. */
-    if (!((rxb && pc >= rxb && pc < rxb + ios_jit_pool_size_global) ||
+    if (!((rxb && pc >= rxb && pc < rxb + ios_jit_pool_size_global) || ios_in_jit2(pc) ||
           pc < 0x100000000ULL ||
           (pc >= 0x7000000000ULL && pc < 0x7400000000ULL)))
         return 0;
@@ -8416,7 +8429,7 @@ static inline void ios_fixup_x18_for_return( ucontext_t *context )
     uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
     size_t sz = ios_jit_pool_size_global;
 
-    if (rx && pc >= rx && pc < rx + sz)
+    if ((rx && pc >= rx && pc < rx + sz) || ios_in_jit2(pc))
     {
         REGn_sig(17, context) = pc;
         PC_sig(context) = (uintptr_t)ios_my_trampoline;
@@ -8432,7 +8445,7 @@ static inline void ios_track_signal( int sig, ucontext_t *context )
     uintptr_t pc = PC_sig(context);
     uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
     size_t sz = ios_jit_pool_size_global;
-    if (rx && pc >= rx && pc < rx + sz)
+    if ((rx && pc >= rx && pc < rx + sz) || ios_in_jit2(pc))
         ios_signal_in_pe++;
 }
 
@@ -8997,7 +9010,7 @@ static int ios_fault_is_foreign( const void *pc, const void *addr )
         *(void **)(tsd_base + ios_teb_tls_slot_offset)) return 0;
 
     /* TEB-less but running emulated code (threads CEF/FEX create directly) */
-    if (sz && rx && p >= rx && p < rx + sz) return 0;
+    if ((sz && rx && p >= rx && p < rx + sz) || ios_in_jit2(p)) return 0;
     if (sz && rw && p >= rw && p < rw + sz) return 0;
     if (p >= 0x7000000000ull && p < 0x8000000000ull) return 0;  /* guest | PA | FEX bands */
 
@@ -9005,7 +9018,7 @@ static int ios_fault_is_foreign( const void *pc, const void *addr )
      * guest buffer handed to Metal): the repair paths below are still correct */
     if (a)
     {
-        if (sz && rx && a >= rx && a < rx + sz) return 0;
+        if ((sz && rx && a >= rx && a < rx + sz) || ios_in_jit2(a)) return 0;
         if (sz && rw && a >= rw && a < rw + sz) return 0;
         if (a >= 0x7000000000ull && a < 0x8000000000ull) return 0;
     }
@@ -9220,7 +9233,8 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                  * 0x7FFE**** as the guest wrote it (see "1. Redirect
                  * user_shared_data" there). Pool PCs stay on the old path, as
                  * in the ml938 block below (x17 clobber). */
-                if (!(usd_rx && (uintptr_t)pc >= usd_rx && (uintptr_t)pc < usd_rx + ios_jit_pool_size_global) &&
+                if (!((usd_rx && (uintptr_t)pc >= usd_rx && (uintptr_t)pc < usd_rx + ios_jit_pool_size_global) ||
+                      ios_in_jit2((uintptr_t)pc)) &&
                     ios_subfloor_service( context, siginfo->si_addr, "segv", ios_jit_current_peb() ))
                 {
                     PC_sig(context) = PC_sig(context) + 4;
@@ -10447,7 +10461,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * servicing it here would trade a clean fault for silent FEX-state
          * corruption -- measured in ml938. Those come through the Mach handler
          * instead, which sets thread state directly. */
-        if (!(sg_rx && sg_pc >= sg_rx && sg_pc < sg_rx + sg_sz) &&
+        if (!((sg_rx && sg_pc >= sg_rx && sg_pc < sg_rx + sg_sz) || ios_in_jit2(sg_pc)) &&
             ios_subfloor_service( context, siginfo->si_addr, "segv", ios_jit_current_peb() ))
         {
             PC_sig(context) = PC_sig(context) + 4;
@@ -12097,7 +12111,7 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         {
             uintptr_t rx = (uintptr_t)ios_jit_rx_base_global;
             size_t pool_sz = ios_jit_pool_size_global;
-            if (rx && (uintptr_t)pc >= rx && (uintptr_t)pc < rx + pool_sz)
+            if ((rx && (uintptr_t)pc >= rx && (uintptr_t)pc < rx + pool_sz) || ios_in_jit2((uintptr_t)pc))
             {
                 extern volatile uint64_t g_wine_return_pc;
                 extern volatile uint64_t g_wine_return_x18;
@@ -12163,7 +12177,7 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         uintptr_t rw = (uintptr_t)ios_jit_rw_base_global;
         size_t pool_sz = ios_jit_pool_size_global;
 
-        if (rx && fault >= rx && fault < rx + pool_sz)
+        if (rx && ((fault >= rx && fault < rx + pool_sz) || ios_in_jit2(fault)))
         {
             uintptr_t rw_addr = fault - rx + rw;
             uint32_t insn = *(uint32_t *)(uintptr_t)PC_sig(bus_ctx);

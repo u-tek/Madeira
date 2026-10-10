@@ -2856,6 +2856,17 @@ void ios_pool_va_warn( const char *who, const void *addr, size_t size )
 }
 
 void *ios_jit_rx_base_global = NULL;
+/* The second JIT code region (StikJITHelper, madeira.cfg env.MADEIRA_JIT_CODE_REGION
+ * = 1): a debugger RX block outside the pool whose RW alias sits at the pool's
+ * RX->RW offset (FEX writes code through one DualMap::WriteOffset). FEX's large
+ * code buffers are carved from it so they stop competing with image copies for
+ * the pool: Stellar Blade's code buffer was held at 16 MB by pool pressure and
+ * FEX retranslated ~4.4M blocks (67% hit rate, ~2 fps while busy). Carves keep
+ * the pool's bookkeeping: off is relative to the POOL base, so rx_base + off and
+ * rw_base + off land in the region and its alias. */
+uintptr_t ios_jit2_rx_base_global = 0;
+size_t ios_jit2_size_global = 0;
+static size_t ios_jit2_bump;
 void *ios_jit_rw_base_global = NULL;
 size_t ios_jit_pool_size_global = 0;
 unsigned long long ios_last_footprint_mb = 0;   /* ml668: latest phys_footprint MB (decl above) */
@@ -5700,6 +5711,13 @@ static inline ULONG_PTR ios_usable_va_floor_get(void)
 
     if (sz && rx >= 0x7000000000ULL && rx < 0x7400000000ULL && rx + sz > floor) floor = rx + sz;
     if (sz && rw >= 0x7000000000ULL && rw < 0x7400000000ULL && rw + sz > floor) floor = rw + sz;
+    /* the second code region's RW alias sits at the pool's RX->RW offset, above the
+     * pool's own alias: keep guest allocations clear of it too */
+    if (sz && rx && rw && ios_jit2_rx_base_global)
+    {
+        ULONG_PTR rw2_end = rw + (ios_jit2_rx_base_global - rx) + ios_jit2_size_global;
+        if (rw2_end > floor && rw2_end < 0x7400000000ULL) floor = rw2_end;
+    }
     return floor;
 }
 #define ios_usable_va_floor (ios_usable_va_floor_get())
@@ -6195,6 +6213,12 @@ static int ios_jit_pool_intersects( const void *addr, size_t size )
     if (!sz) return 0;
     if (rx && a < rx + sz && e > rx) return 1;
     if (rw && a < rw + sz && e > rw) return 1;
+    if (ios_jit2_rx_base_global && rx && rw)
+    {
+        uint64_t rx2 = ios_jit2_rx_base_global, rw2 = rw + (rx2 - rx), sz2 = ios_jit2_size_global;
+        if (a < rx2 + sz2 && e > rx2) return 1;
+        if (a < rw2 + sz2 && e > rw2) return 1;
+    }
     return 0;
 }
 
@@ -12435,6 +12459,21 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                 ios_jit_rx_base_global = jit_rx_base;
                 ios_jit_rw_base_global = jit_rw_base;
                 ios_jit_pool_size_global = jit_pool_size;
+                {
+                    const char *r2 = getenv("WINE_IOS_JIT2_RX"), *s2 = getenv("WINE_IOS_JIT2_SIZE");
+                    uintptr_t rx2 = r2 ? (uintptr_t)strtoull(r2, NULL, 16) : 0;
+                    size_t sz2 = s2 ? (size_t)strtoull(s2, NULL, 16) : 0;
+                    if (rx2 > (uintptr_t)jit_rx_base && sz2)
+                    {
+                        ios_jit2_size_global = sz2;
+                        __sync_synchronize();
+                        ios_jit2_rx_base_global = rx2;
+                    }
+                    dprintf(2, "[jit2] code region %s: rx=%p rw=%p size=0x%lx
+",
+                            ios_jit2_rx_base_global ? "ON" : "off", (void *)rx2,
+                            rx2 ? (char *)jit_rw_base + (rx2 - (uintptr_t)jit_rx_base) : NULL, (unsigned long)sz2);
+                }
 
                 /* ml91 (task #35): dump the VA map ONCE here, unconditionally.
                  * The first cut only probed on jumbo-reserve failure, so a
@@ -23299,6 +23338,55 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         ios_jit_pool_size_global)
     {
         size_t alloc_size = (*size_ptr + 0x3FFF) & ~0x3FFFUL;
+        /* A code buffer larger than the 16 MB the pool can spare comes from the
+         * second code region when there is one: a freed region carve first,
+         * then its bump. Anything that does not fit falls through to the pool. */
+        if (ios_jit2_size_global && alloc_size > 0x1000000 &&
+            alloc_size <= ios_jit2_size_global / 2)   /* FEX allocates the next generation before freeing the last */
+        {
+            uintptr_t rx0 = (uintptr_t)ios_jit_rx_base_global;
+            size_t off2 = 0, got2 = 0;
+            unsigned i2, best2 = ~0u;
+            pthread_mutex_lock( &ios_tail_carve_lock );
+            for (i2 = 0; i2 < ios_tail_carve_n; i2++)
+            {
+                uintptr_t a2 = rx0 + ios_tail_carves[i2].off;
+                if (!ios_tail_carves[i2].free || ios_tail_carves[i2].size < alloc_size) continue;
+                if (a2 < ios_jit2_rx_base_global || a2 >= ios_jit2_rx_base_global + ios_jit2_size_global) continue;
+                if (best2 == ~0u || ios_tail_carves[i2].size < ios_tail_carves[best2].size) best2 = i2;
+            }
+            if (best2 != ~0u)
+            {
+                ios_tail_carves[best2].free = 0;
+                off2 = ios_tail_carves[best2].off;
+                got2 = ios_tail_carves[best2].size;
+            }
+            else if (ios_jit2_bump + alloc_size <= ios_jit2_size_global && ios_tail_carve_n < IOS_TAIL_CARVE_MAX)
+            {
+                off2 = ios_jit2_rx_base_global + ios_jit2_bump - rx0;
+                got2 = alloc_size;
+                ios_jit2_bump += alloc_size;
+                ios_tail_carves[ios_tail_carve_n].off = off2;
+                ios_tail_carves[ios_tail_carve_n].size = got2;
+                ios_tail_carves[ios_tail_carve_n].free = 0;
+                ios_tail_carve_n++;
+            }
+            pthread_mutex_unlock( &ios_tail_carve_lock );
+            if (got2)
+            {
+                void *rx2 = (char *)ios_jit_rx_base_global + off2;
+                volatile uint32_t *rw2 = (volatile uint32_t *)((char *)ios_jit_rw_base_global + off2);
+                size_t w2, nw2 = got2 / sizeof(uint32_t);
+                for (w2 = 0; w2 < nw2; w2++) rw2[w2] = 0xd503201fu;   /* NOP-prefill, as for pool carves */
+                *ret = rx2;
+                *size_ptr = got2;
+                dprintf(2, "[jit2] EC_CODE rx=%p size=0x%lx (asked 0x%lx) region used 0x%lx/0x%lx
+",
+                        rx2, (unsigned long)got2, (unsigned long)alloc_size,
+                        (unsigned long)ios_jit2_bump, (unsigned long)ios_jit2_size_global);
+                return STATUS_SUCCESS;
+            }
+        }
         /* ml459 (#75): cap a single EC code buffer at 16MB. FEX asks for 32MB
          * once its buffers get hot, but an old generation stays pinned by any
          * thread still referencing it (see [pool-tail] PIN) — and a 32MB
@@ -24104,8 +24192,10 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
      * view — before this rev it error'd (FEXCore ignored it) and the tail
      * space leaked forever. Mark the carve free for reuse and succeed. */
     if ((type & MEM_RELEASE) && ios_jit_rx_base_global && ios_jit_pool_size_global &&
-        (char *)base >= (char *)ios_jit_rx_base_global &&
-        (char *)base <  (char *)ios_jit_rx_base_global + ios_jit_pool_size_global)
+        (((char *)base >= (char *)ios_jit_rx_base_global &&
+          (char *)base <  (char *)ios_jit_rx_base_global + ios_jit_pool_size_global) ||
+         (ios_jit2_rx_base_global && (uintptr_t)base >= ios_jit2_rx_base_global &&
+          (uintptr_t)base < ios_jit2_rx_base_global + ios_jit2_size_global)))
     {
         unsigned i;
         size_t off = (size_t)((char *)base - (char *)ios_jit_rx_base_global);
