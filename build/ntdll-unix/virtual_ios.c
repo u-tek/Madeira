@@ -12469,8 +12469,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                         __sync_synchronize();
                         ios_jit2_rx_base_global = rx2;
                     }
-                    dprintf(2, "[jit2] code region %s: rx=%p rw=%p size=0x%lx
-",
+                    dprintf(2, "[jit2] code region %s: rx=%p rw=%p size=0x%lx\n",
                             ios_jit2_rx_base_global ? "ON" : "off", (void *)rx2,
                             rx2 ? (char *)jit_rw_base + (rx2 - (uintptr_t)jit_rx_base) : NULL, (unsigned long)sz2);
                 }
@@ -23380,8 +23379,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
                 for (w2 = 0; w2 < nw2; w2++) rw2[w2] = 0xd503201fu;   /* NOP-prefill, as for pool carves */
                 *ret = rx2;
                 *size_ptr = got2;
-                dprintf(2, "[jit2] EC_CODE rx=%p size=0x%lx (asked 0x%lx) region used 0x%lx/0x%lx
-",
+                dprintf(2, "[jit2] EC_CODE rx=%p size=0x%lx (asked 0x%lx) region used 0x%lx/0x%lx\n",
                         rx2, (unsigned long)got2, (unsigned long)alloc_size,
                         (unsigned long)ios_jit2_bump, (unsigned long)ios_jit2_size_global);
                 return STATUS_SUCCESS;
