@@ -4545,10 +4545,15 @@ wx_done: ;
                  * explanation. */
                 {
                     extern void *ios_jit_rw_base_global;
+                    extern void *ios_jit_rx_base_global;
                     extern size_t ios_jit_pool_size_global;
                     uintptr_t rwb = (uintptr_t)ios_jit_rw_base_global;
                     if (rwb && ios_jit_pool_size_global &&
                         fa >= rwb && fa < rwb + ios_jit_pool_size_global)
+                        goto skip_reclaim_band;
+                    /* The second code region's RW alias (rx2 + (rw - rx)) is live FEX code too. */
+                    if (rwb && fa >= rwb &&
+                        ios_in_jit2( fa - rwb + (uintptr_t)ios_jit_rx_base_global ))
                         goto skip_reclaim_band;
                 }
                 if (!handled && fa != (uint64_t)fault_pc &&

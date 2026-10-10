@@ -49,11 +49,14 @@ final class GamepadInput: @unchecked Sendable {
     /// slot 0 connects only when a real source appears, as before.
     @MainActor func reserveSessionSlot(touchControls: Bool) {
         guard Self.enabled, Self.optIn("MADEIRA_PAD_EARLY_SLOT") else { return }
-        let touch = touchControls && Self.touchEnabled
+        // The overlay often has no pad mappings yet at launch (they appear once
+        // the game window is up), so with the switch on, touch support alone
+        // is enough: an Unreal game enumerates XInput once and never rescans.
+        let touch = Self.touchEnabled
         let paired = !GCController.controllers().isEmpty
         guard touch || paired else { return }
         queue.async { [self] in touchState.reserved = true; sample() }
-        LogStore.shared.log("[xinput] ml1990 slot=0 reserved for the session touch=\(touch ? 1 : 0) paired=\(paired ? 1 : 0)")
+        LogStore.shared.log("[xinput] ml1990 slot=0 reserved for the session touch=\(touch ? 1 : 0) shown=\(touchControls ? 1 : 0) paired=\(paired ? 1 : 0)")
     }
 
     /// ml2100: how player 1 reaches Windows, `env.MADEIRA_PAD_MODE` from

@@ -644,6 +644,11 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
 extern unsigned long long ios_last_footprint_mb;
 extern int ios_fast_footprint;
 
+/* Second code region; defined with the pool globals further down. */
+extern uintptr_t ios_jit2_rx_base_global;
+extern size_t ios_jit2_size_global;
+static size_t ios_jit2_bump;
+
 static void *ios_pool_warmer_thread( void *arg )
 {
     unsigned cycle = 0;
@@ -712,6 +717,16 @@ static void *ios_pool_warmer_thread( void *arg )
             {
                 for (o = 0; o < head; o += 0x4000) { sink += rx[o]; touched++; }
                 for (o = total - tail; o < total; o += 0x4000) { sink += rx[o]; touched++; }
+            }
+            /* The second code region (FEX code buffers) executes from its RX view
+             * too: keep its used part resident the same way, through both views. */
+            if (ios_jit2_rx_base_global && rx)
+            {
+                size_t used2 = ios_jit2_bump;   /* snapshot; only grows */
+                volatile const char *rx2 = (volatile const char *)ios_jit2_rx_base_global;
+                volatile const char *rw2 = rw + (ios_jit2_rx_base_global - (uintptr_t)rx);
+                if (used2 > ios_jit2_size_global) used2 = ios_jit2_size_global;
+                for (o = 0; o < used2; o += 0x4000) { sink += rw2[o]; sink += rx2[o]; touched += 2; }
             }
             (void)sink;
             cycle++;
