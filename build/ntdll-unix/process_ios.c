@@ -1188,16 +1188,9 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
          * "EnterEC wrote it" does NOT name the origin — Core.cpp says so explicitly:
          * EnterEC storing an x64 target in State.rip is its job. The upstream producer
          * still needs finding via x9 at DispatchJump/RetToEntryThunk/ExitToX64. */
-        /* crs-handler.exe: the crash-report handler Stellar Blade starts beside
-         * itself (--no-identify-client-via-url --no-upload-annotations ...). Its
-         * own copies of ~30 system DLLs took 42MB of the JIT pool (646 -> 687MB of
-         * 784MB), and the game's next image load (imm32.dll) found the pool
-         * exhausted, after which calls into it faulted and took the game down.
-         * Nothing in the game depends on it running; same class as
-         * unitycrashhandler64. */
         static const char * const blocked_names[] = { "steamerrorreporter", "gldriverquery", "vulkandriverquery",
                                                       "steamsysinfo", "hardwareupdater",
-                                                      "unitycrashhandler64", "crs-handler" };
+                                                      "unitycrashhandler64" };
         const WCHAR *ip = params->ImagePathName.Buffer;
         int ip_len = params->ImagePathName.Length / sizeof(WCHAR);
         unsigned b;
