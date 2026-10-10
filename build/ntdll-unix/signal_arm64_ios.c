@@ -3119,12 +3119,44 @@ static void *ios_mach_exception_thread( void *arg )
                  * the secondary alias table to find the user_VA → RW alias
                  * mapping. */
                 uintptr_t rw_addr = 0;
+                int smc_trap = 0;
                 int in_jit = (rx && rw && sz &&
                               fault_addr >= rx && fault_addr < rx + sz);
                 if (in_jit) {
                     rw_addr = rw + (fault_addr - rx);
                 } else {
                     rw_addr = ios_jit_anon_alias_lookup(fault_addr);
+                }
+                /* SMC: a guest page whose LOGICAL protection has no write is not
+                 * ours to write. FEX write-protects every RWX page it has compiled
+                 * code from (InvalidationTracker, "Add SMC interval"); the alias
+                 * path records that protection in vprot only (ml640), and this
+                 * emulator then performed every store anyway, so FEX's
+                 * HandleRWXAccessViolation never ran and it kept executing the old
+                 * translation of rewritten code. Stellar Blade's DRM rewrites its
+                 * import stubs in an RWX heap block and, on the stale stub, jumped
+                 * into heap data (AV EXEC, deterministic). Leave the fault unhandled
+                 * so it reaches FEX as an access violation, as on Windows: FEX
+                 * invalidates the page and restores write, and the retried store
+                 * lands here again and is emulated. A genuinely read-only guest
+                 * page gets the access violation Windows would raise. */
+                if (rw_addr && !in_jit && rx && sz &&
+                    fault_pc >= (uint64_t)rx && fault_pc < (uint64_t)rx + sz)   /* guest code (pool), not Wine's own */
+                {
+                    extern int ios_page_expected_prot( const void *addr );
+                    int want = ios_page_expected_prot( (const void *)fault_addr );
+
+                    if (want >= 0 && !(want & PROT_WRITE))
+                    {
+                        static unsigned smc_trap_n;
+
+                        smc_trap = 1;
+                        if (++smc_trap_n <= 16 || (smc_trap_n & 0xfff) == 0)
+                            dprintf( STDERR_FILENO, "[smc-trap] #%u store to %#llx (logical prot %d, no write) "
+                                     "pc=%#llx -> access violation for FEX\n", smc_trap_n,
+                                     (unsigned long long)fault_addr, want,
+                                     (unsigned long long)__darwin_arm_thread_state64_get_pc(state) );
+                    }
                 }
                 /* ml348 DISCRIMINATOR: a write fault with NO alias is a
                  * different bug from a write fault whose instruction we can't
@@ -3166,7 +3198,7 @@ static void *ios_mach_exception_thread( void *arg )
                                 (unsigned long long)fault_pc);
                     }
                 }
-                if (rw_addr && (uintptr_t)fault_pc >= 0x100000000ULL)
+                if (rw_addr && !smc_trap && (uintptr_t)fault_pc >= 0x100000000ULL)
                 {
                     uint32_t insn; ios_fault_read_insn( (uint64_t)(uintptr_t)fault_pc, &insn );  /* ml982 */
                     int emulated = 0;
