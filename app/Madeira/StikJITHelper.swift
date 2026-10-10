@@ -263,7 +263,7 @@ enum StikJITHelper {
         // is already mapped, which removes the collision without naming an RX
         // address ourselves. Failure is still never fatal -- we log and continue
         // exactly as before, and MADEIRA_NO_EXE_WINDOW=1 skips it.
-        let exeWinBase: vm_address_t = 0x140000000
+        let exeWinBase = vm_address_t(MADEIRA_EXE_WINDOW_BASE)
         // ml1037: 128MB, not 256MB. The census on the iPhone 18 Pro read
         //   0x12067c000+505MB | [window 256MB] | 0x150000000+500MB | 0x16fa24000+261MB
         // i.e. the window itself was what split the low gap into pieces too small
@@ -273,7 +273,11 @@ enum StikJITHelper {
         // hole above it ~628MB contiguous. The largest fixed-base image we ship
         // against ends at +117MB; ntdll hands the window to the first fixed map
         // of >=64MB that fits, and reads the size from WINE_IOS_EXE_WINDOW.
-        let exeWinSize: vm_address_t = 0x8000000           // 128MB
+        // Now 352MB (MADEIRA_EXE_WINDOW_SIZE): Stellar Blade's SB-Win64-Shipping.exe
+        // has no relocations and SizeOfImage 0x15981000. The pool no longer has to
+        // share the low gap with it when MADEIRA_POOL_HIGH puts the pool high.
+        let exeWinSize = vm_address_t(MADEIRA_EXE_WINDOW_SIZE)
+        let exeWinDesc = String(format: "[0x%lx,0x%lx) (%luMB)", Int(exeWinBase), Int(exeWinBase + exeWinSize), Int(exeWinSize >> 20))
         func overlapsExeWindow(_ base: vm_address_t, _ len: vm_address_t) -> Bool {
             return base < exeWinBase + exeWinSize && base + len > exeWinBase
         }
@@ -283,14 +287,18 @@ enum StikJITHelper {
             // ml1040: already held since image load (JITAllocator.c constructor).
             windowHeld = true
             setenv("WINE_IOS_EXE_WINDOW", String(format: "%lx:%lx", Int(exeWinBase), Int(exeWinSize)), 1)
-            LogStore.shared.log("ml1040: executable window [0x140000000,+128MB) held since image load", level: .success)
+            LogStore.shared.log("ml1040: executable window \(exeWinDesc) held since image load"
+                + (madeira_early_window_from_image != 0
+                   ? String(format: " (reserved by the image itself at 0x%lx)", Int(madeira_early_reserve_base))
+                   : String(format: " (claimed by the constructor; the image's reservation landed at 0x%lx)", Int(madeira_early_reserve_base))),
+                level: .success)
         } else if !skipWindow {
             var winAddr: vm_address_t = exeWinBase
             let krWin = vm_allocate(mach_task_self_, &winAddr, vm_size_t(exeWinSize), 0 /* VM_FLAGS_FIXED */)
             if krWin == KERN_SUCCESS && winAddr == exeWinBase {
                 windowHeld = true
                 setenv("WINE_IOS_EXE_WINDOW", String(format: "%lx:%lx", Int(exeWinBase), Int(exeWinSize)), 1)
-                LogStore.shared.log("ml1034: reserved executable window [0x140000000,0x150000000) BEFORE "
+                LogStore.shared.log("ml1034: reserved executable window \(exeWinDesc) BEFORE "
                     + "RX allocation - a fixed-base main image can now load where it must; "
                     + "ntdll releases it on demand", level: .success)
             } else {
@@ -333,6 +341,33 @@ enum StikJITHelper {
         let goodLow = 0x119000000
         let guestLo = 0x7000000000
         let guestHi = 0x8000000000
+
+        // HIGH POOL. The low gap is ~1.4GB shared by the runtime, the executable
+        // window and the pool, so the pool has been capped at the largest hole in
+        // it (432-608MB measured) -- less than a large game's image copies alone
+        // (Stellar Blade: ~530MB before its first frame). The top window starts at
+        // 0x7000000000, directly above the GPU carveout, and the debugger's
+        // first-fit already lands there whenever no low hole fits; ml78 refused it
+        // because PCs there were classified as guest code, but every classifier now
+        // tests the pool range first (signal_arm64_ios.c ios_mach_deliver_guest_
+        // exception_inner, ios_fault_is_foreign), and the share probe reads back
+        // before it executes. The pool must end below 0x7400000000: that is the
+        // edge of the band signal_arm64_ios.c claims guest faults in, and FEX
+        // reports RIPs at or above it as host leaks ([iOS-bogusrip]). The RW alias
+        // follows the RX pool (its 0x7000000000 hint then resolves to the first
+        // free address above it) and ntdll's usable-VA floor moves above both.
+        // Places the JIT pool at the bottom of the top address window (0x7000000000, above the GPU carveout) instead of the scarce low gap, so it can be as large as madeira.cfg's pool asks and the low gap only holds the executable window. Needs a 512 GB address map. Experimental: off unless set.
+        let highPoolWanted = MadeiraConfig.flag("MADEIRA_POOL_HIGH", fallback: false)
+        let highPoolCeiling = 0x7400000000
+        var mapLo: UInt64 = 0, mapHi: UInt64 = 0
+        let haveMap = jit_task_map_range(&mapLo, &mapHi)
+        let highPool = highPoolWanted && haveMap && mapHi >= UInt64(guestHi)
+        if highPoolWanted && !highPool {
+            LogStore.shared.log(String(format: "[pool-high] MADEIRA_POOL_HIGH ignored: the address map ends at 0x%llx; the top window needs a 512 GB map",
+                                       haveMap ? mapHi : 0), level: .error)
+        } else if highPool {
+            LogStore.shared.log("[pool-high] placing the \(poolSize >> 20)MB pool in [0x7000000000,0x7400000000)")
+        }
 
         // ml1036: HOLE CENSUS, then size the pool to what can actually be placed.
         //
@@ -395,7 +430,18 @@ enum StikJITHelper {
             LogStore.shared.log("ml1036: free holes >=64MB in [0x119000000,0x7000000000) with the window held: "
                 + (desc.isEmpty ? "NONE" : desc))
             let largest = holes.map { $0.size }.max() ?? 0
-            if largest < vm_address_t(poolSize) {
+            if highPool {
+                // Every low hole that could take the pool would win first-fit; hold them
+                // for the request so it falls through to the top window.
+                for h in holes where h.size >= vm_address_t(poolSize) {
+                    var a = h.base
+                    if vm_allocate(mach_task_self_, &a, vm_size_t(h.size), 0 /* FIXED */) == KERN_SUCCESS && a == h.base {
+                        plugs.append((a, vm_size_t(h.size)))
+                        LogStore.shared.log(String(format: "[pool-high] plugged low hole 0x%lx+%luMB so first-fit lands in the top window",
+                                                   Int(h.base), Int(h.size >> 20)))
+                    } else if a != h.base { vm_deallocate(mach_task_self_, a, vm_size_t(h.size)) }
+                }
+            } else if largest < vm_address_t(poolSize) {
                 let fit = Int(largest) & ~((16 << 20) - 1)
                 if fit >= 256 << 20 {
                     LogStore.shared.log("ml1036: no hole fits a \(poolSize >> 20)MB pool — SHRINKING to \(fit >> 20)MB "
@@ -430,10 +476,10 @@ enum StikJITHelper {
             // ends under 0x140000000, so a pool there is safe; steering only helps
             // if the target fits.
             let aboveFits = holes.contains { $0.base + $0.size > earlyPoolBase && $0.size >= vm_address_t(poolSize) }
-            if earlyPoolBase != 0 && windowHeld && !aboveFits {
+            if !highPool && earlyPoolBase != 0 && windowHeld && !aboveFits {
                 LogStore.shared.log("ml1040: no hole above the window fits \(poolSize >> 20)MB — not plugging, the pool takes the hole below it")
             }
-            if earlyPoolBase != 0 && windowHeld && aboveFits {
+            if !highPool && earlyPoolBase != 0 && windowHeld && aboveFits {
                 for h in holes where h.base + h.size <= earlyPoolBase && h.size >= vm_address_t(poolSize) {
                     var a = h.base
                     if vm_allocate(mach_task_self_, &a, vm_size_t(h.size), 0 /* FIXED */) == KERN_SUCCESS && a == h.base {
@@ -458,7 +504,13 @@ enum StikJITHelper {
             // ml1034: a pool covering 0x140000000 displaces a non-relocatable
             // main image, which is fatal later and unrecoverable.
             let hitsExeWindow = overlapsExeWindow(vm_address_t(a), vm_address_t(poolSize))
-            if a >= goodLow && !inGuestWindow && !hitsExeWindow {
+            let inHighBand = a >= guestLo && a + poolSize <= highPoolCeiling
+            if a >= goodLow && (!inGuestWindow || (highPool && inHighBand)) && !hitsExeWindow {
+                if highPool {
+                    LogStore.shared.log(String(format: "[pool-high] RX pool at 0x%lx (%@)", a,
+                                               inHighBand ? "top window" : "low gap: the top window was not reached"),
+                                        level: inHighBand ? .success : .error)
+                }
                 rxPtrOpt = p
                 break
             }

@@ -111,11 +111,19 @@ void jit_set_log_callback(jit_log_callback_t callback);
 #endif
 
 
+/* The x64 executable window: the default ImageBase of x64 Windows executables,
+ * which an image without relocations (Stellar Blade's SB-Win64-Shipping.exe:
+ * SizeOfImage 0x15981000) can only be loaded at. 352MB; it was 128MB (ml1037). */
+#define MADEIRA_EXE_WINDOW_BASE 0x140000000ul
+#define MADEIRA_EXE_WINDOW_SIZE 0x16000000ul
+
 /* ml1040: address space claimed by a constructor at image load, before the app's
- * own runtime allocations can fragment the scarce low gap. See JITAllocator.m. */
+ * own runtime allocations can fragment the scarce low gap. See JITAllocator.c. */
+extern unsigned long madeira_early_reserve_base;  /* the image's zero-fill reservation */
+extern int madeira_early_window_from_image;       /* window held since the image was mapped */
 extern unsigned long madeira_early_window_base;   /* 0x140000000 if held, else 0 */
 extern unsigned long madeira_early_window_size;
-extern unsigned long madeira_early_pool_base;     /* placeholder directly above the window, else 0 */
+extern unsigned long madeira_early_pool_base;     /* pool placeholder next to the window (below it when the image holds both), else 0 */
 extern unsigned long madeira_early_intruder_base, madeira_early_intruder_size;   /* ml1135: first mapping above the window when no placeholder fit */
 extern unsigned madeira_early_intruder_tag, madeira_early_intruder_prot;
 extern unsigned long madeira_early_pool_size;

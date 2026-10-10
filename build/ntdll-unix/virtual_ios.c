@@ -5585,11 +5585,19 @@ static int ios_va_pressure;
  * any pool-size experiment a two-edit change with a silent, ugly failure if you
  * forget the second one. Computing it from the pool the app actually allocated
  * removes that trap entirely. Falls back to the 896MB pairing until the pool
- * size is published, which is before any use site runs. */
+ * size is published, which is before any use site runs.
+ * MADEIRA_POOL_HIGH puts the RX pool itself at 0x7000000000 and the RW alias
+ * right after it, so the floor is the end of whichever of the two sits in the
+ * top window. */
 static inline ULONG_PTR ios_usable_va_floor_get(void)
 {
     size_t sz = ios_jit_pool_size_global;
-    return (ULONG_PTR)0x7000000000ULL + (ULONG_PTR)(sz ? sz : (896ULL << 20));
+    ULONG_PTR floor = (ULONG_PTR)0x7000000000ULL + (ULONG_PTR)(sz ? sz : (896ULL << 20));
+    ULONG_PTR rx = (ULONG_PTR)ios_jit_rx_base_global, rw = (ULONG_PTR)ios_jit_rw_base_global;
+
+    if (sz && rx >= 0x7000000000ULL && rx < 0x7400000000ULL && rx + sz > floor) floor = rx + sz;
+    if (sz && rw >= 0x7000000000ULL && rw < 0x7400000000ULL && rw + sz > floor) floor = rw + sz;
+    return floor;
 }
 #define ios_usable_va_floor (ios_usable_va_floor_get())
 
