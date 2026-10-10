@@ -325,6 +325,14 @@ static inline int ios_in_jit2( uint64_t a )
     return ios_jit2_rx_base_global && a >= ios_jit2_rx_base_global &&
            a < ios_jit2_rx_base_global + ios_jit2_size_global;
 }
+
+/* [a, a+len) lies wholly in the pool or wholly in the second code region, so
+ * `rw + (a - rx)` is its RW alias. FEX's backpatch lock CASes code there. */
+static inline int ios_jit_span_ok( uintptr_t rx, size_t sz, uint64_t a, size_t len )
+{
+    if (rx && sz >= len && a >= rx && a - rx <= sz - len) return 1;
+    return len && ios_in_jit2( a ) && ios_in_jit2( a + len - 1 );
+}
 volatile int64_t ios_exc_x18_fixes = 0;
 volatile int64_t ios_exc_usd_fixes = 0;
 volatile int ios_exc_thread_alive = 0;
@@ -3669,7 +3677,7 @@ static void *ios_mach_exception_thread( void *arg )
                                 unsigned len = bytes - done;
                                 a = ea + done;
                                 if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
-                                part_rw[parts] = (rx && rw && sz && a >= rx && a - rx <= sz - len)
+                                part_rw[parts] = (rw && ios_jit_span_ok( rx, sz, a, len ))
                                                  ? rw + (a - rx) : ios_jit_anon_alias_lookup( (uintptr_t)a );
                                 if (!part_rw[parts]) break;
                                 part_len[parts++] = len;
@@ -3757,7 +3765,7 @@ static void *ios_mach_exception_thread( void *arg )
                                 unsigned len = bytes - done;
                                 a = ea + done;
                                 if (len > 0x4000 - (a & 0x3fff)) len = 0x4000 - (unsigned)(a & 0x3fff);
-                                part_rw[parts] = (rx && rw && sz && a >= rx && a - rx <= sz - len)
+                                part_rw[parts] = (rw && ios_jit_span_ok( rx, sz, a, len ))
                                                  ? rw + (a - rx) : ios_jit_anon_alias_lookup( (uintptr_t)a );
                                 if (!part_rw[parts]) break;
                                 part_len[parts++] = len;
@@ -3973,7 +3981,7 @@ static void *ios_mach_exception_thread( void *arg )
                         (insn & 0xbfa07c00u) == 0x88a07c00u)
                     {
                         unsigned cas_width = (insn & 0x40000000u) ? 8 : 4;
-                        if (sz >= cas_width && fault_addr - rx <= sz - cas_width &&
+                        if (ios_jit_span_ok( rx, sz, fault_addr, cas_width ) &&
                             ios_mach_emulate_cas(insn, rw_addr, state.__x))
                         {
                             static unsigned cas_mach_logs;
