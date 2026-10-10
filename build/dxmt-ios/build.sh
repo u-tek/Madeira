@@ -180,6 +180,24 @@ echo "=== winemetal unix (Objective-C) ==="
 compile_objc "$DXMT_SRC/winemetal/unix/winemetal_unix.c" winemetal_unix
 compile_objc "$DXMT_SRC/winemetal/unix/cache.c"          cache
 
+echo "=== airconv shader headers ==="
+# airconv_context.cpp embeds three AIR modules as C arrays. meson builds them with
+# metalir_generator then hexdump_generator (src/airconv/meson.build:59-71, no
+# metallib step); same flags and symbol names here, cached like dxmt_command.h.
+mkdir -p "$BUILD_DIR/shader-headers"
+for s in air_msad air_samplepos air_tessellation; do
+    src="$DXMT_SRC/airconv/shaders/$s.metal"
+    if [ ! -f "$BUILD_DIR/shader-headers/$s.h" ] || [ "$src" -nt "$BUILD_DIR/shader-headers/$s.h" ] \
+       || [ "$0" -nt "$BUILD_DIR/shader-headers/$s.h" ]; then
+        (cd "$BUILD_DIR/shader-headers" \
+         && xcrun -sdk macosx metal -std=metal3.1 --target=air64-apple-macos14.0 -o "$s.air" -c "$src" \
+         && xxd -n "$s" -i "$s.air" "$s.h")
+        echo "  $s.h OK"
+    else
+        echo "  $s.h CACHED"
+    fi
+done
+
 echo "=== airconv (C++ 20, needs LLVM headers) ==="
 for cpp in airconv_context.cpp air_type.cpp air_signature.cpp air_operations.cpp \
            dxbc_converter.cpp dxbc_converter_gs.cpp dxbc_converter_ts.cpp \

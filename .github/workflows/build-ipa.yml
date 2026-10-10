@@ -210,7 +210,8 @@ jobs:
 
       - name: Madeira Dock
         if: ${{ !cancelled() }}
-        run: bash build/madeira-dock/build.sh
+        # The script's LLVM_MINGW is the toolchain's bin directory, not its name.
+        run: LLVM_MINGW="$PWD/toolchains/$LLVM_MINGW/bin" bash build/madeira-dock/build.sh
 
       - name: App
         run: bash ci/package-ipa.sh "Madeira-${{ steps.rev.outputs.short }}.ipa"
