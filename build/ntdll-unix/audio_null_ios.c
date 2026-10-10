@@ -363,6 +363,11 @@ struct ios_stream {
     _Atomic uint32_t st_cbs;       /* render passes that mixed this stream */
     _Atomic uint32_t st_short_cbs; /* passes that ran short */
     _Atomic uint32_t st_cb_max;    /* largest render pass, device frames */
+    /* Lifetime and refused GetBuffer calls, reported at release: a title that
+     * tears its client down every few seconds (Stellar Blade's XAudio2 redist
+     * did, 121 times) shows whether this driver gave it a reason to. */
+    uint64_t created_mach;
+    _Atomic uint32_t st_too_large;
 };
 
 /* ml739: one stream object per client, mirroring Wine's CoreAudio driver.
@@ -1191,6 +1196,7 @@ static NTSTATUS ios_create_stream(void *args) {
         p->result = E_OUTOFMEMORY;
         return STATUS_SUCCESS;
     }
+    s->created_mach = mach_absolute_time();
     p->result = S_OK;
     return STATUS_SUCCESS;
 }
@@ -1205,6 +1211,15 @@ static NTSTATUS ios_release_stream(void *args) {
      * leaves its loop, join that thread, and only then dispose the AudioUnit
      * so the render callback cannot still be running against memory we are
      * about to free. Nothing here touches another client's stream. */
+    {
+        static unsigned rel_n;
+        if (++rel_n <= 40 || (rel_n % 50) == 0)
+            fprintf(stderr, "[ios_audio] release_stream #%u lived %.2f s, %.2f s of audio written, "
+                    "too-large refusals %u, short passes %u/%u\n", rel_n,
+                    s->created_mach ? mach_to_ns(mach_absolute_time() - s->created_mach) / 1e9 : -1.0,
+                    s->sample_rate ? (double)atomic_load(&s->write_pos) / s->sample_rate : 0.0,
+                    atomic_load(&s->st_too_large), atomic_load(&s->st_short_cbs), atomic_load(&s->st_cbs));
+    }
     s->valid = 0;
     s->started = 0;
     if (p->timer_thread) {
@@ -1426,6 +1441,7 @@ static NTSTATUS ios_get_render_buffer(void *args) {
         uint64_t padding = atomic_load(&s->write_pos) - atomic_load(&s->play_pos);
         if (p->frames + padding > s->buffer_frames) {
             p->result = (HRESULT)0x88890006L; /* AUDCLNT_E_BUFFER_TOO_LARGE */
+            atomic_fetch_add_explicit(&s->st_too_large, 1, memory_order_relaxed);
             if (p->data) *p->data = NULL;
             return STATUS_SUCCESS;
         }
