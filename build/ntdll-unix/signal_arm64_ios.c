@@ -4436,7 +4436,8 @@ wx_done: ;
                     extern void *ios_jit_rx_base_global;
                     extern size_t ios_jit_pool_size_global;
                     uint64_t rx = (uint64_t)(uintptr_t)ios_jit_rx_base_global;
-                    int in_pool_rx = rx && fa >= rx && fa < rx + ios_jit_pool_size_global;
+                    int in_pool_rx = (rx && fa >= rx && fa < rx + ios_jit_pool_size_global) ||
+                                     ios_in_jit2( fa );
                     int in_band    = (fa >= 0x7C00000000ULL && fa < 0x8000000000ULL);
 
                     if (in_pool_rx || in_band)
@@ -12278,7 +12279,7 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          *
          * Order: wine repair first; then a safe readability probe decides
          * honest-AV (unreadable) vs genuine-alignment 80000002 (readable). */
-        if (!is_exec_fault && !(rx && fault >= rx && fault < rx + pool_sz))
+        if (!is_exec_fault && !(rx && fault >= rx && fault < rx + pool_sz) && !ios_in_jit2( fault ))
         {
             EXCEPTION_RECORD vrec = { EXCEPTION_ACCESS_VIOLATION };
             mach_vm_size_t rd_out = 0;
