@@ -356,7 +356,13 @@ enum StikJITHelper {
         // reports RIPs at or above it as host leaks ([iOS-bogusrip]). The RW alias
         // follows the RX pool (its 0x7000000000 hint then resolves to the first
         // free address above it) and ntdll's usable-VA floor moves above both.
-        // Places the JIT pool at the bottom of the top address window (0x7000000000, above the GPU carveout) instead of the scarce low gap, so it can be as large as madeira.cfg's pool asks and the low gap only holds the executable window. Needs a 512 GB address map. Experimental: off unless set.
+        // MEASURED 2026-10-10, iPhone18,2 / iOS 27.0: placement works (RX
+        // 0x7000000000, RW 0x7048000000) but nothing in the pool executes -- the
+        // first pool call (ntdll at 0x70000e037c, then the syscall trampoline at
+        // 0x7000000008) takes an instruction-fetch fault on every retry although
+        // the pages report r-x, until 2000 redeliveries end the process. The same
+        // wall as ml78; left opt-in for other devices only.
+        // Places the JIT pool at the bottom of the top address window (0x7000000000, above the GPU carveout) instead of the scarce low gap, so it can be as large as madeira.cfg's pool asks and the low gap only holds the executable window. Needs a 512 GB address map. Experimental: off unless set; on an iPhone 17 Pro (iOS 27) code there does not execute.
         let highPoolWanted = MadeiraConfig.flag("MADEIRA_POOL_HIGH", fallback: false)
         let highPoolCeiling = 0x7400000000
         var mapLo: UInt64 = 0, mapHi: UInt64 = 0

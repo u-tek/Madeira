@@ -912,13 +912,16 @@ void jit_wx_probe(void) {
  * so a zero-fill segment of our own holds the window from the moment the image
  * is mapped. dyld places the image first-fit just above the main executable
  * (bases 0x1023dc000..0x104908000 observed); the segment starts ~80MB into the
- * image, so MADEIRA_VA_RESERVE_SIZE covers [0x120000000, 0x156000000) -- the
- * pool placeholder below the window and the window -- for any image base in
- * [0x102000000, 0x108000000], and the image still ends below the main thread's
- * stack (~0x16b000000). The constructor keeps those two ranges and gives the
- * rest back at once. Zero-fill and never touched: it costs no memory. If dyld
- * put the image anywhere else, the whole segment is returned and the claims
- * below run as before. */
+ * image, so MADEIRA_VA_RESERVE_SIZE covers [0x119000000, 0x156000000) -- the
+ * pool placeholder below the window and the window -- for any image base up to
+ * ~0x114000000, and the image still ends below the main thread's stack
+ * (~0x16b000000). The placeholder starts at the pool's low bound
+ * (MADEIRA_POOL_FLOOR, StikJITHelper.swift goodLow) or the segment, whichever is
+ * higher: 624MB from a low base, where a fixed 512MB left the 112MB under it to
+ * the runtime. The constructor keeps those two ranges and gives the rest back at
+ * once. Zero-fill and never touched: it costs no memory. If dyld put the image
+ * anywhere else, the whole segment is returned and the claims below run as
+ * before. */
 #include <mach/mach.h>
 unsigned long madeira_early_window_base, madeira_early_window_size;
 unsigned long madeira_early_pool_base, madeira_early_pool_size;
@@ -928,7 +931,9 @@ unsigned long madeira_early_reserve_base;   /* where dyld put the zero-fill segm
 int madeira_early_window_from_image;        /* 1: window (and placeholder) held since the image was mapped */
 
 #define MADEIRA_VA_RESERVE_SIZE 0x55000000ul
-#define MADEIRA_EARLY_POOL_BELOW 0x20000000ul   /* 512MB placeholder ending at the window */
+#define MADEIRA_POOL_FLOOR 0x119000000ul       /* no pool below it: FEX mode A (StikJITHelper.swift) */
+#define MADEIRA_EARLY_POOL_MIN 0x10000000ul    /* a smaller placeholder is not worth holding */
+#define MADEIRA_POOL_GUARD 0x1000000ul         /* kept under the placeholder for good, see below */
 __asm__(".globl _madeira_va_reserve\n"
         ".private_extern _madeira_va_reserve\n"
         ".zerofill __MADEIRA_VA,__reserve,_madeira_va_reserve,0x55000000,14\n");
@@ -938,17 +943,22 @@ __attribute__((constructor(101), used)) static void madeira_early_va_claim(void)
 {
     const vm_address_t win = MADEIRA_EXE_WINDOW_BASE, winsz = MADEIRA_EXE_WINDOW_SIZE;
     const vm_address_t r0 = (vm_address_t)madeira_va_reserve, r1 = r0 + MADEIRA_VA_RESERVE_SIZE;
-    const vm_address_t keep0 = win - MADEIRA_EARLY_POOL_BELOW, keep1 = win + winsz;
+    const vm_address_t keep0 = r0 > MADEIRA_POOL_FLOOR ? r0 : MADEIRA_POOL_FLOOR, keep1 = win + winsz;
     vm_address_t a = win;
     vm_size_t sz;
 
     madeira_early_reserve_base = r0;
-    if (r0 <= keep0 && keep1 <= r1) {
-        if (keep0 > r0) vm_deallocate(mach_task_self(), r0, keep0 - r0);
+    if (keep0 + MADEIRA_EARLY_POOL_MIN <= win && keep1 <= r1) {
+        /* The debugger's allocator is first-fit: free space directly under the
+         * released placeholder would start the pool below MADEIRA_POOL_FLOOR
+         * (a 512MB placeholder at 0x120000000 got its pool at 0x11ff9c000). A
+         * guard under it stays reserved for the life of the process. */
+        const vm_address_t guard = keep0 >= r0 + MADEIRA_POOL_GUARD ? keep0 - MADEIRA_POOL_GUARD : r0;
+        if (guard > r0) vm_deallocate(mach_task_self(), r0, guard - r0);
         if (r1 > keep1) vm_deallocate(mach_task_self(), keep1, r1 - keep1);
-        vm_protect(mach_task_self(), keep0, keep1 - keep0, 0, VM_PROT_NONE);
+        vm_protect(mach_task_self(), guard, keep1 - guard, 0, VM_PROT_NONE);
         madeira_early_window_base = win; madeira_early_window_size = winsz;
-        madeira_early_pool_base = keep0; madeira_early_pool_size = MADEIRA_EARLY_POOL_BELOW;
+        madeira_early_pool_base = keep0; madeira_early_pool_size = win - keep0;
         madeira_early_window_from_image = 1;
         return;
     }
