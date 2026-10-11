@@ -54,6 +54,7 @@ struct ms_waiter
     struct ms_link links[NTSYNC_MAX_WAIT_COUNT + 1];
     unsigned       count;        /* real objects (alert excluded) */
     int            all, has_alert, done, ownerdead;
+    int            kicked;       /* ml1259: the server queued a system APC for this thread */
     uint32_t       owner, index;
     uint64_t       wake_t;       /* ml1122: mach_absolute_time when a waker satisfied us */
 };
@@ -356,9 +357,138 @@ static uint64_t now_ns( clockid_t c )
 }
 
 /* ---- per-thread wait state ------------------------------------------------- */
-struct ms_thread { struct ms_waiter w; int waiting; };
+struct ms_thread
+{
+    struct ms_waiter  w;
+    int               waiting;
+    uint32_t          tid;                 /* ml1259: owner of this thread's last wait */
+    struct ms_thread *snext, *sprev;       /* ml1259: on g_sleepers while waiting (lock held) */
+};
 static pthread_key_t  g_key;
 static pthread_once_t g_key_once = PTHREAD_ONCE_INIT;
+
+/* ---- system APC kicks (ml1259) ----------------------------------------------
+ * The server runs the client half of async I/O (APC_ASYNC_IO), and other system
+ * APCs, on the thread that queued them. Upstream interrupts a thread that is not
+ * waiting in the server with SIGUSR1. On iOS that signal can't be sent, so
+ * queue_apc handed the APC to some other thread waiting in the server, or
+ * dropped it. With madsync almost no thread waits in the server: the APC was
+ * dropped, the async completed with nothing written to the caller's IOSB, and
+ * ws2_32's connect() read an uninitialised io.Status. Every Denuvo activation
+ * connect failed with 12029 that way (it passed with fastsync), and it is the
+ * likely cause of the services.exe RPC hang behind MADEIRA_MADSYNC_SESSION=0.
+ *
+ * Now the server's SIGUSR1 (mach_ios.c send_thread_signal) is a kick instead:
+ * it wakes the thread's madsync wait, or records the tid so its next wait sees
+ * it. A kicked thread leaves the wait, runs its queued system APCs through the
+ * runner ntdll registered (a zero-timeout interruptible server select, which
+ * is what usr1_handler's wait_suspend would have done), and waits again with
+ * the same deadline. The APC stays queued on the thread that issued the I/O. */
+#define MS_KICKED      (-2)
+#define MS_KICK_SLOTS  1024u                    /* power of two */
+#define MS_KICK_TOMB   1u                       /* Windows tids are multiples of 4, never 1 */
+static volatile uint32_t g_kick[MS_KICK_SLOTS];  /* pending tids; 0 = never used, TOMB = taken */
+static volatile unsigned g_nkick;                /* live entries; 0 lets every wait skip the table */
+static struct ms_thread *g_sleepers;             /* threads asleep in do_wait */
+static void (*g_apc_runner)(void);
+static unsigned long long g_kicks, g_kick_wakes, g_kick_runs;
+
+void madsync_set_apc_runner( void (*fn)(void) ) { g_apc_runner = fn; }
+
+/* Safe without the lock: slots are single words, and a stale read only delays a
+ * kick to the next wait. */
+static int ms_kick_find( uint32_t tid )
+{
+    unsigned i, h = (tid >> 2) & (MS_KICK_SLOTS - 1);
+    for (i = 0; i < MS_KICK_SLOTS; i++, h = (h + 1) & (MS_KICK_SLOTS - 1))
+    {
+        uint32_t v = g_kick[h];
+        if (v == tid) return (int)h;
+        if (!v) return -1;
+    }
+    return -1;
+}
+
+/* lock held */
+static void ms_kick_add_locked( uint32_t tid )
+{
+    unsigned i, h = (tid >> 2) & (MS_KICK_SLOTS - 1);
+    if (tid <= MS_KICK_TOMB || ms_kick_find( tid ) >= 0) return;
+    for (i = 0; i < MS_KICK_SLOTS; i++, h = (h + 1) & (MS_KICK_SLOTS - 1))
+    {
+        if (g_kick[h] > MS_KICK_TOMB) continue;
+        g_kick[h] = tid;
+        g_nkick++;
+        return;
+    }
+    dprintf( 2, "[madsync] ml1259 kick table full; tid %04x runs its APC at its next server wait\n", tid );
+}
+
+/* lock held */
+static int ms_kick_take_locked( uint32_t tid )
+{
+    int h = ms_kick_find( tid );
+    if (h < 0) return 0;
+    g_kick[h] = MS_KICK_TOMB;
+    if (!--g_nkick) memset( (void *)g_kick, 0, sizeof(g_kick) );   /* drop the tombstones */
+    return 1;
+}
+
+/* lock held */
+static void ms_sleepers_add( struct ms_thread *t )
+{
+    t->sprev = NULL;
+    t->snext = g_sleepers;
+    if (g_sleepers) g_sleepers->sprev = t;
+    g_sleepers = t;
+}
+
+/* lock held */
+static void ms_sleepers_del( struct ms_thread *t )
+{
+    if (t->sprev) t->sprev->snext = t->snext;
+    else if (g_sleepers == t) g_sleepers = t->snext;
+    if (t->snext) t->snext->sprev = t->sprev;
+    t->snext = t->sprev = NULL;
+}
+
+/* Called by the server (mach_ios.c) where upstream sends SIGUSR1 for a system APC. */
+int madsync_kick( unsigned int tid )
+{
+    sigset_t old;
+    struct ms_thread *t;
+    unsigned long long n;
+    int woke = 0;
+
+    ms_lock( &old );
+    for (t = g_sleepers; t; t = t->snext)
+    {
+        if (t->w.owner != tid || t->w.done) continue;
+        t->w.kicked = 1;
+        semaphore_signal( t->w.sem );
+        woke = 1;
+        break;
+    }
+    if (!woke) ms_kick_add_locked( tid );
+    n = ++g_kicks;
+    if (woke) g_kick_wakes++;
+    ms_unlock( &old );
+    if (n <= 16 || !(n & 1023))
+        dprintf( 2, "[madsync] ml1259 system APC kick #%llu tid %04x: %s\n",
+                 n, tid, woke ? "woke its in-process wait" : "pending until its next wait" );
+    return 1;
+}
+
+static void ms_run_system_apcs(void)
+{
+    int saved = errno;
+    if (g_apc_runner)
+    {
+        g_apc_runner();
+        __sync_fetch_and_add( &g_kick_runs, 1 );
+    }
+    errno = saved;
+}
 
 static void ms_release_refs_locked( struct ms_waiter *w )
 {
@@ -375,8 +505,10 @@ static void ms_thread_destroy( void *arg )
     {
         waiter_unlink( &t->w );
         ms_release_refs_locked( &t->w );
+        ms_sleepers_del( t );
         t->waiting = 0;
     }
+    if (g_nkick && t->tid) ms_kick_take_locked( t->tid );   /* ml1259: no stale kick for a dead tid */
     ms_unlock( &old );
     semaphore_destroy( mach_task_self(), t->w.sem );
     free( t );
@@ -394,7 +526,10 @@ static struct ms_thread *ms_thread_get(void)
     return t;
 }
 
-static int do_wait( struct ntsync_wait_args *args, int all )
+/* One wait. Returns MS_KICKED, without consuming anything, when a system APC is
+ * queued for this thread and nothing completed the wait; *kicked says the APCs
+ * need running either way. */
+static int do_wait_once( struct ntsync_wait_args *args, int all, int *kicked )
 {
     struct ms_thread *t;
     struct ms_waiter *w;
@@ -427,7 +562,7 @@ static int do_wait( struct ntsync_wait_args *args, int all )
             struct ms_obj *o = obj_of( (int)args->alert );
             any = !o || obj_ready( o, args->owner );
         }
-        if (!any)
+        if (!any && !(g_nkick && ms_kick_find( args->owner ) >= 0))   /* ml1259: a kick takes the locked path */
         {
             __sync_fetch_and_add( &g_polls, 1 );
             errno = ETIMEDOUT;
@@ -442,6 +577,13 @@ static int do_wait( struct ntsync_wait_args *args, int all )
     w->count = args->count; w->all = all; w->owner = args->owner; w->index = ~0u;
 
     ms_lock( &old );
+    t->tid = args->owner;
+    if (g_nkick && ms_kick_take_locked( args->owner ))   /* ml1259: run queued system APCs first */
+    {
+        ms_unlock( &old );
+        *kicked = 1;
+        return MS_KICKED;
+    }
     g_waits++;
     for (i = 0; i < w->count; i++)
     {
@@ -490,6 +632,12 @@ static int do_wait( struct ntsync_wait_args *args, int all )
         ms_lock( &old );
         if (ready && waiter_try( w )) g_spin_hits++;
     }
+    if (!w->done && g_nkick && ms_kick_take_locked( w->owner ))   /* ml1259: kicked while we spun */
+    {
+        ms_unlock( &old );
+        *kicked = 1;
+        return MS_KICKED;
+    }
     if (!w->done)
     {
         const int realtime = (args->flags & NTSYNC_WAIT_REALTIME) != 0;
@@ -503,8 +651,9 @@ static int do_wait( struct ntsync_wait_args *args, int all )
             o->head.prev->next = l; o->head.prev = l;
         }
         t->waiting = 1;
+        ms_sleepers_add( t );
         g_blocked++;
-        while (!w->done)
+        while (!w->done && !w->kicked)
         {
             kern_return_t kr;
             if (args->timeout == ~(uint64_t)0)
@@ -532,7 +681,13 @@ static int do_wait( struct ntsync_wait_args *args, int all )
         if (!w->done) waiter_try( w );                   /* a last look before declaring a timeout */
         waiter_unlink( w );
         ms_release_refs_locked( w );
+        ms_sleepers_del( t );
         t->waiting = 0;
+        if (w->kicked)
+        {
+            *kicked = 1;
+            if (!w->done) { ms_unlock( &old ); return MS_KICKED; }
+        }
     }
 
     if (w->done)
@@ -543,6 +698,18 @@ static int do_wait( struct ntsync_wait_args *args, int all )
     else { errno = ETIMEDOUT; ret = -1; }
     ms_unlock( &old );
     return ret;
+}
+
+/* ml1259: a kicked wait runs the thread's system APCs, then waits again with the
+ * same absolute deadline (one of them may be what sets the object it waits on). */
+static int do_wait( struct ntsync_wait_args *args, int all )
+{
+    for (;;)
+    {
+        int kicked = 0, ret = do_wait_once( args, all, &kicked );
+        if (kicked) ms_run_system_apcs();
+        if (ret != MS_KICKED) return ret;
+    }
 }
 
 /* ---- the "driver" entry point --------------------------------------------- */
@@ -663,6 +830,8 @@ int madsync_ioctl( int fd, unsigned long req, void *arg )
                  g_lat_n, g_lat_n ? g_lat_ticks / ms_ticks_per_us() / g_lat_n : 0.0,
                  g_lat_hist[0], g_lat_hist[1], g_lat_hist[2], g_lat_hist[3], g_lat_hist[4], g_lat_hist[5],
                  g_contended, g_lock_wait_ticks / ms_ticks_per_us() / 1000.0, g_spin_tries, g_spin_hits );
+        dprintf( 2, "[madsync] ml1259 system APC kicks %llu (%llu woke a wait), %llu runs, %u pending\n",
+                 g_kicks, g_kick_wakes, g_kick_runs, g_nkick );
     }
     ms_unlock( &ms_old );
     return ret;

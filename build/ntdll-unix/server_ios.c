@@ -2534,6 +2534,21 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
 }
 
 
+/* ml1259: madsync woke this thread because the server queued a system APC for
+ * it (its stand-in for SIGUSR1). Run them the way usr1_handler's wait_suspend
+ * would: an interruptible select that has already timed out. server_select
+ * loops on STATUS_KERNEL_APC, so every queued system APC runs; no user APC is
+ * delivered because the select is not alertable. */
+static void ios_madsync_run_system_apcs( void )
+{
+    struct user_apc apc;
+
+    server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, &apc );
+}
+
+extern void madsync_set_apc_runner( void (*fn)(void) );
+
+
 /* helper function to perform a server-side wait on an internal handle without
  * using the fast synchronization path */
 unsigned int server_wait_for_object( HANDLE handle, BOOL alertable, const LARGE_INTEGER *timeout )
@@ -4275,6 +4290,7 @@ size_t server_init_process(void)
                 /* ml1058: userspace ntsync (build/madsync). The "device" is a constant
                  * pseudo fd and the server sends nothing for it. */
                 inproc_device_fd = 0x6fffffff /* MADSYNC_DEVICE_FD */;
+                madsync_set_apc_runner( ios_madsync_run_system_apcs );   /* ml1259 */
             }
         }
     }
@@ -4387,6 +4403,7 @@ size_t server_init_process_child( int child_fd_socket )
             {
                 /* ml1058: nothing was sent, so nothing to receive or close. */
                 if (inproc_device_fd < 0) inproc_device_fd = 0x6fffffff /* MADSYNC_DEVICE_FD */;
+                madsync_set_apc_runner( ios_madsync_run_system_apcs );   /* ml1259 */
             }
         }
     }

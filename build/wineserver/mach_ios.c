@@ -377,8 +377,29 @@ extern int __pthread_kill( mach_port_t, int );
 int send_thread_signal( struct thread *thread, int sig )
 {
     int ret = -1;
-    mach_port_t process_port = get_process_port( thread->process );
+    mach_port_t process_port;
 
+#ifdef WINE_IOS
+    /* ml1259: there is no per-process task port, so the signal below always
+     * fails. queue_apc sends SIGUSR1 when it queues a system APC (the client
+     * half of async I/O) for a thread that is not waiting in the server; on
+     * failure the APC went to another thread waiting in the server, or was
+     * dropped. Under madsync nearly every wait is in-process, so it was dropped
+     * and the I/O completed with an unwritten IOSB. Kick the thread's madsync
+     * wait instead (build/madsync/madsync.c): the APC stays queued on it and
+     * runs when that wait, or its next one, wakes. fastsync is unchanged. */
+    {
+        extern int madsync_enabled( void );
+        extern int madsync_kick( unsigned int tid );
+
+        if (sig == SIGUSR1 && madsync_enabled())
+        {
+            if (thread->unix_pid == -1 || thread->state == TERMINATED) return 0;
+            return madsync_kick( thread->id );
+        }
+    }
+#endif
+    process_port = get_process_port( thread->process );
     if (thread->unix_pid != -1 && process_port)
     {
         mach_msg_type_name_t type;

@@ -67,6 +67,10 @@ extern int  madsync_ref( int fd );                                   /* another 
 /* The server->client hand-off that replaces SCM_RIGHTS for pseudo fds. */
 extern void madsync_post( unsigned int pid, unsigned int handle, int fd );
 extern int  madsync_take( unsigned int pid, unsigned int handle );
+/* ml1259: the server's stand-in for SIGUSR1 (a system APC is queued for tid), and
+ * how ntdll runs a kicked thread's system APCs. */
+extern int  madsync_kick( unsigned int tid );
+extern void madsync_set_apc_runner( void (*fn)(void) );
 
 #ifndef MADSYNC_IMPLEMENTATION
 #define ioctl(fd, req, arg) madsync_ioctl( (fd), (unsigned long)(req), (void *)(arg) )
