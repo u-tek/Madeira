@@ -25,6 +25,7 @@
 
 #include <assert.h>
 #include <pthread.h>
+#include <string.h>
 
 #include "ntstatus.h"
 #include "ntgdi_private.h"
@@ -719,12 +720,78 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
     return TRUE;
 }
 
+/* ml1260: answer a known, harmless message box with OK, as a tap would.
+ * Stellar Blade (and Sony's other PC ports) shows "The PlayStation(R) PC SDK
+ * Runtime cannot start because it is missing from your computer." on its main
+ * thread at every launch, and carries on once it is closed. The runtime is a
+ * separate Windows install (MSIs plus a resident PsPcSdkAppMgr.exe) that only
+ * serves PSN account linking, and is not worth its memory here. The box's body
+ * is a static control whose text is set before its last layout move; when it
+ * matches, the dialog gets WM_COMMAND IDOK, which a message box's dialog proc
+ * ends with IDOK.
+ * madeira.cfg env.MADEIRA_DISMISS_DIALOGS: unset = the PS SDK runtime box only;
+ * 0 = off; anything else = '|'-separated substrings of the text to answer. */
+static void winios_auto_dismiss( HWND hwnd )
+{
+    static const char *list;
+    static HWND last_root;
+    static unsigned count;
+    WCHAR txtW[256];
+    char txt[256];
+    const char *p;
+    HWND root;
+    int j, n;
+
+    if (!list)
+    {
+        const char *env = getenv( "MADEIRA_DISMISS_DIALOGS" );
+        list = env ? env : "PlayStation(R) PC SDK Runtime cannot start";
+    }
+    if (!*list || !strcmp( list, "0" )) return;
+    if (!(get_window_long( hwnd, GWL_STYLE ) & WS_CHILD)) return;
+
+    n = NtUserInternalGetWindowText( hwnd, txtW, ARRAY_SIZE(txtW) );
+    if (n <= 0) return;
+    for (j = 0; j < n && j < (int)sizeof(txt) - 1; j++)
+        txt[j] = (txtW[j] >= 32 && txtW[j] < 127) ? (char)txtW[j] : '?';
+    txt[j] = 0;
+
+    for (p = list; *p; )
+    {
+        const char *end = strchr( p, '|' );
+        size_t len = end ? (size_t)(end - p) : strlen( p );
+        char want[256];
+
+        if (len && len < sizeof(want))
+        {
+            memcpy( want, p, len );
+            want[len] = 0;
+            if (strstr( txt, want ))
+            {
+                root = NtUserGetAncestor( hwnd, GA_ROOT );
+                if (!root || root == hwnd || root == last_root) return;
+                last_root = root;
+                NtUserPostMessage( root, WM_COMMAND, MAKEWPARAM( IDOK, BN_CLICKED ), 0 );
+                if (++count <= 16)
+                    dprintf( 2, "[dismiss] ml1260 answered OK to dialog %p: \"%s\" "
+                             "(madeira.cfg env.MADEIRA_DISMISS_DIALOGS = 0 shows it)\n", root, txt );
+                return;
+            }
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+}
+
 /* pWindowPosChanged wrapper: dereference window_rects HERE (Winios.m
  * cannot include wine headers) and forward plain ints for the layer
  * frame; chain to the Winios.m hook afterwards. */
 static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                            const struct window_rects *new_rects, struct window_surface *surface )
 {
+    if (!IsRectEmpty( &new_rects->visible ) && !(swp_flags & SWP_HIDEWINDOW))
+        winios_auto_dismiss( hwnd );   /* ml1260 */
+
     /* desktop mode, or a top-level window in game mode (Winios.m draws it
      * in its transparent game-mode overlay, never the desktop backdrop that
      * would cover the DXMT Metal layer) */
