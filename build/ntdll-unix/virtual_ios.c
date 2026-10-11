@@ -15636,7 +15636,7 @@ static unsigned long long ios_swap_resv_bytes, ios_swap_resv_n, ios_swap_merges,
 static unsigned long long ios_swap_holes, ios_swap_disk_refused, ios_swap_churn_skips;   /* ml1257 / ml1258 */
 #define IOS_SWAP_CHURN_NS (3ull * 1000000000ull)
 /* ml1226: hits = young deaths, backs = backings of the size; see ios_swap_churny */
-static struct { size_t size; unsigned hits; unsigned backs; } ios_swap_churn[64];
+static struct { size_t size; unsigned hits; unsigned backs; unsigned probes; } ios_swap_churn[64];
 static unsigned ios_swap_nchurn;    /* sizes tracked */
 static unsigned ios_swap_nchurny;   /* sizes left anonymous */
 #define IOS_SWAP_CHURN_MIN_YOUNG 8
@@ -15801,7 +15801,15 @@ static uint64_t ios_swap_now_ns( void )
  * was jetsammed. A size is churny now only after IOS_SWAP_CHURN_MIN_YOUNG young
  * deaths that are also at least half of its backings -- Metro 2033 Redux's 4 and 16 MB
  * blocks (~9 deaths a second, 1834 backings against ~170 lasting) still qualify
- * within a second. Once churny a size gets no more backings, so it stays so. */
+ * within a second.
+ *
+ * Probation, not a life sentence: a churny size still gets every 8th block
+ * backed, so its ratio can recover once its blocks start living long. Stellar
+ * Blade lost 0x10000 and 0x20000 -- the tier's floor and its commonest sizes --
+ * to eight early young deaths in one run and not in another; the run that lost
+ * them held ~1.2 GB more anonymous memory and was jetsammed loading a save the
+ * other run reached. A size that really churns keeps failing its probes and
+ * costs one backing in eight. */
 static int ios_swap_churn_find( size_t size, int add )
 {
     unsigned i;
@@ -15810,6 +15818,7 @@ static int ios_swap_churn_find( size_t size, int add )
     ios_swap_churn[ios_swap_nchurn].size = size;
     ios_swap_churn[ios_swap_nchurn].hits = 0;
     ios_swap_churn[ios_swap_nchurn].backs = 0;
+    ios_swap_churn[ios_swap_nchurn].probes = 0;
     return (int)ios_swap_nchurn++;
 }
 static int ios_swap_churn_is( unsigned i )
@@ -15822,13 +15831,25 @@ static int ios_swap_churny( size_t size )
     int i;
     if (!ios_swap_broad) return 0;
     i = ios_swap_churn_find( size, 0 );
-    return i >= 0 && ios_swap_churn_is( (unsigned)i );
+    if (i < 0 || !ios_swap_churn_is( (unsigned)i )) return 0;
+    return (++ios_swap_churn[i].probes & 7) != 0;   /* every 8th block is a probe */
 }
 static void ios_swap_churn_backed( size_t size )
 {
-    int i;
+    int i, was;
     if (!ios_swap_broad) return;
-    if ((i = ios_swap_churn_find( size, 1 )) >= 0) ios_swap_churn[i].backs++;
+    if ((i = ios_swap_churn_find( size, 1 )) < 0) return;
+    was = ios_swap_churn_is( (unsigned)i );
+    ios_swap_churn[i].backs++;
+    if (was && !ios_swap_churn_is( (unsigned)i ))
+    {
+        static unsigned cleared_logs;
+        if (ios_swap_nchurny) ios_swap_nchurny--;
+        if (cleared_logs++ < 64)
+            dprintf( 2, "[swap] ml1226 churn cleared: 0x%zx blocks live long again (%u young of %u backed) -- "
+                        "back in the tier (%u sizes left out)\n",
+                     size, ios_swap_churn[i].hits, ios_swap_churn[i].backs, ios_swap_nchurny );
+    }
 }
 static void ios_swap_churn_note( size_t size, uint64_t lived_ns )
 {
@@ -15838,7 +15859,9 @@ static void ios_swap_churn_note( size_t size, uint64_t lived_ns )
     ios_swap_churn[i].hits++;
     if (!was && ios_swap_churn_is( (unsigned)i ))
     {
+        static unsigned churn_logs;
         ios_swap_nchurny++;
+        if (churn_logs++ < 64)
         dprintf( 2, "[swap] ml1226 churn: %u of %u backed blocks of 0x%zx were freed young (the last within %llu ms) -- "
                     "that size stays anonymous from now on (%u sizes)\n",
                  ios_swap_churn[i].hits, ios_swap_churn[i].backs, size,
