@@ -23355,8 +23355,13 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         /* A code buffer larger than the 16 MB the pool can spare comes from the
          * second code region when there is one: a freed region carve first,
          * then its bump. Anything that does not fit falls through to the pool. */
+        /* FEX allocates the next generation before freeing the last, so a request
+         * the region's free part cannot hold falls through (refused) and FEX halves
+         * it. Not capped at half the region: that held FEX to 64MB generations, and
+         * Stellar Blade's gameplay outgrew 64MB every 10-30 s, each reset a drop to
+         * 2-12 fps. Now a 192MB region alternates 128MB and 64MB generations. */
         if (ios_jit2_size_global && alloc_size > 0x1000000 &&
-            alloc_size <= ios_jit2_size_global / 2)   /* FEX allocates the next generation before freeing the last */
+            alloc_size <= ios_jit2_size_global)
         {
             uintptr_t rx0 = (uintptr_t)ios_jit_rx_base_global;
             size_t off2 = 0, got2 = 0;
