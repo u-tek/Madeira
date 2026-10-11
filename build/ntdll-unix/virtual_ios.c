@@ -23382,8 +23382,14 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
          * the region's free part cannot hold falls through (refused) and FEX halves
          * it. Not capped at half the region: that held FEX to 64MB generations, and
          * Stellar Blade's gameplay outgrew 64MB every 10-30 s, each reset a drop to
-         * 2-12 fps. Now a 192MB region alternates 128MB and 64MB generations. */
-        if (ios_jit2_size_global && alloc_size > 0x1000000 &&
+         * 2-12 fps. Now a 192MB region alternates 128MB and 64MB generations.
+         * From 4MB up, not only above 16MB: each process's first 16MB buffer
+         * used to land in the pool tail, where a freed carve can never serve an
+         * image copy. Three of them (two Steam-side processes and the game) held
+         * 48MB of an 800MB pool, and the head then ran out loading the game's
+         * DLLs. A pool shortfall breaks a load; a region-2 shortfall only means a
+         * smaller FEX generation. */
+        if (ios_jit2_size_global && alloc_size >= 0x400000 &&
             alloc_size <= ios_jit2_size_global)
         {
             uintptr_t rx0 = (uintptr_t)ios_jit_rx_base_global;
