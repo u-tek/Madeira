@@ -322,6 +322,7 @@ enum { MAD_CAT_TEX_RT, MAD_CAT_TEX_DS, MAD_CAT_TEX_UAV, MAD_CAT_TEX_PLAIN, MAD_C
 static const char *const g_cat_name[MAD_CAT_N] = { "tex-RT", "tex-DS", "tex-UAV", "tex-sampled", "tex-MSAA", "buf-private", "buf-shared" };
 static volatile LONG64 g_cat_bytes[MAD_CAT_N], g_cat_peak[MAD_CAT_N];
 static volatile LONG g_cat_count[MAD_CAT_N];
+static volatile LONG g_cat_made[MAD_CAT_N];   /* ml1272: allocations ever made, per kind */
 static volatile LONG64 g_upload_swap_bytes; static volatile LONG g_upload_swap_n;   /* ml1154 */
 static int mad_upload_swap_on(void);
 static volatile LONG64 g_lib_bytes; static volatile LONG g_lib_count;   /* ml1060: metallib bytes handed to newLibrary */
@@ -507,8 +508,8 @@ static void mad_acct_report(void) {
     char line[700]; int n = 0; unsigned c; LONG64 tot = 0;
     for (c = 0; c < MAD_CAT_N; c++) {
         tot += g_cat_bytes[c];
-        n += snprintf(line + n, sizeof line - n, " %s=%lldMB/%ld (peak %lld)", g_cat_name[c],
-                      (long long)(g_cat_bytes[c] >> 20), g_cat_count[c], (long long)(g_cat_peak[c] >> 20));
+        n += snprintf(line + n, sizeof line - n, " %s=%lldMB/%ld (peak %lld, made %ld)", g_cat_name[c],
+                      (long long)(g_cat_bytes[c] >> 20), g_cat_count[c], (long long)(g_cat_peak[c] >> 20), g_cat_made[c]);
     }
     d3d12_log("[madeira-d3d12] ml1057 live GPU backing (estimated) total=%lldMB:%s\n", (long long)(tot >> 20), line);
     d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffers on file-backed storage: %ld, %lld MB\n", g_upload_swap_n, (long long)(g_upload_swap_bytes >> 20));
@@ -6330,10 +6331,37 @@ static int mad_map_texture_format(DXGI_FORMAT f, D3D12_RESOURCE_FLAGS flags, enu
  * Buffer<float>/Buffer<float4> SRVs) sees a raw address the converted shader
  * never dereferences: every scene vertex came out at the origin and nothing
  * rasterised (depth 0.0 % written, GBuffers 0.0 %). */
+/* ml1272: with FSR frame generation on, GPU memory went from ~1 GB to 2.9 GB in
+ * 30 s (2,600 more private buffers in 10 s) until iOS refused a page. Every 128th
+ * allocation of each kind, and each one of 16 MB or more, is logged (400 lines at
+ * most) with its shape, the creating thread and the nearest two return addresses
+ * in the game executable, so the allocator can be found. */
+static void mad_acct_sample(struct mad_resource *r, unsigned cat, UINT64 bytes) {
+    static LONG said; static ULONG_PTR exe_lo, exe_hi;
+    LONG made = InterlockedIncrement(&g_cat_made[cat]);
+    ULONG_PTR hit[2] = { 0, 0 }, *p, *end; unsigned nh = 0;
+    volatile ULONG_PTR here = 0; NT_TIB *tib = (NT_TIB *)NtCurrentTeb(); char nm[64];
+    if ((made % 128) != 0 && bytes < (16u << 20)) return;
+    if (InterlockedIncrement(&said) > 400) return;
+    if (!exe_lo) {
+        HMODULE m = GetModuleHandleW(NULL); IMAGE_DOS_HEADER *dh = (IMAGE_DOS_HEADER *)m;
+        IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)((BYTE *)m + dh->e_lfanew);
+        exe_hi = (ULONG_PTR)m + nt->OptionalHeader.SizeOfImage; exe_lo = (ULONG_PTR)m;
+    }
+    p = (ULONG_PTR *)&here; end = p + 4096;
+    if (tib && (ULONG_PTR)tib->StackBase > (ULONG_PTR)p && (ULONG_PTR *)tib->StackBase < end) end = (ULONG_PTR *)tib->StackBase;
+    for (; p < end && nh < 2; p++) if (*p >= exe_lo + 0x1000 && *p < exe_hi) hit[nh++] = *p - exe_lo;
+    mad_thread_name(nm, sizeof nm);
+    d3d12_log("[mem-diag] ml1272 %s #%ld: %llu KB, dim %d %llux%ux%u fmt %u flags %#x heap %u, thread %04lx '%s', exe +0x%llx <- +0x%llx (live %ld, %lld MB)\n",
+              g_cat_name[cat], (long)made, (unsigned long long)(bytes >> 10), (int)r->desc.Dimension,
+              (unsigned long long)r->desc.Width, (unsigned)r->desc.Height, (unsigned)r->desc.DepthOrArraySize, (unsigned)r->desc.Format,
+              (unsigned)r->desc.Flags, (unsigned)r->heap, GetCurrentThreadId(), nm,
+              (unsigned long long)hit[0], (unsigned long long)hit[1], (long)g_cat_count[cat], (long long)(g_cat_bytes[cat] >> 20));
+}
 static void mad_acct(struct mad_resource *r, unsigned cat, UINT64 bytes, int sign) {
     LONG64 now;
     if (cat >= MAD_CAT_N) return;
-    if (sign > 0) { r->acct_bytes = bytes; r->acct_cat = cat; InterlockedIncrement(&g_cat_count[cat]); }
+    if (sign > 0) { r->acct_bytes = bytes; r->acct_cat = cat; InterlockedIncrement(&g_cat_count[cat]); mad_acct_sample(r, cat, bytes); }
     else InterlockedDecrement(&g_cat_count[cat]);
     now = InterlockedExchangeAdd64(&g_cat_bytes[cat], sign > 0 ? (LONG64)bytes : -(LONG64)bytes) + (sign > 0 ? (LONG64)bytes : -(LONG64)bytes);
     if (now > g_cat_peak[cat]) g_cat_peak[cat] = now;
