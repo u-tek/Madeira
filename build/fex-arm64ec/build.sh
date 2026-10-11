@@ -28,7 +28,13 @@ if [ ! -f "$B/CMakeCache.txt" ]; then
         -DCMAKE_CXX_FLAGS=-DFEX_IOS_HOST -DCMAKE_ASM_FLAGS=-DFEX_IOS_HOST \
         -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=OFF -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF \
         -DBUILD_TESTING=OFF -DBUILD_FEXCONFIG=OFF -DTUNE_ARCH=generic -DTUNE_CPU=none \
-        -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        -DCMAKE_DISABLE_FIND_PACKAGE_fmt=ON -DCMAKE_DISABLE_FIND_PACKAGE_range-v3=ON \
+        -DCMAKE_DISABLE_FIND_PACKAGE_unordered_dense=ON -DCMAKE_DISABLE_FIND_PACKAGE_xxhash=ON \
+        -DCMAKE_DISABLE_FIND_PACKAGE_Catch2=ON
+    # The DISABLE_FIND_PACKAGE lines keep CMake on FEX's bundled External/ copies:
+    # the CI runner's Homebrew fmt is a macOS library, and as an imported target
+    # for a Windows build it fails configuration (IMPORTED_IMPLIB not set).
 fi
 cmake --build "$B" --target arm64ecfex
 cp "$B/Bin/libarm64ecfex.dll" "$R/app/Madeira/arm64ec-windows/xtajit64.dll" && ls -l "$R/app/Madeira/arm64ec-windows/xtajit64.dll"
