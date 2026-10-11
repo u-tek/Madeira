@@ -246,8 +246,8 @@ index a121a7a..a93da4a 100644
 +  cmp w0, #64           // TLS_MINIMUM_AVAILABLE; expansion slots take the normal path
 +  b.hs ios_fast_none
 +  IOS_LOAD_TEB x17
-+  add x16, x17, #0x1480 // TEB->TlsSlots
-+  ldr x8, [x16, w0, uxtw #3]
++  add x16, x17, w0, uxtw #3
++  ldr x8, [x16, #0x1480] // TEB->TlsSlots[ecx]; 0x1480 is past add's 12-bit immediate, not past ldr's scaled one
 +  str wzr, [x17, #0x68] // TEB->LastErrorValue
 +  b ios_fast_ret
 +
