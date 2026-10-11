@@ -1,0 +1,354 @@
+diff --git a/Source/Windows/ARM64EC/IosJitAlias.cpp b/Source/Windows/ARM64EC/IosJitAlias.cpp
+index fff2e7b..d0b5156 100644
+--- a/Source/Windows/ARM64EC/IosJitAlias.cpp
++++ b/Source/Windows/ARM64EC/IosJitAlias.cpp
+@@ -18,6 +18,8 @@
+ // their own TU sidesteps the issue.
+ 
+ #include <cstdint>
++#include <cstdlib>
++#include <cstring>
+ #include <atomic>
+ #include <FEXCore/Utils/LogManager.h>
+ #include <windows.h>
+@@ -56,6 +58,17 @@ IosAliasEntry* volatile IosAliasLast = nullptr;
+  * steady state is read-only and shared by every thread. Cleared whenever an
+  * entry is retired or reused (see IosAliasHintClear). */
+ IosAliasEntry* volatile IosAliasHint[4096];
++/* ml1261: x64->EC calls ExitFunctionEC answers itself (Module.S ios_fast_*),
++ * keyed by the address the call reaches it with. Slot
++ * ((va >> 2) ^ (va >> 14)) & 1023 holds {Target, Kind}: 1 = TlsGetValue,
++ * 2 = RtlEnterCriticalSection, 3 = RtlLeaveCriticalSection,
++ * 4 = GetCurrentThreadId. Filled once by IosFastCallResolve (Kind before
++ * Target) and never changed after, so readers need no lock. */
++struct IosFastCallSlot {
++  uint64_t Target;
++  uint64_t Kind;
++};
++IosFastCallSlot IosFastCallHash[1024];
+ }
+ 
+ namespace {
+@@ -469,4 +482,134 @@ uint64_t IosJitReverseTranslate(uint64_t Addr) {
+ 
+ }  // extern "C"
+ 
++namespace {
++// ml1261: kinds, as Module.S dispatches on them.
++constexpr uint64_t kFastTls = 1;
++constexpr uint64_t kFastEnterCs = 2;
++constexpr uint64_t kFastLeaveCs = 3;
++constexpr uint64_t kFastThreadId = 4;
++constexpr uint64_t kFastQpcWatch = 5;
++int g_FastCallSlots;
++
++void FastCallAdd(uint64_t Va, uint64_t Kind) {
++  if (!Va) {
++    return;
++  }
++  auto& S = IosFastCallHash[((Va >> 2) ^ (Va >> 14)) & 1023];
++  if (S.Target == Va) {
++    return;
++  }
++  if (S.Target) {
++    LogMan::Msg::EFmt("[iOS-fastcall] ml1261 slot of {:#x} (kind {}) already holds {:#x}; that address keeps the normal path", Va,
++                      Kind, S.Target);
++    return;
++  }
++  S.Kind = Kind;
++  __sync_synchronize();
++  S.Target = Va;
++  g_FastCallSlots++;
++}
++
++// Every address an x64 call to this export can reach ExitFunctionEC with: the
++// export, the target of its x64 fast-forward sequence or import jump, and the
++// pool copy of each (Madeira binds EC imports to pool aliases). Registering an
++// address that turns out to be x64 code is harmless: it never reaches
++// ExitFunctionEC.
++void FastCallCollect(uint64_t Va, uint64_t Kind, int Depth) {
++  static const uint8_t Ffs[] = {0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x20, 0x55, 0x5d, 0xe9};
++  if (!Va || Depth > 3) {
++    return;
++  }
++  FastCallAdd(Va, Kind);
++  FastCallAdd(IosJitTranslate(Va), Kind);
++  const auto* P = reinterpret_cast<const uint8_t*>(Va);
++  int32_t Rel;
++  if (!memcmp(P, Ffs, sizeof(Ffs))) {
++    memcpy(&Rel, P + 10, sizeof(Rel));
++    FastCallCollect(Va + 14 + Rel, Kind, Depth + 1);
++  } else if (P[0] == 0xff && P[1] == 0x25) {  // jmp [rip+rel32]: an import thunk
++    uint64_t Slot;
++    memcpy(&Rel, P + 2, sizeof(Rel));
++    memcpy(&Slot, P + 6 + Rel, sizeof(Slot));
++    FastCallCollect(Slot, Kind, Depth + 1);
++  }
++}
++
++// The export table's own address for Name (0 for a forwarder or a miss), read
++// straight from the mapped headers so GetProcAddress's EC redirection rules
++// don't matter.
++uint64_t FastCallExport(HMODULE Module, const char* Name) {
++  if (!Module) {
++    return 0;
++  }
++  const auto* Base = reinterpret_cast<const uint8_t*>(Module);
++  const auto* Dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(Base);
++  const auto* Nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(Base + Dos->e_lfanew);
++  const auto& Dir = Nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
++  if (!Dir.VirtualAddress) {
++    return 0;
++  }
++  const auto* Exp = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(Base + Dir.VirtualAddress);
++  const auto* Names = reinterpret_cast<const uint32_t*>(Base + Exp->AddressOfNames);
++  const auto* Ords = reinterpret_cast<const uint16_t*>(Base + Exp->AddressOfNameOrdinals);
++  const auto* Funcs = reinterpret_cast<const uint32_t*>(Base + Exp->AddressOfFunctions);
++  for (DWORD i = 0; i < Exp->NumberOfNames; i++) {
++    if (strcmp(reinterpret_cast<const char*>(Base + Names[i]), Name)) {
++      continue;
++    }
++    const uint32_t Rva = Funcs[Ords[i]];
++    if (Rva >= Dir.VirtualAddress && Rva < Dir.VirtualAddress + Dir.Size) {
++      return 0;
++    }
++    return reinterpret_cast<uint64_t>(Base + Rva);
++  }
++  return 0;
++}
++}  // namespace
++
++extern "C" {
++/* ml1261: fill IosFastCallHash once ntdll, kernelbase and kernel32 are all
++ * loaded. ThreadInit calls this on every new thread until it has; the first
++ * threads usually start before kernel32. madeira.cfg
++ * env.MADEIRA_FEX_FASTCALLS = 0 leaves the table empty (every call takes the
++ * normal path). */
++void IosFastCallResolve() {
++  static std::atomic<int> State {0};  // 0 = not yet, 1 = resolving or done
++  int Expected = 0;
++  if (!State.compare_exchange_strong(Expected, 1)) {
++    return;
++  }
++  const char* Env = getenv("MADEIRA_FEX_FASTCALLS");
++  if (Env && Env[0] == '0') {
++    LogMan::Msg::EFmt("[iOS-fastcall] ml1261 off (MADEIRA_FEX_FASTCALLS=0)");
++    return;
++  }
++  const HMODULE NtDll = GetModuleHandleA("ntdll.dll");
++  const HMODULE KernelBase = GetModuleHandleA("kernelbase.dll");
++  const HMODULE Kernel32 = GetModuleHandleA("kernel32.dll");
++  if (!NtDll || !KernelBase || !Kernel32) {
++    State.store(0);
++    return;
++  }
++  FastCallCollect(FastCallExport(KernelBase, "TlsGetValue"), kFastTls, 0);
++  FastCallCollect(FastCallExport(Kernel32, "TlsGetValue"), kFastTls, 0);
++  FastCallCollect(FastCallExport(NtDll, "RtlEnterCriticalSection"), kFastEnterCs, 0);
++  FastCallCollect(FastCallExport(NtDll, "RtlLeaveCriticalSection"), kFastLeaveCs, 0);
++  FastCallCollect(FastCallExport(KernelBase, "GetCurrentThreadId"), kFastThreadId, 0);
++  FastCallCollect(FastCallExport(Kernel32, "GetCurrentThreadId"), kFastThreadId, 0);
++  // ml1262: QueryPerformanceCounter busy-wait watch (Module.S ios_fast_qpc).
++  const char* Spin = getenv("MADEIRA_FEX_SPIN_DEPRESS");
++  const bool SpinWatch = !(Spin && Spin[0] == '0');
++  if (SpinWatch) {
++    FastCallCollect(FastCallExport(Kernel32, "QueryPerformanceCounter"), kFastQpcWatch, 0);
++    FastCallCollect(FastCallExport(KernelBase, "QueryPerformanceCounter"), kFastQpcWatch, 0);
++    FastCallCollect(FastCallExport(NtDll, "RtlQueryPerformanceCounter"), kFastQpcWatch, 0);
++  }
++  LogMan::Msg::EFmt("[iOS-fastcall] ml1261 {} addresses answered inline: TlsGetValue, Rtl{{Enter,Leave}}CriticalSection, "
++                    "GetCurrentThreadId (MADEIRA_FEX_FASTCALLS=0 turns this off); ml1262 QPC busy-wait depress {} "
++                    "(MADEIRA_FEX_SPIN_DEPRESS=0 turns it off)",
++                    g_FastCallSlots, SpinWatch ? "on" : "off");
++}
++}  // extern "C"
++
+ #endif  // FEX_IOS_HOST
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index a121a7a..a93da4a 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -266,6 +266,161 @@ BeginSimulation:
+   // Expects the target code address in x9
+ .global ExitFunctionEC
+ ExitFunctionEC:
++#ifdef FEX_IOS_HOST
++  // ml1261: answer the hottest x64->EC calls here, without leaving the JIT.
++  // In Stellar Blade gameplay ~30% of guest-thread samples sat in TlsGetValue
++  // (UE's allocator) and the critical-section calls are next. The normal path
++  // runs FPCR fixup, InSimulation off, the doorbell, the alias walk, the entry
++  // thunk, the EC function, the dispatch-ret bitmap check and enter_jit's dmb.
++  // These do the same work in a few instructions on the x64 registers
++  // (RCX = x0, RAX = x8), pop the x64 return address and re-enter the
++  // dispatcher. InSimulation never drops, so the sweeper handshake is that of
++  // a thread still running JIT code. IosFastCallHash (IosJitAlias.cpp) maps
++  // each address a call can arrive with to its kind; anything unexpected
++  // (contention, an out-of-range TLS index) takes the normal path with every
++  // x64 register intact. x16, x17, x23 and NZCV are clobbered on every path
++  // anyway; x4/x5 (R10/R11) are volatile at a call.
++  lsr x16, x9, #2
++  eor x16, x16, x9, lsr #14
++  and x16, x16, #1023
++  adrp x17, IosFastCallHash
++  add x17, x17, #:lo12:IosFastCallHash
++  add x17, x17, x16, lsl #4
++  ldp x16, x23, [x17]   // {Target, Kind}
++  cmp x16, x9
++  b.ne ios_fast_none
++  cmp x23, #1
++  b.eq ios_fast_tls
++  cmp x23, #2
++  b.eq ios_fast_enter_cs
++  cmp x23, #3
++  b.eq ios_fast_leave_cs
++  cmp x23, #4
++  b.eq ios_fast_tid
++  cmp x23, #5
++  b.eq ios_fast_qpc
++  b ios_fast_none
++
++ios_fast_qpc:
++  // QueryPerformanceCounter: not answered here, only watched. A worker that
++  // busy-waits on QPC (~130k calls a second with <1 us gaps in Stellar Blade)
++  // holds a core the throttled phone does not have; iOS had parked the
++  // performance cores, leaving 4 efficiency cores for 4-7 runnable threads.
++  // After 64 back-to-back calls (<2 us apart) the thread depresses its own
++  // priority for 1 ms: anything else runnable goes first, an idle core still
++  // runs the spinner. TEB->ReservedForWdf (unused outside WDF drivers) holds
++  // (streak << 48) | last 48-bit tick. Then the real QPC runs as before.
++  IOS_LOAD_TEB x17
++  mrs x16, cntvct_el0
++  and x16, x16, #0xffffffffffff
++  ldr x23, [x17, #0x1818] // TEB->ReservedForWdf
++  and x4, x23, #0xffffffffffff
++  sub x4, x16, x4
++  and x4, x4, #0xffffffffffff
++  lsr x5, x23, #48
++  cmp x4, #48           // 2 us at the 24 MHz generic timer
++  csinc x5, xzr, x5, hs // a gap resets the streak, back-to-back extends it
++  cmp x5, #64
++  b.lo 4f
++  str x16, [x17, #0x1818] // streak back to 0
++  mov x23, x0           // RCX (the counter pointer) across the trap; the kernel only writes x0
++  mov x0, #0            // thread_switch(MACH_PORT_NULL,
++  mov x1, #1            //   SWITCH_OPTION_DEPRESS,
++  mov x2, #1            //   1 ms)
++  mov x16, #-61
++  svc #0x80
++  mov x0, x23
++  b ios_fast_none
++4:
++  orr x23, x16, x5, lsl #48
++  str x23, [x17, #0x1818]
++  b ios_fast_none
++
++ios_fast_tls:           // TlsGetValue(ecx): TEB->TlsSlots[ecx], LastErrorValue = 0
++  cmp w0, #64           // TLS_MINIMUM_AVAILABLE; expansion slots take the normal path
++  b.hs ios_fast_none
++  IOS_LOAD_TEB x17
++  add x16, x17, #0x1480 // TEB->TlsSlots
++  ldr x8, [x16, w0, uxtw #3]
++  str wzr, [x17, #0x68] // TEB->LastErrorValue
++  b ios_fast_ret
++
++ios_fast_tid:           // GetCurrentThreadId: TEB->ClientId.UniqueThread
++  IOS_LOAD_TEB x17
++  ldr w8, [x17, #0x48]
++  b ios_fast_ret
++
++ios_fast_enter_cs:      // RtlEnterCriticalSection(rcx), uncontended or recursive only
++  IOS_LOAD_TEB x17
++  ldr w23, [x17, #0x48] // our thread id
++  add x16, x0, #8       // &crit->LockCount
++  mov w4, #-1
++  mov w5, #0
++  casal w4, w5, [x16]   // free (-1) -> held (0)
++  cmn w4, #1
++  b.ne 1f
++  str x23, [x0, #16]    // crit->OwningThread
++  mov w4, #1
++  str w4, [x0, #12]     // crit->RecursionCount = 1
++  mov x8, #0
++  b ios_fast_ret
++1:
++  ldr x4, [x0, #16]
++  cmp x4, x23
++  b.ne ios_fast_none    // held by another thread: the real one waits
++  mov w4, #1
++  ldaddal w4, w5, [x16] // LockCount++
++  ldr w4, [x0, #12]
++  add w4, w4, #1
++  str w4, [x0, #12]     // RecursionCount++
++  mov x8, #0
++  b ios_fast_ret
++
++ios_fast_leave_cs:      // RtlLeaveCriticalSection(rcx) with nobody waiting
++  IOS_LOAD_TEB x17
++  ldr w23, [x17, #0x48]
++  ldr x4, [x0, #16]
++  cmp x4, x23
++  b.ne ios_fast_none    // not ours: the real one reports it
++  ldr w4, [x0, #12]
++  add x16, x0, #8       // &crit->LockCount
++  cmp w4, #1
++  b.lt ios_fast_none
++  b.eq 2f
++  sub w4, w4, #1
++  str w4, [x0, #12]     // RecursionCount--
++  mov w5, #-1
++  ldaddal w5, w4, [x16] // LockCount--
++  mov x8, #0
++  b ios_fast_ret
++2:
++  str xzr, [x0, #16]    // OwningThread = 0
++  str wzr, [x0, #12]    // RecursionCount = 0
++  mov w4, #0
++  mov w5, #-1
++  casal w4, w5, [x16]   // held, no waiters (0) -> free (-1)
++  cbnz w4, 3f
++  mov x8, #0
++  b ios_fast_ret
++3:
++  // A waiter arrived after the owner check: put the section back exactly as
++  // it was and let the real Leave release it and wake the waiter.
++  mov w4, #1
++  str w4, [x0, #12]
++  str x23, [x0, #16]
++  b ios_fast_none
++
++ios_fast_ret:
++  mov x16, sp
++  ldr x9, [x16], #8     // pop the x64 return address (RSP may be 8-aligned: no sp-based load)
++  mov sp, x16
++  IOS_LOAD_TEB x17
++  ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
++  ldr x16, [x17, #0x40] // ChpeV2CpuAreaInfo->EmulatorData[2] - DispatcherLoopTopEnterEC
++  br x16                // DispatcherLoopTopEnterEC(RIP:x9, CPUArea:x17)
++
++ios_fast_none:
++#endif
+   // Clear any the AFP NEP and AH bits in FPCR as native code won't expect their behaviour.
+   // ml1125: only WRITE FPCR when a bit actually has to change. An FPCR write is
+   // expensive on Apple cores (the samples pile up on the instruction after it,
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index fbaf76f..6128322 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -77,6 +77,7 @@ extern "C" int ios_va_log_len;
+  * PE images are copied into the JIT pool. */
+ extern "C" uint64_t IosJitTranslate(uint64_t Addr);
+ extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
++extern "C" void IosFastCallResolve();   // ml1261
+ extern "C" uint64_t IosSubfloorToReal(uint64_t Addr);   // ml951
+ extern "C" uint64_t IosSubfloorToLow(uint64_t Addr);    // ml951
+ extern "C" uint64_t IosSubfloorClipSize(uint64_t LowAddr, uint64_t Size);  // ml951
+@@ -2149,6 +2150,9 @@ NTSTATUS ThreadInit() {
+ #ifdef FEX_IOS_HOST
+   IosLogCPUArea("ThreadInit-done");
+ #endif
++#ifdef FEX_IOS_HOST
++  IosFastCallResolve();   // ml1261: until ntdll, kernelbase and kernel32 are all loaded
++#endif
+ #ifdef FEX_IOS_HOST
+   {
+     HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters

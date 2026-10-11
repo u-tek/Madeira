@@ -257,6 +257,16 @@ enum ResolutionChoices {
         return Choice(w: w, h: 480, label: "\(w)×480 · for MetalFX 1.5×")
     }
 
+    /// ml1263: the screen's shape at 360 lines, which MetalFX 2× brings to 720
+    /// (784x360 -> 1568x720 on a 19.5:9 iPhone): under half the pixels of the
+    /// light size, for a game the GPU holds back. Offered while a game uses
+    /// MetalFX 2×; nil when `groups` already have that size.
+    static func metalFX2x(for s: Screen = screen, in groups: [Group]) -> Choice? {
+        let w = Int((360 * aspect(s) / 8).rounded()) * 8
+        guard (480...4096).contains(w), !groups.contains(where: { $0.choices.contains { $0.w == w && $0.h == 360 } }) else { return nil }
+        return Choice(w: w, h: 360, label: "\(w)×360 · for MetalFX 2×")
+    }
+
     /// A stored "WxH" that none of `groups` offers (a size chosen on another
     /// device, or typed into madeira.cfg), so a picker never shows a blank
     /// choice; nil when it is offered or does not parse.

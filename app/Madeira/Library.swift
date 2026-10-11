@@ -2958,6 +2958,7 @@ struct LibraryDetail: View {
                     // ml1172: this device's choices (ResolutionChoices), grouped.
                     let groups = ResolutionChoices.groups()
                     let metalFX = ResolutionChoices.metalFX(in: groups)
+                    let metalFX2x = ResolutionChoices.metalFX2x(in: groups)   // ml1263
                     Picker("Resolution", selection: $entry.resolution) {
                         ForEach(groups, id: \.title) { group in
                             Section(group.title) {
@@ -2968,8 +2969,13 @@ struct LibraryDetail: View {
                         if let shape = metalFX, entry.metalFXUpscale == 1.5 || entry.resolution == shape.value {
                             Text(shape.label).tag(shape.value)
                         }
+                        // ... and at 360 lines, which MetalFX 2× brings to 720.
+                        if let shape = metalFX2x, entry.metalFXUpscale == 2 || entry.resolution == shape.value {
+                            Text(shape.label).tag(shape.value)
+                        }
                         // A size none of them has, so the picker never shows a blank choice.
-                        if entry.resolution != metalFX?.value, let saved = ResolutionChoices.extra(entry.resolution, in: groups, note: "saved") {
+                        if entry.resolution != metalFX?.value, entry.resolution != metalFX2x?.value,
+                           let saved = ResolutionChoices.extra(entry.resolution, in: groups, note: "saved") {
                             Text(saved.label).tag(entry.resolution)
                         }
                     }
