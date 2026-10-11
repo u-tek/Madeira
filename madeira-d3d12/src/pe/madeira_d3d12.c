@@ -951,9 +951,74 @@ struct mad_fence {
     volatile LONG64 committed;   /* ml1120: highest value whose Signal batch has been COMMITTED to Metal (or signalled on the CPU) */
     struct { UINT64 value; HANDLE event; LONGLONG t_reg; } waiters[MAD_FENCE_WAITERS];   /* ml1109: t_reg = registration time */
     unsigned nwaiters;
+    /* ml1270 (frame-generation diagnostics): creation order, GetCompletedValue
+     * polls since the value last changed, and how many further operations on
+     * this fence to log once a poller has stalled on it. */
+    unsigned ordinal;
+    volatile LONG diag_polls;
+    UINT64 diag_last;
+    volatile LONG diag_trace;
 };
 
+/* ---- ml1270: frame-generation diagnostics --------------------------------
+ * With FSR 3 frame generation on, its "AMD FSR Interpolation Thread" polled
+ * GetCompletedValue ~4 million times a second on a fence that stayed at 1, and
+ * nothing was presented again. These lines say which fence, who was asked to
+ * signal it, what every queue worker was doing at that moment, and every later
+ * operation on that fence. Quiet unless a thread spins on an unchanging fence. */
+#define MAD_DIAG_QUEUES 32
+struct mad_diag_q {
+    unsigned ordinal; int type; DWORD tid;
+    volatile LONG depth;        /* jobs queued for the submission worker */
+    volatile LONG cur_kind;     /* job the worker is running (0 = idle) */
+    volatile unsigned cur_fence; volatile UINT64 cur_value;
+};
+static struct mad_diag_q g_diag_q[MAD_DIAG_QUEUES];
+static LONG g_diag_nq, g_fence_ordinal;
+static void mad_thread_name(char *nm, int n) {
+    WCHAR *wn = NULL;
+    nm[0] = '?'; nm[1] = 0;
+    if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &wn)) && wn) {
+        WideCharToMultiByte(CP_UTF8, 0, wn, -1, nm, n, NULL, NULL);
+        LocalFree(wn);
+    }
+}
+static void mad_fg_trace(struct mad_fence *f, const char *op, UINT64 value, int queue) {
+    char nm[64];
+    if (f->diag_trace <= 0 || InterlockedDecrement(&f->diag_trace) < 0) return;
+    mad_thread_name(nm, sizeof nm);
+    d3d12_log("[fg-diag] ml1270 fence #%u: %s %llu (queue #%d, thread %04lx '%s'; fence at %llu, asked %lld, committed %lld)\n",
+              f->ordinal, op, (unsigned long long)value, queue, GetCurrentThreadId(), nm,
+              (unsigned long long)f->value, (long long)f->submitted, (long long)f->committed);
+}
+static void mad_fg_stall_report(struct mad_fence *f, UINT64 v, LONG polls) {
+    static const char *kinds[] = { "idle", "ExecuteCommandLists", "Signal", "Wait", "Present" };
+    char nm[64]; LONG i, n; unsigned k;
+    mad_thread_name(nm, sizeof nm);
+    EnterCriticalSection(&f->lock);
+    d3d12_log("[fg-diag] ml1270 STALL: thread %04lx '%s' polled fence #%u %p %ld times at %llu; "
+              "asked-to-signal %lld, committed %lld, %u event waiter(s)\n",
+              GetCurrentThreadId(), nm, f->ordinal, (void *)f, (long)polls, (unsigned long long)v,
+              (long long)f->submitted, (long long)f->committed, f->nwaiters);
+    for (k = 0; k < f->nwaiters && k < 8; k++)
+        d3d12_log("[fg-diag]   event waiter for %llu\n", (unsigned long long)f->waiters[k].value);
+    LeaveCriticalSection(&f->lock);
+    n = g_diag_nq; if (n > MAD_DIAG_QUEUES) n = MAD_DIAG_QUEUES;
+    for (i = 0; i < n; i++) {
+        struct mad_diag_q *d = &g_diag_q[i];
+        LONG kd = d->cur_kind;
+        if (kd == 2 || kd == 3)
+            d3d12_log("[fg-diag]   queue #%u type %d (made by %04lx): %ld job(s) queued, worker in %s fence #%u value %llu\n",
+                      d->ordinal, d->type, d->tid, (long)d->depth, kinds[kd], d->cur_fence, (unsigned long long)d->cur_value);
+        else
+            d3d12_log("[fg-diag]   queue #%u type %d (made by %04lx): %ld job(s) queued, worker %s\n",
+                      d->ordinal, d->type, d->tid, (long)d->depth, (kd >= 0 && kd <= 4) ? kinds[kd] : "?");
+    }
+    f->diag_trace = 64;
+}
+
 static void fence_set_locked(struct mad_fence *f, UINT64 v) {
+    mad_fg_trace(f, "reached", v, -1);   /* ml1270 */
     f->value = v;
     WakeAllConditionVariable(&f->cv);
     unsigned w = 0;
@@ -1018,11 +1083,17 @@ static UINT64 STDMETHODCALLTYPE fence_GetCompletedValue(ID3D12Fence *This) {
     EnterCriticalSection(&f->lock);
     UINT64 v = f->value;
     LeaveCriticalSection(&f->lock);
+    if (v != f->diag_last) { f->diag_last = v; f->diag_polls = 0; }   /* ml1270 */
+    else {
+        LONG polls = InterlockedIncrement(&f->diag_polls);
+        if (polls == (1 << 20) || polls == (1 << 24)) mad_fg_stall_report(f, v, polls);
+    }
     return v;
 }
 static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence *This, UINT64 value, HANDLE event) {
     struct mad_fence *f = (struct mad_fence *)This;
     HRESULT hr = S_OK;
+    mad_fg_trace(f, event ? "SetEventOnCompletion" : "SetEventOnCompletion(blocking)", value, -1);   /* ml1270 */
     EnterCriticalSection(&f->lock);
     if (value <= f->value) {
         /* Already reached. Signalling now is the documented behaviour; queueing
@@ -1052,6 +1123,7 @@ static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence *This, U
 static void mad_fence_committed(struct mad_fence *f, UINT64 value);
 static HRESULT STDMETHODCALLTYPE fence_Signal(ID3D12Fence *This, UINT64 value) {
     struct mad_fence *f = (struct mad_fence *)This;
+    mad_fg_trace(f, "CPU Signal", value, -1);   /* ml1270 */
     EnterCriticalSection(&f->lock);
     fence_set_locked(f, value);
     LeaveCriticalSection(&f->lock);
@@ -1273,6 +1345,7 @@ struct mad_queue {
     const IID *iid;
     const char *name;
     D3D12_COMMAND_LIST_TYPE type;
+    struct mad_diag_q *diag;   /* ml1270: NULL past MAD_DIAG_QUEUES queues */
     UINT64 executed;
     UINT64 rejected;
     struct mad_device *device;
@@ -4914,6 +4987,7 @@ static void mad_sub_enqueue(struct mad_queue *q, struct mad_subjob *j) {
     EnterCriticalSection(&q->sub_lock);
     if (q->sub_tail) q->sub_tail->next = j; else q->sub_head = j;
     q->sub_tail = j;
+    if (q->diag) InterlockedIncrement(&q->diag->depth);   /* ml1270 */
     WakeConditionVariable(&q->sub_work);
     LeaveCriticalSection(&q->sub_lock);
 }
@@ -5295,6 +5369,7 @@ static HRESULT STDMETHODCALLTYPE queue_Wait(ID3D12CommandQueue *This, ID3D12Fenc
     unsigned waited = 0;
     static unsigned said;
     if (!f) return E_INVALIDARG;
+    mad_fg_trace(f, "queue Wait", value, ((struct mad_queue *)This)->diag ? (int)((struct mad_queue *)This)->diag->ordinal : -1);   /* ml1270 */
     if (((struct mad_queue *)This)->sub_thread) {   /* ml1120: the worker waits for the signal's COMMIT, in FIFO order */
         struct mad_subjob *j = calloc(1, sizeof *j);
         if (j) {
@@ -5330,6 +5405,7 @@ static HRESULT mad_signal_run(struct mad_queue *q, ID3D12Fence *fence, UINT64 va
 static HRESULT STDMETHODCALLTYPE queue_Signal(ID3D12CommandQueue *This, ID3D12Fence *fence, UINT64 value) {
     struct mad_queue *q = (struct mad_queue *)This;
     if (!fence) return E_INVALIDARG;
+    mad_fg_trace((struct mad_fence *)fence, "queue Signal", value, q->diag ? (int)q->diag->ordinal : -1);   /* ml1270 */
     {   /* ml1061 */
         struct mad_fence *sf = (struct mad_fence *)fence; LONG64 cur;
         do { cur = sf->submitted; } while ((UINT64)cur < value && InterlockedCompareExchange64(&sf->submitted, (LONG64)value, cur) != cur);
@@ -5427,6 +5503,12 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
         j = q->sub_head; q->sub_head = j->next; if (!q->sub_head) q->sub_tail = NULL;
         q->sub_busy = 1;
         LeaveCriticalSection(&q->sub_lock);
+        if (q->diag) {   /* ml1270 */
+            InterlockedDecrement(&q->diag->depth);
+            q->diag->cur_value = j->value;
+            q->diag->cur_fence = ((j->kind == MAD_SUB_SIGNAL || j->kind == MAD_SUB_WAIT) && j->fence) ? ((struct mad_fence *)j->fence)->ordinal : 0;
+            q->diag->cur_kind = j->kind;
+        }
 
         QueryPerformanceCounter(&t0);
         pool = NSAutoreleasePool_alloc_init();
@@ -5457,6 +5539,7 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
             LeaveCriticalSection(&q->sub_lock);
             break;
         }
+        if (q->diag) q->diag->cur_kind = 0;   /* ml1270 */
         {   /* ml1128: per-kind elapsed, and the pool drain on its own */
             LONG64 tk = mad_qpc(), d = tk - t0.QuadPart;
             switch (j->kind) {
@@ -5921,10 +6004,20 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandQueue(ID3D12Device *This,
         d3d12_log("[madeira-d3d12] CreateCommandQueue: type %d is not implemented\n", desc->Type);
         return E_NOTIMPL;
     }
-    d3d12_log("[madeira-d3d12] command queue: type %d\n", desc->Type);
     struct mad_queue *q = calloc(1, sizeof *q);
     if (!q) return E_OUTOFMEMORY;
     q->type = desc->Type;
+    {   /* ml1270: numbered, so the frame-generation lines can name queues */
+        LONG o = InterlockedIncrement(&g_diag_nq) - 1;
+        char nm[64];
+        if (o < MAD_DIAG_QUEUES) {
+            q->diag = &g_diag_q[o];
+            q->diag->ordinal = (unsigned)o; q->diag->type = desc->Type; q->diag->tid = GetCurrentThreadId();
+        }
+        mad_thread_name(nm, sizeof nm);
+        d3d12_log("[madeira-d3d12] command queue #%ld: type %d priority %d flags %#x, thread %04lx '%s'\n",
+                  (long)o, desc->Type, desc->Priority, (unsigned)desc->Flags, GetCurrentThreadId(), nm);
+    }
     q->vtbl = &g_queue_vtbl; q->refs = 1; q->iid = &IID_ID3D12CommandQueue; q->name = "CommandQueue";
     InitializeCriticalSection(&q->submit_lock);   /* ml1021 */
     if (mad_async_on()) {   /* ml1120 */
@@ -5991,13 +6084,24 @@ static HRESULT STDMETHODCALLTYPE device_CreateFence(ID3D12Device *This, UINT64 i
         D3D12_FENCE_FLAGS flags, REFIID riid, void **out) {
     (void)This;
     if (!out) return E_INVALIDARG;
-    if (flags != D3D12_FENCE_FLAG_NONE) return E_NOTIMPL;
+    if (flags != D3D12_FENCE_FLAG_NONE) {
+        d3d12_log("[fg-diag] ml1270 CreateFence with flags %#x refused (E_NOTIMPL)\n", (unsigned)flags);
+        return E_NOTIMPL;
+    }
     struct mad_fence *f = calloc(1, sizeof *f);
     if (!f) return E_OUTOFMEMORY;
     f->vtbl = &g_fence_vtbl; f->refs = 1; f->iid = &IID_ID3D12Fence; f->name = "Fence";
     f->value = initial;
     InitializeCriticalSection(&f->lock);
     InitializeConditionVariable(&f->cv);
+    f->ordinal = (unsigned)InterlockedIncrement(&g_fence_ordinal);   /* ml1270 */
+    f->diag_last = initial;
+    if (f->ordinal <= 64 || (f->ordinal % 256) == 0) {
+        char nm[64];
+        mad_thread_name(nm, sizeof nm);
+        d3d12_log("[fg-diag] ml1270 fence #%u %p created at %llu by thread %04lx '%s'\n",
+                  f->ordinal, (void *)f, (unsigned long long)initial, GetCurrentThreadId(), nm);
+    }
     HRESULT hr = fence_QI((ID3D12Fence *)f, riid, out);
     fence_Release((ID3D12Fence *)f);
     return hr;
@@ -12157,6 +12261,8 @@ struct mad_swapchain {
     /* MetalFX spatial upscaling of the presented image (madeira.cfg metalfx-upscale) */
     obj_handle_t fx_scaler, fx_out, fx_view[MAD_SWAP_MAX_BUFFERS];
     UINT fx_w, fx_h;
+    LONG diag_calls, diag_waitable;   /* ml1270 */
+    enum WMTColorSpace hdr_cs;        /* ml1271: the layer's colour space once the game asked for HDR; 0 (sRGB) = never touched */
 };
 static IDXGISwapChain4Vtbl g_swap_vtbl;
 
@@ -12252,6 +12358,7 @@ static void mad_swap_apply_layer(struct mad_swapchain *s) {
     props.framebuffer_only = false;
     props.display_sync_enabled = true;
     MetalLayer_setProps(s->layer, &props);
+    if (s->hdr_cs) MetalLayer_setColorSpace(s->layer, s->hdr_cs);   /* ml1271: the shared layer may have been reset by another swapchain */
     g_layer_cfg_layer = s->layer;
     g_layer_cfg_owner = s;
 }
@@ -12288,8 +12395,9 @@ static HRESULT mad_swap_make_buffers(struct mad_swapchain *s) {
      * copy. framebuffer_only must be off: a framebuffer-only drawable cannot
      * be a blit destination. */
     mad_swap_apply_layer(s);
-    d3d12_log("[madeira-d3d12] swapchain: %ux%u, %u buffers, format %u, hwnd %p\n",
-              s->desc.Width, s->desc.Height, n, (unsigned)s->desc.Format, (void *)s->hwnd);
+    d3d12_log("[madeira-d3d12] swapchain %p: %ux%u, %u buffers, format %u, flags %#x, hwnd %p, queue #%d, thread %04lx\n",
+              (void *)s, s->desc.Width, s->desc.Height, n, (unsigned)s->desc.Format, (unsigned)s->desc.Flags, (void *)s->hwnd,
+              (s->queue && s->queue->diag) ? (int)s->queue->diag->ordinal : -1, GetCurrentThreadId());
     return S_OK;
 }
 
@@ -12358,6 +12466,16 @@ static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UIN
     LARGE_INTEGER t0, t1; HRESULT hr;
     mad_xp_role('P'); InterlockedIncrement64(&g_xp.pres_enq);   /* ml1128 */
     QueryPerformanceCounter(&t0);
+    {   /* ml1270: which thread presents, and how, for the first calls on each swapchain */
+        struct mad_swapchain *ds = (struct mad_swapchain *)T;
+        LONG c = InterlockedIncrement(&ds->diag_calls);
+        if (c <= 3) {
+            char nm[64];
+            mad_thread_name(nm, sizeof nm);
+            d3d12_log("[fg-diag] ml1270 swapchain %p Present call %ld: sync %u flags %#x, thread %04lx '%s'\n",
+                      (void *)ds, (long)c, sync, flags, GetCurrentThreadId(), nm);
+        }
+    }
     hr = swap_Present_pool(T, sync, flags);
     QueryPerformanceCounter(&t1);
     InterlockedExchangeAdd64(&g_perf_present_ticks, t1.QuadPart - t0.QuadPart);
@@ -12644,23 +12762,61 @@ static HANDLE STDMETHODCALLTYPE swap_GetFrameLatencyWaitableObject(IDXGISwapChai
     /* Always signalled: presentation never applies back-pressure here, so a
      * waiter must never block on it. */
     struct mad_swapchain *s = (struct mad_swapchain *)T;
+    if (InterlockedIncrement(&s->diag_waitable) == 1)   /* ml1270 */
+        d3d12_log("[fg-diag] ml1270 swapchain %p: frame-latency waitable object requested by thread %04lx\n", (void *)s, GetCurrentThreadId());
     if (!s->latency_event) s->latency_event = CreateEventW(NULL, TRUE, TRUE, NULL);
     return s->latency_event;
 }
 static HRESULT STDMETHODCALLTYPE swap_SetMatrixTransform(IDXGISwapChain4 *T, const DXGI_MATRIX_3X2_F *m) { (void)T; (void)m; return DXGI_ERROR_INVALID_CALL; }
 static HRESULT STDMETHODCALLTYPE swap_GetMatrixTransform(IDXGISwapChain4 *T, DXGI_MATRIX_3X2_F *m) { (void)T; (void)m; return DXGI_ERROR_INVALID_CALL; }
 static UINT STDMETHODCALLTYPE swap_GetCurrentBackBufferIndex(IDXGISwapChain4 *T) { return ((struct mad_swapchain *)T)->index; }
+/* ml1271: HDR. DXMT's IDXGIOutput6::GetDesc1 reports ST.2084 when winemetal says
+ * the panel has EDR headroom, which on iOS it does only with env.MADEIRA_HDR = 1
+ * in madeira.cfg (build/dxmt-ios/0001-ios-edr-display.patch). The game may then
+ * pick HDR10 (PQ, 10-bit) or scRGB (FP16), and the layer takes that colour space
+ * with EDR on. Without HDR the layer's colour space is never touched. */
+static int mad_hdr_display(void) {
+    static int v = -1;
+    if (v < 0) {
+        struct WMTDisplayDescription d;
+        memset(&d, 0, sizeof d);
+        WMTGetDisplayDescription(WMTGetPrimaryDisplayId(), &d);
+        v = d.maximum_potential_edr_color_component_value > 1.0f;
+        d3d12_log("[madeira-d3d12] ml1271 HDR display: %s (EDR headroom %.2f)\n", v ? "yes" : "no",
+                  (double)d.maximum_potential_edr_color_component_value);
+    }
+    return v;
+}
+static enum WMTColorSpace mad_hdr_colorspace(DXGI_COLOR_SPACE_TYPE cs) {
+    if (cs == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) return WMTColorSpaceSRGB;
+    if (!mad_hdr_display()) return WMTColorSpaceInvalid;
+    if (cs == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) return WMTColorSpaceHDR_PQ;
+    if (cs == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709) return WMTColorSpaceHDR_scRGB;
+    return WMTColorSpaceInvalid;
+}
 static HRESULT STDMETHODCALLTYPE swap_CheckColorSpaceSupport(IDXGISwapChain4 *T, DXGI_COLOR_SPACE_TYPE cs, UINT *flags) {
     (void)T;
     if (!flags) return E_INVALIDARG;
-    *flags = (cs == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) ? DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT : 0;
+    *flags = (mad_hdr_colorspace(cs) != WMTColorSpaceInvalid) ? DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT : 0;
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE swap_SetColorSpace1(IDXGISwapChain4 *T, DXGI_COLOR_SPACE_TYPE cs) {
-    (void)T;
-    if (cs == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) return S_OK;
-    d3d12_log("[madeira-d3d12] SetColorSpace1(%u) refused: only sRGB is presented\n", (unsigned)cs);
-    return E_INVALIDARG;
+    struct mad_swapchain *s = (struct mad_swapchain *)T;
+    enum WMTColorSpace want = mad_hdr_colorspace(cs);
+    if (want == WMTColorSpaceInvalid) {
+        d3d12_log("[madeira-d3d12] SetColorSpace1(%u) refused: not sRGB, or HDR10/scRGB without an HDR display\n", (unsigned)cs);
+        return E_INVALIDARG;
+    }
+    if (want == s->hdr_cs) return S_OK;
+    if (!MetalLayer_setColorSpace(s->layer, want)) {
+        d3d12_log("[madeira-d3d12] ml1271 SetColorSpace1(%u): the layer refused colour space %llu\n", (unsigned)cs, (unsigned long long)want);
+        return E_INVALIDARG;
+    }
+    s->hdr_cs = want;
+    d3d12_log("[madeira-d3d12] ml1271 swapchain %p colour space %u: layer %s, format %u\n", (void *)s, (unsigned)cs,
+              want == WMTColorSpaceHDR_PQ ? "HDR10 (PQ, EDR on)" : want == WMTColorSpaceHDR_scRGB ? "scRGB (EDR on)" : "sRGB",
+              (unsigned)s->desc.Format);
+    return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE swap_ResizeBuffers1(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                      const UINT *node_masks, IUnknown *const *queues) {

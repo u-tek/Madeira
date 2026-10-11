@@ -200,6 +200,12 @@ jobs:
         if: ${{ !cancelled() && steps.fexec.outputs.cache-hit == 'true' }}
         run: cp FEX/build-arm64ec/Bin/libarm64ecfex.dll app/Madeira/arm64ec-windows/xtajit64.dll
 
+      # madeira_d3d12.dll (shipped as d3d12.dll too) is built from madeira-d3d12/src,
+      # replacing the prebuilt copies. One C file; it builds in well under a minute.
+      - name: D3D12 layer (ARM64EC)
+        if: ${{ !cancelled() }}
+        run: bash build/madeira-d3d12/build-ci.sh
+
       - id: winetrees
         uses: actions/cache/restore@v4
         with:

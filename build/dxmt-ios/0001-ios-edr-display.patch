@@ -1,0 +1,61 @@
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -5000,6 +5000,34 @@
+ }
+ #endif
+ 
++#if TARGET_OS_IOS
++/* MADEIRA ml1271: HDR is opt-in on iOS (env.MADEIRA_HDR = 1 in madeira.cfg). */
++static int
++madeira_hdr_wanted(void) {
++  static int v = -1;
++  if (v < 0) {
++    const char *e = getenv("MADEIRA_HDR");
++    v = e && e[0] == '1';
++  }
++  return v;
++}
++
++/* The panel's EDR headroom (peak over SDR white), read once on the main thread. */
++static float
++madeira_edr_headroom(void) {
++  static float h = 0.0f;
++  if (h == 0.0f) {
++    __block float r = 1.0f;
++    execute_on_main(^{
++      if (@available(iOS 16.0, *))
++        r = (float)UIScreen.mainScreen.potentialEDRHeadroom;
++    });
++    h = r > 1.0f ? r : 1.0f;
++  }
++  return h;
++}
++#endif
++
+ static NTSTATUS
+ _WMTGetDisplayDescription(void *obj) {
+   struct unixcall_generic_obj_ptr_noret *params = obj;
+@@ -5009,6 +5037,23 @@
+   desc_out->maximum_edr_color_component_value = 1.0;
+   desc_out->maximum_reference_edr_color_component_value = 0.0;
+   desc_out->maximum_potential_edr_color_component_value = 1.0;
++  /* MADEIRA ml1271: with env.MADEIRA_HDR = 1, report the panel's EDR headroom and
++   * Display P3 primaries, so DXGI's IDXGIOutput6::GetDesc1 says ST.2084 and the
++   * game offers HDR. Without it the output stays SDR, as before. */
++  if (madeira_hdr_wanted()) {
++    float headroom = madeira_edr_headroom();
++    desc_out->red_primaries[0] = 0.680f;
++    desc_out->red_primaries[1] = 0.320f;
++    desc_out->green_primaries[0] = 0.265f;
++    desc_out->green_primaries[1] = 0.690f;
++    desc_out->blue_primaries[0] = 0.150f;
++    desc_out->blue_primaries[1] = 0.060f;
++    desc_out->white_points[0] = 0.3127f;
++    desc_out->white_points[1] = 0.3290f;
++    desc_out->maximum_edr_color_component_value = headroom;
++    desc_out->maximum_reference_edr_color_component_value = 1.0;
++    desc_out->maximum_potential_edr_color_component_value = headroom;
++  }
+ #else
+   CGDirectDisplayID display_id = params->handle;
+   ColorSyncProfileRef profile = ColorSyncProfileCreateWithDisplayID(display_id);

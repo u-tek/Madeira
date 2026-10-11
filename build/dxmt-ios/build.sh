@@ -17,6 +17,18 @@ OUT_LIB="$BUILD_DIR/libdxmt_unix.a"
 
 mkdir -p "$OBJ_DIR"
 
+# The *.patch files next to this script are applied to the DXMT checkout first
+# (once; a patch that is already in the tree is skipped).
+for p in "$BUILD_DIR"/*.patch; do
+    [ -e "$p" ] || continue
+    if git -C "$DXMT_ROOT" apply --reverse --check "$p" 2>/dev/null; then
+        echo "DXMT patch already applied: $(basename "$p")"
+    else
+        git -C "$DXMT_ROOT" apply "$p"
+        echo "DXMT patch applied: $(basename "$p")"
+    fi
+done
+
 COMMON_FLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=18.0 -fblocks -O2"
 INCLUDES="-I$DXMT_ROOT/include -I$DXMT_ROOT/libs -I$DXMT_SRC/winemetal -I$DXMT_SRC/airconv"
 INCLUDES_DIRECTX="-I$DXMT_ROOT/include/native/directx -I$DXMT_ROOT/include/native/windows"
