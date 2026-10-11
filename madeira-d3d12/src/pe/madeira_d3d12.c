@@ -1020,7 +1020,7 @@ static void mad_fg_stall_report(struct mad_fence *f, UINT64 v, LONG polls) {
 
 static void fence_set_locked(struct mad_fence *f, UINT64 v) {
     mad_fg_trace(f, "reached", v, -1);   /* ml1270 */
-    f->value = v;
+    __atomic_store_n(&f->value, v, __ATOMIC_RELEASE);   /* ml1273: GetCompletedValue reads it without the lock */
     WakeAllConditionVariable(&f->cv);
     unsigned w = 0;
     for (unsigned i = 0; i < f->nwaiters; i++) {
@@ -1051,18 +1051,33 @@ static ULONG STDMETHODCALLTYPE fence_Release(ID3D12Fence *This) {
  * sit on the same stack in ARM64EC) and tallies the nearest two, with the
  * thread's name, so the loop can be read in the executable. Diagnostic only. */
 static LONG g_gcv_calls;
+/* ml1273: where a return-address scan starting at p must stop: the end of the
+ * committed region p is in (the top of this thread's stack), or `words` words
+ * up, whichever is lower. These scans used to stop at TEB->StackBase, read
+ * through NtCurrentTeb(), but here x18 is 0 (iOS clears it), so the TEB came
+ * back NULL, the clamp was skipped and every scan read 32 KB up. On FSR 3's
+ * freshly started presenter/interpolation threads, whose stacks are only a
+ * few hundred bytes deep, that read ran off the top of the stack: the AV READ
+ * of <stack hi> in d3d12.dll that killed both frame-generation runs (logs
+ * 029c5755 and d7da6432, x8 = &here + 32 KB). */
+static ULONG_PTR *mad_stack_scan_end(ULONG_PTR *p, unsigned words) {
+    MEMORY_BASIC_INFORMATION mbi;
+    ULONG_PTR *end = p + words, *top;
+    if (!VirtualQuery(p, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return p;   /* scan nothing */
+    top = (ULONG_PTR *)((BYTE *)mbi.BaseAddress + mbi.RegionSize);
+    return top < end ? top : end;
+}
 static struct { ULONG_PTR r0, r1; DWORD tid; LONG n; } g_gcv_site[16];
 static void mad_gcv_sample(struct mad_fence *f, UINT64 v) {
     static ULONG_PTR exe_lo, exe_hi; static LONG samples;
-    ULONG_PTR hit[2] = { 0, 0 }, *p, *end; unsigned nh = 0, i; NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+    ULONG_PTR hit[2] = { 0, 0 }, *p, *end; unsigned nh = 0, i;
     volatile ULONG_PTR here = 0;
     if (!exe_lo) {
         HMODULE m = GetModuleHandleW(NULL); IMAGE_DOS_HEADER *dh = (IMAGE_DOS_HEADER *)m;
         IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)((BYTE *)m + dh->e_lfanew);
         exe_lo = (ULONG_PTR)m; exe_hi = exe_lo + nt->OptionalHeader.SizeOfImage;
     }
-    p = (ULONG_PTR *)&here; end = p + 4096;
-    if (tib && (ULONG_PTR)tib->StackBase > (ULONG_PTR)p && (ULONG_PTR *)tib->StackBase < end) end = (ULONG_PTR *)tib->StackBase;
+    p = (ULONG_PTR *)&here; end = mad_stack_scan_end(p, 4096);   /* ml1273 */
     for (; p < end && nh < 2; p++) if (*p >= exe_lo + 0x1000 && *p < exe_hi) hit[nh++] = *p - exe_lo;
     for (i = 0; i < 16; i++) {
         if (g_gcv_site[i].n && g_gcv_site[i].r0 == hit[0] && g_gcv_site[i].r1 == hit[1] && g_gcv_site[i].tid == GetCurrentThreadId()) { g_gcv_site[i].n++; break; }
@@ -1079,14 +1094,19 @@ static void mad_gcv_sample(struct mad_fence *f, UINT64 v) {
 }
 static UINT64 STDMETHODCALLTYPE fence_GetCompletedValue(ID3D12Fence *This) {
     struct mad_fence *f = (struct mad_fence *)This;
-    InterlockedIncrement(&g_perf_polls);   /* ml1109 */
-    if ((InterlockedIncrement(&g_gcv_calls) & 0x3ffff) == 0) mad_gcv_sample(f, f->value);   /* ml1142 */
-    EnterCriticalSection(&f->lock);
-    UINT64 v = f->value;
-    LeaveCriticalSection(&f->lock);
+    /* ml1273: no lock and no atomics. FSR 3 frame generation's threads poll this
+     * 3,500-14,000 times a frame (ml1109); every poll took the fence's critical
+     * section, which the submission worker needs to advance the fence, and three
+     * interlocked increments on cache lines all pollers share. The value is an
+     * aligned 64-bit word stored with release semantics (fence_set_locked), so an
+     * acquire load sees a whole, current value. The counters are statistics and
+     * diagnostics and may lose the odd increment between racing pollers. */
+    UINT64 v = __atomic_load_n(&f->value, __ATOMIC_ACQUIRE);
+    g_perf_polls++;   /* ml1109 */
+    if ((++g_gcv_calls & 0x3ffff) == 0) mad_gcv_sample(f, v);   /* ml1142 */
     if (v != f->diag_last) { f->diag_last = v; f->diag_polls = 0; }   /* ml1270 */
     else {
-        LONG polls = InterlockedIncrement(&f->diag_polls);
+        LONG polls = ++f->diag_polls;
         if (polls == (1 << 20) || polls == (1 << 24)) mad_fg_stall_report(f, v, polls);
     }
     return v;
@@ -6340,7 +6360,7 @@ static void mad_acct_sample(struct mad_resource *r, unsigned cat, UINT64 bytes) 
     static LONG said; static ULONG_PTR exe_lo, exe_hi;
     LONG made = InterlockedIncrement(&g_cat_made[cat]);
     ULONG_PTR hit[2] = { 0, 0 }, *p, *end; unsigned nh = 0;
-    volatile ULONG_PTR here = 0; NT_TIB *tib = (NT_TIB *)NtCurrentTeb(); char nm[64];
+    volatile ULONG_PTR here = 0; char nm[64];
     if ((made % 128) != 0 && bytes < (16u << 20)) return;
     if (InterlockedIncrement(&said) > 400) return;
     if (!exe_lo) {
@@ -6348,8 +6368,7 @@ static void mad_acct_sample(struct mad_resource *r, unsigned cat, UINT64 bytes) 
         IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)((BYTE *)m + dh->e_lfanew);
         exe_hi = (ULONG_PTR)m + nt->OptionalHeader.SizeOfImage; exe_lo = (ULONG_PTR)m;
     }
-    p = (ULONG_PTR *)&here; end = p + 4096;
-    if (tib && (ULONG_PTR)tib->StackBase > (ULONG_PTR)p && (ULONG_PTR *)tib->StackBase < end) end = (ULONG_PTR *)tib->StackBase;
+    p = (ULONG_PTR *)&here; end = mad_stack_scan_end(p, 4096);   /* ml1273 */
     for (; p < end && nh < 2; p++) if (*p >= exe_lo + 0x1000 && *p < exe_hi) hit[nh++] = *p - exe_lo;
     mad_thread_name(nm, sizeof nm);
     d3d12_log("[mem-diag] ml1272 %s #%ld: %llu KB, dim %d %llux%ux%u fmt %u flags %#x heap %u, thread %04lx '%s', exe +0x%llx <- +0x%llx (live %ld, %lld MB)\n",
