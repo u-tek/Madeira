@@ -1,16 +1,34 @@
 #!/bin/bash
 # Configure (first time) and build the ARM64EC FEX module (libarm64ecfex.dll,
-# shipped as xtajit64.dll). Options mirror the development build's CMakeCache.
+# shipped as xtajit64.dll). The options are the WOW64 module's
+# (build/fex-wow64/build.sh) with the arm64ec triple: FEX_IOS_HOST_BUILD picks
+# the iOS-host link and CRT, and FEX_IOS_HOST turns on the iOS code paths in
+# Module.S and the C++ sources.
+#
+# The *.patch files next to this script are applied to the FEX checkout first
+# (once; a patch that is already in the tree is skipped).
 set -eu
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export PATH="$R/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin:$PATH"
 B="$R/FEX/build-arm64ec"
+for p in "$R"/build/fex-arm64ec/*.patch; do
+    [ -e "$p" ] || continue
+    if git -C "$R/FEX" apply --reverse --check "$p" 2>/dev/null; then
+        echo "FEX patch already applied: $(basename "$p")"
+    else
+        git -C "$R/FEX" apply "$p"
+        echo "FEX patch applied: $(basename "$p")"
+    fi
+done
 if [ ! -f "$B/CMakeCache.txt" ]; then
-    cmake -S "$R/FEX" -B "$B" -DCMAKE_BUILD_TYPE=Release \
+    cmake -S "$R/FEX" -B "$B" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE="$R/FEX/Data/CMake/toolchain_mingw.cmake" \
-        -DENABLE_FEX_ALLOCATOR=ON -DENABLE_JEMALLOC_GLIBC_ALLOC=ON -DENABLE_OFFLINE_RUNTIME=ON \
-        -DBUILD_FEXCONFIG=ON -DENABLE_CLANG_THUNKS=ON -DENABLE_CCACHE=ON \
-        -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DENABLE_ASSERTIONS=OFF
+        -DMINGW_TRIPLE=arm64ec-w64-mingw32 \
+        -DFEX_IOS_HOST_BUILD=ON -DCMAKE_C_FLAGS=-DFEX_IOS_HOST \
+        -DCMAKE_CXX_FLAGS=-DFEX_IOS_HOST -DCMAKE_ASM_FLAGS=-DFEX_IOS_HOST \
+        -DENABLE_LTO=OFF -DENABLE_ASSERTIONS=OFF -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF \
+        -DBUILD_TESTING=OFF -DBUILD_FEXCONFIG=OFF -DTUNE_ARCH=generic -DTUNE_CPU=none \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 fi
 cmake --build "$B" --target arm64ecfex
 cp "$B/Bin/libarm64ecfex.dll" "$R/app/Madeira/arm64ec-windows/xtajit64.dll" && ls -l "$R/app/Madeira/arm64ec-windows/xtajit64.dll"

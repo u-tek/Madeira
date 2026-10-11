@@ -1,0 +1,121 @@
+diff --git a/Source/Windows/ARM64EC/IosJitAlias.cpp b/Source/Windows/ARM64EC/IosJitAlias.cpp
+index 61d7a23..fff2e7b 100644
+--- a/Source/Windows/ARM64EC/IosJitAlias.cpp
++++ b/Source/Windows/ARM64EC/IosJitAlias.cpp
+@@ -49,11 +49,28 @@ volatile int IosAliasCount = 0;
+  * runtime) are registered late, so oldest-first cost ~150 iterations per
+  * x64->EC call at up to a million calls a second. */
+ IosAliasEntry* volatile IosAliasLast = nullptr;
++/* Per-64KB-page hint for ExitFunctionEC: slot ((va >> 16) ^ (va >> 28)) & 4095
++ * holds the entry that last translated an address in that page. Module.S
++ * range-checks the entry before using it, so a stale or colliding slot only
++ * costs the walk. Unlike IosAliasLast it is written on a miss only, so the
++ * steady state is read-only and shared by every thread. Cleared whenever an
++ * entry is retired or reused (see IosAliasHintClear). */
++IosAliasEntry* volatile IosAliasHint[4096];
+ }
+ 
+ namespace {
+ IosAliasEntry* const g_Entries = IosAliasEntries;
+ volatile int& g_EntryCount = IosAliasCount;
++
++// Drop every page hint before an entry's fields change, so ExitFunctionEC
++// stops reaching a slot that is being retired or refilled. Image loads are
++// rare; 4096 stores each time is nothing next to the copy into the pool.
++void IosAliasHintClear() {
++  for (auto& Hint : IosAliasHint) {
++    Hint = nullptr;
++  }
++  __sync_synchronize();
++}
+ }  // namespace
+ 
+ extern "C" {
+@@ -393,12 +410,14 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
+     if (pb < PeBase + Size && PeBase < pb + sz) {
+       g_Entries[i].Size = 0;
+       __sync_synchronize();
++      IosAliasHintClear();
+     }
+   }
+ 
+   // Prefer a retired slot so long-running processes don't exhaust the table.
+   for (int i = 0; i < count; i++) {
+     if (!g_Entries[i].Size) {
++      IosAliasHintClear();
+       g_Entries[i].PeBase = PeBase;
+       g_Entries[i].JitBase = JitBase;
+       __sync_synchronize();
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index 8153212..a121a7a 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -282,25 +282,10 @@ ExitFunctionEC:
+ #endif
+ 1:
+ #ifdef FEX_IOS_HOST
+-  // ml1131: count this x64->EC call (x9 = target as the caller addressed it) and
+-  // append every 64th target of a shard to the ring. x4 (x64 R10, volatile at a
+-  // call boundary), x16, x17 and x23 are clobbered on every path below anyway.
+-  adrp x16, IosXpFex
+-  add x16, x16, #:lo12:IosXpFex
+-  mov x23, sp
+-  ubfx x23, x23, #16, #4
+-  add x17, x16, x23, lsl #6
+-  add x17, x17, #64
+-  mov x4, #1
+-  ldadd x4, x23, [x17]
+-  tst x23, #63
+-  b.ne 2f
+-  add x17, x16, #3136
+-  ldadd x4, x23, [x17]
+-  and x23, x23, #4095
+-  add x17, x16, #3200
+-  str x9, [x17, x23, lsl #3]
+-2:
++  // ml1131's per-call counter (an ldadd on every x64->EC call, plus a global
++  // ldadd and a ring store every 64th) is gone: at ~2.8M calls a second the
++  // atomics were the single hottest bucket of guest CPU in gameplay profiles
++  // (rip-profile 0x..a580, 36-41%). [xp-api] x64->EC now reads 0/s.
+   IOS_LOAD_TEB x17
+   ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
+ #else
+@@ -324,9 +309,19 @@ ExitFunctionSuspendResumePoint:
+   // x64 R10 (volatile at this call/ret boundary) and is clobbered by the
+   // entry-thunk path below. NZCV is clobbered by the cmp at check_thunk
+   // regardless.
+-  // ml1116: last-hit entry first, then the table newest-first.
+-  adrp x16, IosAliasLast
+-  ldr x16, [x16, #:lo12:IosAliasLast]
++  // Per-64KB-page hint first, then the table newest-first. The hint slot for
++  // the target's page holds the entry that last translated an address in it;
++  // the range check below validates it, so a stale or colliding hint only
++  // falls through to the walk. It replaces ml1116's single global last-hit
++  // pointer, which every thread overwrote: game threads alternate between
++  // ntdll, kernelbase, ucrtbase and kernel32, so nearly every call missed and
++  // walked ~100 entries (rip-profile 0x..a5c0/0x..a600, 27-41% of guest CPU).
++  lsr x16, x9, #16
++  eor x16, x16, x16, lsr #12
++  and x16, x16, #0xfff
++  adrp x4, IosAliasHint
++  add x4, x4, #:lo12:IosAliasHint
++  ldr x16, [x4, x16, lsl #3]
+   cbz x16, ios_ec_xlate_walk
+   ldr x23, [x16]        // Entry.PeBase
+   sub x23, x9, x23
+@@ -350,8 +345,13 @@ ios_ec_xlate_loop:
+   b.lo ios_ec_xlate_hit_walk
+   b ios_ec_xlate_loop
+ ios_ec_xlate_hit_walk:
+-  adrp x4, IosAliasLast
+-  str x16, [x4, #:lo12:IosAliasLast]
++  // Remember the entry for this page. x23 (offset into the image) must survive.
++  lsr x4, x9, #16
++  eor x4, x4, x4, lsr #12
++  and x4, x4, #0xfff
++  adrp x17, IosAliasHint
++  add x17, x17, #:lo12:IosAliasHint
++  str x16, [x17, x4, lsl #3]
+ ios_ec_xlate_hit:
+   ldr x4, [x16, #8]     // Entry.JitBase
+   add x9, x4, x23

@@ -70,6 +70,7 @@ jobs:
           echo "ffmpeg=$(git rev-parse HEAD:build/ffmpeg)" >> "$GITHUB_OUTPUT"
           echo "dxmtios=$(git rev-parse HEAD:build/dxmt-ios)" >> "$GITHUB_OUTPUT"
           echo "rppairing=$(git rev-parse HEAD:build/rppairing-ios)" >> "$GITHUB_OUTPUT"
+          echo "fexec=$(git rev-parse HEAD:build/fex-arm64ec)" >> "$GITHUB_OUTPUT"
 
       - name: Host tools
         run: |
@@ -164,6 +165,40 @@ jobs:
         with:
           path: FEX/build-ios
           key: fex-ios-${{ steps.rev.outputs.FEX }}-${{ hashFiles('build/fex-ios/build.sh') }}
+
+      # The ARM64EC FEX module (xtajit64.dll) is built from the FEX submodule plus
+      # build/fex-arm64ec/*.patch, replacing the prebuilt copy. Keyed like FEX (iOS);
+      # ccache carries over between patch revisions so a patch change rebuilds fast.
+      - id: fexec
+        if: ${{ !cancelled() }}
+        uses: actions/cache/restore@v4
+        with:
+          path: FEX/build-arm64ec/Bin/libarm64ecfex.dll
+          key: fex-arm64ec-${{ steps.rev.outputs.FEX }}-${{ steps.rev.outputs.fexec }}
+      - id: fexecccache
+        if: ${{ !cancelled() && steps.fexec.outputs.cache-hit != 'true' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache-fex-arm64ec
+          key: ccache-fex-arm64ec-${{ steps.rev.outputs.FEX }}-${{ github.run_id }}
+          restore-keys: ccache-fex-arm64ec-${{ steps.rev.outputs.FEX }}-
+      - name: FEX (ARM64EC)
+        id: fexecbuild
+        if: ${{ !cancelled() && steps.fexec.outputs.cache-hit != 'true' }}
+        run: CCACHE_DIR="$PWD/.ccache-fex-arm64ec" bash build/fex-arm64ec/build.sh
+      - if: ${{ !cancelled() && steps.fexecbuild.outcome == 'success' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache-fex-arm64ec
+          key: ccache-fex-arm64ec-${{ steps.rev.outputs.FEX }}-${{ github.run_id }}
+      - if: ${{ !cancelled() && steps.fexecbuild.outcome == 'success' }}
+        uses: actions/cache/save@v4
+        with:
+          path: FEX/build-arm64ec/Bin/libarm64ecfex.dll
+          key: fex-arm64ec-${{ steps.rev.outputs.FEX }}-${{ steps.rev.outputs.fexec }}
+      - name: FEX (ARM64EC, cached)
+        if: ${{ !cancelled() && steps.fexec.outputs.cache-hit == 'true' }}
+        run: cp FEX/build-arm64ec/Bin/libarm64ecfex.dll app/Madeira/arm64ec-windows/xtajit64.dll
 
       - id: winetrees
         uses: actions/cache/restore@v4
@@ -272,5 +307,6 @@ jobs:
             build/*/obj/base/*.err
             wine/build-*/config.log
             FEX/build-ios/CMakeFiles/*.log
+            FEX/build-arm64ec/CMakeFiles/*.log
             toolchains/llvm-ios-build/CMakeFiles/*.log
           if-no-files-found: ignore
