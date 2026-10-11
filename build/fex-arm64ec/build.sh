@@ -31,10 +31,19 @@ if [ ! -f "$B/CMakeCache.txt" ]; then
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DCMAKE_DISABLE_FIND_PACKAGE_fmt=ON -DCMAKE_DISABLE_FIND_PACKAGE_range-v3=ON \
         -DCMAKE_DISABLE_FIND_PACKAGE_unordered_dense=ON -DCMAKE_DISABLE_FIND_PACKAGE_xxhash=ON \
-        -DCMAKE_DISABLE_FIND_PACKAGE_Catch2=ON
+        -DCMAKE_DISABLE_FIND_PACKAGE_Catch2=ON \
+        -DOVERRIDE_VERSION=FEX-2607-76-g26859e1
     # The DISABLE_FIND_PACKAGE lines keep CMake on FEX's bundled External/ copies:
     # the CI runner's Homebrew fmt is a macOS library, and as an imported target
     # for a Windows build it fails configuration (IMPORTED_IMPLIB not set).
+    #
+    # OVERRIDE_VERSION: FEX returns this string from its hypervisor CPUID leaf
+    # (0x40000001 sub-leaves 1-2), and Denuvo includes it in the hardware
+    # fingerprint. CI's submodule checkout has no tags, so `git describe` gives an
+    # empty string; a build with an empty version asked Stellar Blade for online
+    # re-activation. This is the string the prebuilt xtajit64.dll had (built at
+    # willfaust/FEX 26859e1), the one existing activations were made under. Keep
+    # it fixed even when the FEX commit moves.
 fi
 cmake --build "$B" --target arm64ecfex
 cp "$B/Bin/libarm64ecfex.dll" "$R/app/Madeira/arm64ec-windows/xtajit64.dll" && ls -l "$R/app/Madeira/arm64ec-windows/xtajit64.dll"
