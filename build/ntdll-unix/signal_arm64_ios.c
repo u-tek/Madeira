@@ -1273,6 +1273,12 @@ void ios_dump_guest_callers( const char *tag, unsigned long long x28 )
      * there, not the guest's FEX frame. */
     if (x28 < 0x10000 || x28 >= 0xfffffff000000000ULL) return;
 
+    /* ml1051: 16,753 of these (x7 lines) filled a quarter of a 46 MB log and the
+     * log pipeline was ~12% of all running CPU samples. First 24, then 1 in 2000,
+     * decided before the two Mach reads below so a skipped call costs nothing. */
+    { static unsigned long ml1051_n; unsigned long k = __sync_add_and_fetch( &ml1051_n, 1 );
+      if (k > 24 && (k % 2000)) return; }
+
     /* callret_sp lives in the FEX frame; read it the same way the fault path
      * does, through a failure-returning copy so a stale x28 cannot fault here. */
     if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(x28 + 0xb0),
@@ -1284,10 +1290,6 @@ void ios_dump_guest_callers( const char *tag, unsigned long long x28 )
         got != sizeof(cr))
         return;
 
-    /* ml1051: 16,753 of these (x7 lines) filled a quarter of a 46 MB log and the
-     * log pipeline was ~12% of all running CPU samples. First 24, then 1 in 2000. */
-    { static unsigned long ml1051_n; unsigned long k = __sync_add_and_fetch( &ml1051_n, 1 );
-      if (k > 24 && (k % 2000)) return; }
     dprintf( 2, "ml1002: [%s] guest callers (most recent first), x28=%#llx callret=%#llx:\n",
              tag, (unsigned long long)x28, (unsigned long long)cret );
     for (i = 0; i < 6; i++)

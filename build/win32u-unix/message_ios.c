@@ -472,8 +472,9 @@ static BOOL init_window_call_params( struct win_proc_params *params, HWND hwnd, 
      * can resolve a NULL winproc (crash: blr NULL in call_window_proc).
      * Log func + resolved procW for the first few calls per process. */
     {
-        static int wp_cnt;
-        if (getenv("MADEIRA_DESKTOP") && wp_cnt++ < 30)
+        static int wp_cnt, wp_desktop = -1;
+        if (wp_desktop < 0) wp_desktop = getenv("MADEIRA_DESKTOP") != NULL;
+        if (wp_desktop && wp_cnt++ < 30)
         {
             struct win_proc_params tmp = { .func = params->func, .ansi = ansi };
             get_winproc_params( &tmp, TRUE );

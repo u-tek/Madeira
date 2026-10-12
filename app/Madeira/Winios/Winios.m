@@ -760,7 +760,13 @@ BOOL winios_pProcessEvents(DWORD mask) {
         g_input_q.tail = (g_input_q.tail + 1) % WINIOS_RING_SIZE;
         pthread_mutex_unlock(&g_input_q.lock);
 
-        fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x\n", e.type, e.x, e.y, e.flags); fflush(stderr);
+        {   /* one line per 30 events, like post_touch_move: this runs on the window's
+             * own thread for every touch move (60-120 Hz), and each line is a write
+             * plus a pass through the app's log pipeline */
+            static unsigned drain_n;
+            if ((drain_n++ % 30) == 0)
+                fprintf(stderr, "[winios] drain type=%u x=%d y=%d flags=0x%x (n=%u)\n", e.type, e.x, e.y, e.flags, drain_n);
+        }
         if (e.type == WINIOS_EV_KEY)
             winios_drv_post_key((unsigned short)e.x, e.flags);
         else
