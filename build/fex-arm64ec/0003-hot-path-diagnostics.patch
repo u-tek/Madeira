@@ -1,0 +1,89 @@
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 26a039f..f737d48 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1923,7 +1923,20 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+    * every CompileBlock call; g_cb_real_compiles bumped after cache miss
+    * proves we actually compile (see below at LookupCache fallthrough).
+    * Boyer-Moore-style 1-slot hot-RIP estimator. Summary every 16K calls. */
+-  {
++  /* Sampled: this is the dispatcher's L1-miss path (~15K calls a frame, nearly all
++   * L2/L3 hits), and three process-wide read-modify-writes per call made every
++   * thread that missed its L1 fight over the same cache lines. One call in 64,
++   * picked by the low bits of the virtual counter (no shared state on the other
++   * 63), now stands for 64: total and the hot-RIP estimate are approximate,
++   * real_compiles stays exact. */
++  uint64_t IosCbTick = 0;
++#if defined(ARCHITECTURE_arm64) || defined(ARCHITECTURE_arm64ec)
++  constexpr uint64_t IosCbWeight = 64;
++  __asm volatile("mrs %0, cntvct_el0" : "=r"(IosCbTick));
++#else
++  constexpr uint64_t IosCbWeight = 1;
++#endif
++  if ((IosCbTick & (IosCbWeight - 1)) == 0) {
+     static volatile uint64_t g_cb_last_summary_total = 0;
+     static volatile uint64_t g_cb_hot_rip = 0;
+     static volatile uint64_t g_cb_hot_rip_count = 0;
+@@ -1935,7 +1948,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     } else {
+       __sync_sub_and_fetch(&g_cb_hot_rip_count, 1);
+     }
+-    uint64_t total = __sync_add_and_fetch(&g_cb_total, 1);
++    uint64_t total = __sync_add_and_fetch(&g_cb_total, IosCbWeight);
+     if ((total - g_cb_last_summary_total) >= 16384) {
+       g_cb_last_summary_total = total;
+       uint64_t reals = g_cb_real_compiles;
+@@ -1988,6 +2001,13 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     }
+   }
+ 
++  /* MADEIRA_FEX_HOTRIP_DIAG (off): the per-thread callret table and the HOTRIP
++   * counters below ran on every L1 miss, writing shared lines from every thread,
++   * and the HOTRIP part is keyed on fixed RIPs of an earlier game. Any executable
++   * based at 0x140000000 (Stellar Blade's is) can have blocks at those RIPs, and
++   * for 0x140006feb it dereferenced guest RBX/RCX as pointers inside the compiler.
++   * Define MADEIRA_FEX_HOTRIP_DIAG to bring both back for that investigation. */
++#ifdef MADEIRA_FEX_HOTRIP_DIAG
+   /* iOS-Madeira 2026-05-14: per-thread callret tracking (runs for EVERY
+    * block dispatch, not just hot RIPs). 4-slot hash table keyed by Frame
+    * pointer (unique per FEX thread). Identifies WHICH thread is leaking
+@@ -2112,6 +2132,8 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     }
+   }
+ 
++#endif  // MADEIRA_FEX_HOTRIP_DIAG
++
+   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
+ 
+ #ifdef FEX_IOS_HOST
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.h b/FEXCore/Source/Interface/Core/LookupCache.h
+index ffa2709..a0f9339 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -257,10 +257,14 @@ public:
+     // Keeping track not L1 misses, but specifically L2/L3 hits.
+     ++L2L3CacheHits;
+ #ifdef FEX_IOS_HOST
+-    {   /* ml1124: process-wide L1-miss rate (every 2^20 misses, with the time) */
++    /* ml1124: process-wide L1-miss rate (every 2^20 misses, with the time). Each
++     * thread's cache adds its misses to the shared counter 256 at a time: one
++     * process-wide read-modify-write per L1 miss made every missing thread
++     * contend on one cache line. */
++    if ((++IosL1MissBatch & 0xff) == 0) {
+       static std::atomic<uint64_t> IosL1Misses {0};
+       static std::atomic<int64_t> IosL1LastNs {0};
+-      const uint64_t M = IosL1Misses.fetch_add(1, std::memory_order_relaxed) + 1;
++      const uint64_t M = IosL1Misses.fetch_add(0x100, std::memory_order_relaxed) + 0x100;
+       if ((M & 0xfffff) == 0) {
+         const int64_t Now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+         const int64_t Last = IosL1LastNs.exchange(Now, std::memory_order_relaxed);
+@@ -564,6 +568,9 @@ private:
+ 
+   size_t CurrentL1Entries = MIN_L1_ENTRIES;
+   uint64_t L2L3CacheHits {};
++#ifdef FEX_IOS_HOST
++  uint64_t IosL1MissBatch {};
++#endif
+   std::chrono::time_point<std::chrono::system_clock> LastPeriod {};
+   constexpr static std::chrono::seconds SamplePeriod {1};
+   FEX_CONFIG_OPT(DynamicL1CacheIncreaseCountHeuristic, DYNAMICL1CACHEINCREASECOUNTHEURISTIC);
