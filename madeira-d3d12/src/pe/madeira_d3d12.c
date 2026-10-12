@@ -3562,6 +3562,18 @@ static enum WMTAttributeFormat mad_attr_format(DXGI_FORMAT f) {
     }
 }
 
+/* ml1278: an R10G10B10A2 texture stored as RGBA16Float (see mad_rgb10a2_as_fp16). */
+static int mad_res_promoted(const struct mad_resource *r) {
+    return r && r->tex_pf == WMTPixelFormatRGBA16Float &&
+           (r->desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM || r->desc.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS);
+}
+static void mad_promoted_copy_skip(const char *what, const struct mad_resource *r) {
+    static LONG said;
+    if (InterlockedIncrement(&said) <= 8)
+        d3d12_log("[madeira-d3d12] ml1278 %s copy skipped: '%s' %ux%u is R10G10B10A2 stored as RGBA16Float and the other side is not\n",
+                  what, r->name ? r->name : "?", r->width, r->height);
+}
+
 static UINT mad_pf_bytes(UINT pf) {
     switch (pf) {
     case 10: case 13: return 1;
@@ -4712,6 +4724,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     case MC_COPY_B2T: {
         struct wmtcmd_blit_copy_from_buffer_to_texture k;
         if (!c->u.bt.tex->texture || !c->u.bt.buf->buffer) { MAD_SKIP(e); return; }
+        if (mad_res_promoted(c->u.bt.tex)) { mad_promoted_copy_skip("buffer -> texture", c->u.bt.tex); MAD_SKIP(e); return; }   /* ml1278 */
         memset(&k, 0, sizeof k);
         k.type = WMTBlitCommandCopyFromBufferToTexture;
         k.src = c->u.bt.buf->buffer; k.src_offset = c->u.bt.off;
@@ -4726,6 +4739,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     case MC_COPY_T2B: {
         struct wmtcmd_blit_copy_from_texture_to_buffer k;
         if (!c->u.bt.tex->texture || !c->u.bt.buf->buffer) { MAD_SKIP(e); return; }
+        if (mad_res_promoted(c->u.bt.tex)) { mad_promoted_copy_skip("texture -> buffer", c->u.bt.tex); MAD_SKIP(e); return; }   /* ml1278 */
         memset(&k, 0, sizeof k);
         k.type = WMTBlitCommandCopyFromTextureToBuffer;
         k.src = c->u.bt.tex->texture; k.slice = c->u.bt.slice; k.level = c->u.bt.level;
@@ -4744,6 +4758,10 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
             (c->u.tt.src->tex_pf != c->u.tt.dst->tex_pf || c->u.tt.splane || c->u.tt.dplane)) {
             exec_copy_aspect(e, c);   /* a depth or stencil plane to or from a colour texture */
             return;
+        }
+        if (mad_res_promoted(c->u.tt.src) != mad_res_promoted(c->u.tt.dst)) {   /* ml1278: RGBA16F and RGB10A2 do not blit into each other */
+            mad_promoted_copy_skip("texture -> texture", mad_res_promoted(c->u.tt.src) ? c->u.tt.src : c->u.tt.dst);
+            MAD_SKIP(e); return;
         }
         memset(&k, 0, sizeof k);
         k.type = WMTBlitCommandCopyFromTextureToTexture;
@@ -6801,6 +6819,7 @@ static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, 
     if (!r->texture) return 0;
     if (!swz) swz = MAD_SWZ_IDENTITY;
     if (!pf || (r->is_depth && pf != WMTPixelFormatX32_Stencil8)) pf = r->tex_pf;   /* depth textures keep their format: sampled as depth; ml1101: unless a stencil view */
+    if (pf == WMTPixelFormatRGB10A2Unorm && r->tex_pf == WMTPixelFormatRGBA16Float) pf = r->tex_pf;   /* ml1278: an R10G10B10A2 view of a promoted texture */
     if (nlvl == 0 || nlvl == ~0u || lvl0 + nlvl > r->tex_mips) nlvl = r->tex_mips > lvl0 ? r->tex_mips - lvl0 : 1;
     if (nsl == 0 || nsl == ~0u || sl0 + nsl > r->tex_layers) nsl = r->tex_layers > sl0 ? r->tex_layers - sl0 : 1;
     if (want == r->tex_type && lvl0 == 0 && nlvl == r->tex_mips && sl0 == 0 && nsl == r->tex_layers && pf == r->tex_pf && swz == MAD_SWZ_IDENTITY)
@@ -7615,6 +7634,31 @@ static D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE res_GetGPUVirtualAddress(ID3D
  * stencil view. Metal has no 24-bit depth on Apple GPUs, so D24S8 widens to
  * D32S8, which changes the stored precision and nothing the application can
  * observe through the API. Unknown formats are named once and refused. */
+/* ml1278: R10G10B10A2 RENDER TARGETS AND UAVs AS RGBA16Float. FSR 3 frame
+ * generation writes its interpolated frame into a UAV of the swap chain's
+ * format (R10G10B10A2 here, SDR and HDR alike) and its inpainting pass reads
+ * it back with typed UAV loads. Metal's read-write textures support RGB10A2Unorm
+ * at no tier, so those reads are undefined; the likely result is the black
+ * squares seen with frame generation on (logs 92129101 onward), where
+ * disoccluded areas are never filled. With madeira.cfg rgb10a2-as-fp16 = 1, every texture of this
+ * format that can be a render target or a UAV is stored as RGBA16Float (tier
+ * 2), and so are pipelines' colour attachments, the swap chain's buffers and
+ * its layer. Copies between such textures stay format-for-format, and RGBA16F
+ * holds every RGB10A2 value. The pixel shader still clamps unorm targets
+ * (ps_unorm_mask follows the DXGI format). Textures that are only sampled
+ * keep RGB10A2. A copy between the two kinds, or between a promoted texture
+ * and a buffer, is skipped and logged (the layouts differ). Sizes reported to
+ * the application come from the promoted texture, so placed resources fit. */
+static int mad_rgb10a2_as_fp16(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = mad_cfg_int_pe("rgb10a2-as-fp16", 0) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] ml1278 rgb10a2-as-fp16 = %d (%s)\n", v,
+                  v ? "R10G10B10A2 render targets and UAVs are RGBA16Float, so typed UAV loads work"
+                    : "R10G10B10A2 textures stay RGB10A2Unorm");
+    }
+    return v;
+}
 static int mad_map_texture_format(DXGI_FORMAT f, D3D12_RESOURCE_FLAGS flags,
                                   enum WMTPixelFormat *out, int *is_depth) {
     int ds = (flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
@@ -7670,7 +7714,11 @@ static int mad_map_texture_format(DXGI_FORMAT f, D3D12_RESOURCE_FLAGS flags,
     case DXGI_FORMAT_R8G8_SNORM: *out = WMTPixelFormatRG8Snorm; return 1;
     case DXGI_FORMAT_R8G8_UINT: *out = WMTPixelFormatRG8Uint; return 1;
     case DXGI_FORMAT_R8G8_SINT: *out = WMTPixelFormatRG8Sint; return 1;
-    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM: *out = WMTPixelFormatRGB10A2Unorm; return 1;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM:
+        /* ml1278: render targets and UAVs of this format are stored as RGBA16Float */
+        *out = ((flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) && mad_rgb10a2_as_fp16())
+             ? WMTPixelFormatRGBA16Float : WMTPixelFormatRGB10A2Unorm;
+        return 1;
     case DXGI_FORMAT_R10G10B10A2_UINT: *out = WMTPixelFormatRGB10A2Uint; return 1;
     case DXGI_FORMAT_R11G11B10_FLOAT: *out = WMTPixelFormatRG11B10Float; return 1;
     case DXGI_FORMAT_R9G9B9E5_SHAREDEXP: *out = WMTPixelFormatRGB9E5Float; return 1;
@@ -11123,9 +11171,21 @@ static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct 
             d3d12_log("[madeira-d3d12] %s: view %s; clearing the named resource '%s' %ux%u (mip %u, format %u)\n",
                       what, why, u.res->name ? u.res->name : "?", u.res->width, u.res->height, u.level, (unsigned)u.fmt);
     }
-    bpp = u.res->samples > 1 ? 0 : mad_pack_clear(u.fmt, v, is_float, px);
-    if (bpp) mad_format_info(u.res->desc.Format, &rbytes, &rblock);
-    if (bpp && rblock == 1 && rbytes && rbytes != bpp) bpp = 0;   /* the view must cover whole texels */
+    if (mad_res_promoted(u.res)) {   /* ml1278: stored as RGBA16Float, so the texel is packed as that */
+        UINT32 fv[4];
+        if (is_float) memcpy(fv, v, sizeof fv);
+        else {   /* a Uint clear of an R10G10B10A2 view writes each value's low bits: 10, 10, 10, 2 */
+            float f[4];
+            f[0] = (float)(v[0] & 1023) / 1023.0f; f[1] = (float)(v[1] & 1023) / 1023.0f;
+            f[2] = (float)(v[2] & 1023) / 1023.0f; f[3] = (float)(v[3] & 3) / 3.0f;
+            memcpy(fv, f, sizeof fv);
+        }
+        bpp = u.res->samples > 1 ? 0 : mad_pack_clear(DXGI_FORMAT_R16G16B16A16_FLOAT, fv, 1, px);
+    } else {
+        bpp = u.res->samples > 1 ? 0 : mad_pack_clear(u.fmt, v, is_float, px);
+        if (bpp) mad_format_info(u.res->desc.Format, &rbytes, &rblock);
+        if (bpp && rblock == 1 && rbytes && rbytes != bpp) bpp = 0;   /* the view must cover whole texels */
+    }
     memcpy(w, px, 16);
     if (bpp == 1) pat = px[0] * 0x01010101u;
     else if (bpp == 2) { pat = (UINT32)px[0] | ((UINT32)px[1] << 8); pat |= pat << 16; }

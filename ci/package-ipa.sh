@@ -25,6 +25,13 @@ mkdir "$STAGE/Payload"
 ditto "$APP" "$STAGE/Payload/Madeira.app"
 # Release packages leave Wine Mono out; the app downloads it on first use.
 rm -rf "$STAGE/Payload/Madeira.app/wine-mono"
+# The log's "[build]" line (BuildStamp reads MadeiraBuild) names the CI build and
+# commit, so a log shows which release is installed: the version is the same in
+# every build.
+if [ -n "${GITHUB_RUN_NUMBER:-}" ]; then
+    /usr/libexec/PlistBuddy -c "Add :MadeiraBuild string build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:7}" \
+        "$STAGE/Payload/Madeira.app/Info.plist" 2>/dev/null || true
+fi
 
 # Ad-hoc sign with the app's entitlements. The sideloader re-signs at install time and
 # keeps the entitlements it finds in the existing signature (filtered by the profile);
