@@ -189,6 +189,7 @@ struct mad_device {
     const char *name;
     obj_handle_t mtl_device;
     obj_handle_t mtl_queue;
+    obj_handle_t present_queue; /* ml1277: a second Metal queue for frame-generation presents (lazy) */
     obj_handle_t dsso;          /* depth: less-equal, writes enabled */
     LONG device_lost;
     LUID adapter_luid;          /* GetAdapterLuid: the DXGI adapter the device was created on */
@@ -1151,6 +1152,110 @@ static UINT64 mad_fence_spin_wait(struct mad_fence *f, UINT64 v) {
     LeaveCriticalSection(&f->lock);
     f->spin_t = mad_timer_ticks();   /* the next poll right after this one still counts as spinning */
     return v;
+}
+/* ml1276: FSR 3 frame generation's busy-waits sleep. Its "AMD FSR Presenter
+ * Thread" paces frames by calling QueryPerformanceCounter in a loop (waits of
+ * up to half a game frame), and its fence waits poll GetCompletedValue and QPC
+ * in turn. Log e64dba4f: the presenter made 3-20 million QPC calls a second, a
+ * whole core, while iOS had parked the performance cores (P=0) and the game
+ * thread got a third of an efficiency core. FEX's QPC watch (ml1274) never saw
+ * these calls. Instead the QueryPerformanceCounter import of FidelityFX's own
+ * DLLs is pointed here: after 64 calls in a row from one thread, each under
+ * 2 us after the last, the thread sleeps 500 us before reading the counter.
+ * A wait of N ms then costs ~N/64 of a millisecond of CPU and ends at most
+ * ~0.5 ms late. Only FidelityFX's modules are patched; the game's own timing
+ * is untouched. madeira.cfg fg-qpc-nap = 0 leaves the imports alone. */
+#define MAD_QPC_NAP_GAP 48   /* generic-timer ticks: 2 us at 24 MHz */
+struct mad_qpc_slot { volatile DWORD tid; UINT streak; UINT64 last; };
+static struct mad_qpc_slot g_qpc_slot[64];
+typedef LONG (WINAPI *mad_delay_fn)(BOOLEAN, const LARGE_INTEGER *);   /* ntdll NtDelayExecution */
+static mad_delay_fn p_NtDelayExecution;
+static volatile LONG g_qpc_naps_said;
+static volatile LONG64 g_qpc_naps;
+static BOOL WINAPI mad_qpc_nap(LARGE_INTEGER *counter) {
+    DWORD tid = GetCurrentThreadId();
+    struct mad_qpc_slot *sl = &g_qpc_slot[(tid >> 2) & 63];
+    UINT64 now = mad_timer_ticks();
+    if (sl->tid != tid) { sl->tid = tid; sl->streak = 0; }   /* a slot shared by two threads just starts over */
+    else if (now - sl->last < MAD_QPC_NAP_GAP) {
+        if (++sl->streak >= 64 && p_NtDelayExecution) {
+            LARGE_INTEGER d;
+            d.QuadPart = -5000;   /* 500 us, relative */
+            sl->streak = 0;
+            p_NtDelayExecution(FALSE, &d);
+            InterlockedIncrement64(&g_qpc_naps);
+            if (!InterlockedExchange(&g_qpc_naps_said, 1)) {
+                char nm[64];
+                mad_thread_name(nm, sizeof nm);
+                d3d12_log("[madeira-d3d12] ml1276 first QueryPerformanceCounter busy-wait nap (thread %04lx '%s')\n", tid, nm);
+            }
+            now = mad_timer_ticks();
+        }
+    } else sl->streak = 0;
+    sl->last = now;
+    return QueryPerformanceCounter(counter);
+}
+/* Point one module's QueryPerformanceCounter import(s) at mad_qpc_nap. */
+static int mad_qpc_patch_module(HMODULE m) {
+    BYTE *base = (BYTE *)m;
+    IMAGE_DOS_HEADER *dh = (IMAGE_DOS_HEADER *)base;
+    IMAGE_NT_HEADERS64 *nt;
+    IMAGE_DATA_DIRECTORY *dir;
+    IMAGE_IMPORT_DESCRIPTOR *imp;
+    int n = 0;
+    if (dh->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    nt = (IMAGE_NT_HEADERS64 *)(base + dh->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return 0;
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir->VirtualAddress || !dir->Size) return 0;
+    for (imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir->VirtualAddress); imp->Name; imp++) {
+        IMAGE_THUNK_DATA64 *names, *iat;
+        if (!imp->OriginalFirstThunk || !imp->FirstThunk) continue;   /* no name table: the slots cannot be told apart */
+        names = (IMAGE_THUNK_DATA64 *)(base + imp->OriginalFirstThunk);
+        iat = (IMAGE_THUNK_DATA64 *)(base + imp->FirstThunk);
+        for (; names->u1.AddressOfData; names++, iat++) {
+            IMAGE_IMPORT_BY_NAME *ibn;
+            DWORD old;
+            if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)) continue;
+            ibn = (IMAGE_IMPORT_BY_NAME *)(base + names->u1.AddressOfData);
+            if (strcmp((const char *)ibn->Name, "QueryPerformanceCounter")) continue;
+            if (!VirtualProtect(&iat->u1.Function, sizeof iat->u1.Function, PAGE_READWRITE, &old)) continue;
+            iat->u1.Function = (ULONGLONG)(ULONG_PTR)mad_qpc_nap;
+            VirtualProtect(&iat->u1.Function, sizeof iat->u1.Function, old, &old);
+            n++;
+        }
+    }
+    return n;
+}
+static void mad_qpc_patch_fidelityfx(void) {
+    static const WCHAR *const names[] = {
+        L"amd_fidelityfx_dx12.dll", L"amd_fidelityfx_framegeneration_dx12.dll", L"amd_fidelityfx_upscaler_dx12.dll",
+        L"amd_fidelityfx_loader_dx12.dll", L"ffx_backend_dx12_x64.dll", L"ffx_frameinterpolation_x64.dll",
+        L"ffx_fsr3_x64.dll", L"ffx_fsr3upscaler_x64.dll", L"ffx_opticalflow_x64.dll",
+    };
+    static HMODULE done[16];
+    static int enabled = -1;
+    unsigned i, k;
+    if (enabled < 0) {
+        enabled = mad_cfg_int_pe("fg-qpc-nap", 1) ? 1 : 0;
+        p_NtDelayExecution = (mad_delay_fn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtDelayExecution");
+    }
+    if (!enabled || !p_NtDelayExecution) return;
+    for (i = 0; i < sizeof names / sizeof names[0]; i++) {
+        HMODULE m = GetModuleHandleW(names[i]);
+        int n;
+        if (!m) continue;
+        for (k = 0; k < 16 && done[k] && done[k] != m; k++) ;
+        if (k == 16 || done[k] == m) continue;
+        done[k] = m;
+        n = mad_qpc_patch_module(m);
+        {
+            char nm[64];
+            WideCharToMultiByte(CP_UTF8, 0, names[i], -1, nm, sizeof nm, NULL, NULL);
+            d3d12_log("[madeira-d3d12] ml1276 %s: %d QueryPerformanceCounter import(s) now nap in busy-waits (madeira.cfg fg-qpc-nap = 0 turns this off)\n",
+                      nm, n);
+        }
+    }
 }
 static UINT64 STDMETHODCALLTYPE fence_GetCompletedValue(ID3D12Fence *This) {
     struct mad_fence *f = (struct mad_fence *)This;
@@ -6114,6 +6219,7 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
         /* These were retained on creation and were previously leaked. */
         if (d->dsso) NSObject_release(d->dsso);
         if (d->mtl_queue) NSObject_release(d->mtl_queue);
+        if (d->present_queue) NSObject_release(d->present_queue);   /* ml1277 */
         if (d->mtl_device) NSObject_release(d->mtl_device);
         DeleteCriticalSection(&d->live_lock);
         DeleteCriticalSection(&d->view_lock); free(d->vmap);
@@ -12643,9 +12749,10 @@ static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UIN
             fg = strstr(nm, "FSR Presenter") != NULL;
             ps->pace_tid = tid;
             if (fg != ps->pace_fg) {
-                d3d12_log("[madeira-d3d12] ml1275 swapchain %p: presents now come from thread %04lx '%s'; frame-generation pacing %s\n",
+                d3d12_log("[madeira-d3d12] ml1275 swapchain %p: presents now come from thread %04lx '%s'; frame generation %s\n",
                           (void *)ps, tid, nm, fg ? "on" : "off");
                 InterlockedExchange(&ps->pace_fg, fg);
+                if (fg) mad_qpc_patch_fidelityfx();   /* ml1276 */
             }
         }
     }
@@ -12694,8 +12801,12 @@ static HRESULT swap_Present_inner(IDXGISwapChain4 *T, UINT sync, UINT flags) {
  * present interval after the one before. Presents arrive at two per game frame
  * on average, so that is just under half a game frame and the pair is spread
  * across it; staying under the real cadence means the pacing never holds back
- * throughput by itself. madeira.cfg fg-pace = 0 turns it off; fg-pace-floor-us
- * (default 16667, the 60 fps cap DXMT applies) is the shortest spacing used. */
+ * throughput by itself. madeira.cfg fg-pace = 1 turns it on; fg-pace-floor-us
+ * (default 16667, the 60 fps cap DXMT applies) is the shortest spacing used.
+ * Off by default since Build 54. Log e64dba4f showed it did hold throughput
+ * back: the held drawables ran the layer's pool dry, and the present worker
+ * waited 100-300 ms of every 330 ms in nextDrawable. Ml1277 (presenting on a
+ * second Metal queue) goes after the cause instead. */
 static int g_fg_pace = -1; static double g_fg_pace_floor;
 static void mad_fg_present(struct mad_swapchain *s, obj_handle_t cb, obj_handle_t drawable) {
     LARGE_INTEGER fq;
@@ -12703,7 +12814,7 @@ static void mad_fg_present(struct mad_swapchain *s, obj_handle_t cb, obj_handle_
     double after;
     if (g_fg_pace < 0) {
         g_fg_pace_floor = (double)mad_cfg_int_pe("fg-pace-floor-us", 16667) / 1e6;
-        g_fg_pace = mad_cfg_int_pe("fg-pace", 1) ? 1 : 0;
+        g_fg_pace = mad_cfg_int_pe("fg-pace", 0) ? 1 : 0;
         d3d12_log("[madeira-d3d12] ml1275 fg-pace = %d (frame-generation presents %s), fg-pace-floor-us = %.0f\n", g_fg_pace,
                   g_fg_pace ? "are spread evenly across the game frame" : "go out as they arrive", g_fg_pace_floor * 1e6);
     }
@@ -12729,12 +12840,57 @@ static void mad_fg_present(struct mad_swapchain *s, obj_handle_t cb, obj_handle_
         d3d12_log("[madeira-d3d12] ml1275 frame-generation pacing: presents %.1f ms apart on average, each shown at least %.1f ms after the last\n",
                   s->pace_avg * 1e3, after * 1e3);
 }
+/* ml1277: FRAME-GENERATION PRESENTS ON THEIR OWN METAL QUEUE. Every D3D queue
+ * feeds one Metal queue, so the present blit of a frame that FSR has already
+ * composited still waits behind all the game work committed since (the next
+ * frame's, typically a whole GPU frame). The interpolated frame and the real
+ * one then reach the panel back to back, and the game waits on FSR's buffers
+ * meanwhile (log e64dba4f: "game blocked" 54-99% of wall time). FSR calls
+ * Present only after waiting on the CPU for its composite fence, so when that
+ * swapchain's queue has nothing unfinished on the GPU the back buffer is
+ * final, and the blit can go to a second Metal queue that holds nothing else.
+ * Checked per present: if the queue's last batch has not finished, the blit
+ * takes the normal path. It waits on no MTLFence (fences do not cross queues)
+ * and updates none. madeira.cfg fg-present-queue = 0 turns this off. */
+static int g_present_direct = -1;
+static LONG64 g_present_direct_n, g_present_direct_miss;
+static obj_handle_t mad_present_cmdbuf(struct mad_swapchain *s, int *direct) {
+    struct mad_device *dv = s->queue->device;
+    *direct = 0;
+    if (g_present_direct < 0) {
+        g_present_direct = mad_cfg_int_pe("fg-present-queue", 1) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] ml1277 fg-present-queue = %d (%s)\n", g_present_direct,
+                  g_present_direct ? "frame-generation presents whose frame is finished use a second Metal queue"
+                                   : "every present waits behind the game's GPU work");
+    }
+    if (g_present_direct && s->pace_fg && dv->gpu_event && dv->mtl_device) {
+        if (mad_gpu_completed(dv) >= s->queue->last_serial) {
+            if (!dv->present_queue) {
+                dv->present_queue = MTLDevice_newCommandQueue(dv->mtl_device, 8);
+                if (dv->present_queue && dv->resset) MTLCommandQueue_addResidencySet(dv->present_queue, dv->resset);
+                d3d12_log("[madeira-d3d12] ml1277 frame-generation present queue %s\n", dv->present_queue ? "created" : "could NOT be created");
+            }
+            if (dv->present_queue) {
+                obj_handle_t cb = MTLCommandQueue_commandBuffer(dv->present_queue);
+                if (cb) {
+                    *direct = 1;
+                    if ((InterlockedIncrement64(&g_present_direct_n) % 600) == 1)
+                        d3d12_log("[madeira-d3d12] ml1277 frame-generation presents: %lld on the present queue, %lld waited behind game work\n",
+                                  (long long)g_present_direct_n, (long long)g_present_direct_miss);
+                    return cb;
+                }
+            }
+        } else InterlockedIncrement64(&g_present_direct_miss);
+    }
+    return MTLCommandQueue_commandBuffer(dv->mtl_queue);
+}
 /* ml1121: the Metal half of Present; runs on the queue's worker (async) or on the caller. */
 static void mad_mheap_reclaim(struct mad_device *d, int all);
 static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     struct mad_resource *src;
     obj_handle_t drawable, tex, cb, enc;
     struct wmtcmd_blit_copy_from_texture_to_texture t2t;
+    int direct = 0;   /* ml1277 */
     if (idx >= s->nbuf) return;
     src = s->buffers[idx];
     mad_mheap_reclaim(s->dev, 0);   /* ml1148: once a frame, heaps whose GPU work is long done */
@@ -12823,19 +12979,19 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     }
     { LONG64 tc = mad_qpc();   /* ml1128: blit + presentDrawable + commit */
     tex = MetalDrawable_texture(drawable);
-    cb = MTLCommandQueue_commandBuffer(s->queue->device->mtl_queue);
+    cb = mad_present_cmdbuf(s, &direct);   /* ml1277: the device queue, or the frame-generation present queue */
     if (cb && tex) {
         obj_handle_t copy_src = src->texture;
         UINT copy_w = src->width, copy_h = src->height;
         if (s->fx_scaler && s->fx_out && s->fx_view[idx]) {   /* MetalFX spatial, then the copy below */
             /* After fence-chain 6 work the scaler waits for the frame's batches on
              * the device fence and updates it, so the blit's wait below orders after it. */
-            obj_handle_t ff = (g_f6_used && s->queue->device->enc_fence) ? s->queue->device->enc_fence : 0;
+            obj_handle_t ff = (!direct && g_f6_used && s->queue->device->enc_fence) ? s->queue->device->enc_fence : 0;
             MTLCommandBuffer_encodeSpatialScale(cb, s->fx_scaler, s->fx_view[idx], s->fx_out, ff);
             copy_src = s->fx_out; copy_w = s->fx_w; copy_h = s->fx_h;
         }
         enc = MTLCommandBuffer_blitCommandEncoder(cb); if (enc) g_enc_seq++;
-        if (enc && g_f6_used && s->queue->device->enc_fence) {   /* ml1134: after every committed batch, not just queue order */
+        if (enc && !direct && g_f6_used && s->queue->device->enc_fence) {   /* ml1134: after every committed batch, not just queue order */
             obj_handle_t df = s->queue->device->enc_fence;
             f6_encode(enc, F6_BLIT, &df, 1, 0);
         }
@@ -13072,6 +13228,7 @@ static HRESULT mad_swapchain_create(struct mad_queue *q, IDXGIFactory1 *factory,
     }
     hr = mad_swap_make_buffers(s);
     if (FAILED(hr)) { swap_Release((IDXGISwapChain4 *)s); return hr; }
+    mad_qpc_patch_fidelityfx();   /* ml1276: FSR creates its real swapchain itself, so its DLLs are loaded by now */
     *out = (IDXGISwapChain1 *)s;
     return S_OK;
 }
