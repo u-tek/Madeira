@@ -4585,13 +4585,31 @@ void server_init_process_done(void)
         /* ml875 [thread-sample]: ONE task-wide sampler (ml873 armed seven, one
          * per pseudo-process, each suspending the others' threads). Body in
          * ios_thread_sampler_main() above. */
+        /* MADEIRA_PROFILERS (madeira.cfg env.MADEIRA_PROFILERS) picks which of these run:
+         *   0         none
+         *   unset     the passive probe only (ml1128 [xp]/[xp-api]: thread_info, no suspends)
+         *   1 or all  also the samplers that thread_suspend guest threads: the ml876
+         *             thread sampler with its rip-profile (every live thread once, then
+         *             200 passes, every 20 s) and the ml1129 W-thread profiler (bursts of
+         *             3,000 suspends per render/worker thread at 1 kHz, every ~18 s).
+         * Each suspend takes a running thread off its core mid-frame, so the samplers
+         * cost frame time and pacing for as long as the game runs; turn them on for
+         * profiling sessions only. */
         if (__sync_bool_compare_and_swap(&ios_ts_armed, 0, 1))
         {
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_thread_sampler_main(); });
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_xprobe_main(); });   /* ml1128 */
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_wprof_main(); });   /* ml1129 */
+            const char *prof = getenv("MADEIRA_PROFILERS");   /* 0 none; unset: passive [xp] probe only; 1/all: also the samplers that suspend guest threads (profiling sessions) */
+            int passive = !(prof && prof[0] == '0');
+            int suspending = prof && (!strcmp(prof, "1") || !strcmp(prof, "all"));
+            if (suspending)
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_thread_sampler_main(); });
+            if (passive)
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_xprobe_main(); });   /* ml1128 */
+            if (suspending)
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_wprof_main(); });   /* ml1129 */
+            wine_log_write("[profilers] MADEIRA_PROFILERS=%s: passive probe %s, suspending samplers %s",
+                           prof ? prof : "(unset)", passive ? "on" : "off", suspending ? "on" : "off");
         }
-        if (!getenv("MADEIRA_QUIET"))
+        if (!getenv("MADEIRA_QUIET"))   /* set by the app: skips the 500 Hz busiest-thread sampler below */
         {
             /* iOS-Madeira 2026-07-05 quiet mode: the sampler thread_suspends
              * the game thread ~500x/s (each suspend+get_state+resume steals
