@@ -1,5 +1,5 @@
 diff --git a/Source/Windows/ARM64EC/IosJitAlias.cpp b/Source/Windows/ARM64EC/IosJitAlias.cpp
-index fff2e7b..d0b5156 100644
+index fff2e7b..8b7e5b6 100644
 --- a/Source/Windows/ARM64EC/IosJitAlias.cpp
 +++ b/Source/Windows/ARM64EC/IosJitAlias.cpp
 @@ -18,6 +18,8 @@
@@ -148,7 +148,7 @@ index fff2e7b..d0b5156 100644
 +  FastCallCollect(FastCallExport(NtDll, "RtlLeaveCriticalSection"), kFastLeaveCs, 0);
 +  FastCallCollect(FastCallExport(KernelBase, "GetCurrentThreadId"), kFastThreadId, 0);
 +  FastCallCollect(FastCallExport(Kernel32, "GetCurrentThreadId"), kFastThreadId, 0);
-+  // ml1262: QueryPerformanceCounter busy-wait watch (Module.S ios_fast_qpc).
++  // ml1262/ml1274: QueryPerformanceCounter busy-wait watch (Module.S ios_fast_qpc).
 +  const char* Spin = getenv("MADEIRA_FEX_SPIN_DEPRESS");
 +  const bool SpinWatch = !(Spin && Spin[0] == '0');
 +  if (SpinWatch) {
@@ -157,7 +157,7 @@ index fff2e7b..d0b5156 100644
 +    FastCallCollect(FastCallExport(NtDll, "RtlQueryPerformanceCounter"), kFastQpcWatch, 0);
 +  }
 +  LogMan::Msg::EFmt("[iOS-fastcall] ml1261 {} addresses answered inline: TlsGetValue, Rtl{{Enter,Leave}}CriticalSection, "
-+                    "GetCurrentThreadId (MADEIRA_FEX_FASTCALLS=0 turns this off); ml1262 QPC busy-wait depress {} "
++                    "GetCurrentThreadId (MADEIRA_FEX_FASTCALLS=0 turns this off); ml1274 QPC busy-wait sleep {} "
 +                    "(MADEIRA_FEX_SPIN_DEPRESS=0 turns it off)",
 +                    g_FastCallSlots, SpinWatch ? "on" : "off");
 +}
@@ -165,10 +165,10 @@ index fff2e7b..d0b5156 100644
 +
  #endif  // FEX_IOS_HOST
 diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
-index a121a7a..c683fed 100644
+index a121a7a..e7305fe 100644
 --- a/Source/Windows/ARM64EC/Module.S
 +++ b/Source/Windows/ARM64EC/Module.S
-@@ -266,6 +266,161 @@ BeginSimulation:
+@@ -266,6 +266,181 @@ BeginSimulation:
    // Expects the target code address in x9
  .global ExitFunctionEC
  ExitFunctionEC:
@@ -208,38 +208,58 @@ index a121a7a..c683fed 100644
 +  b ios_fast_none
 +
 +ios_fast_qpc:
-+  // QueryPerformanceCounter: not answered here, only watched. A worker that
-+  // busy-waits on QPC (~130k calls a second with <1 us gaps in Stellar Blade)
-+  // holds a core the throttled phone does not have; iOS had parked the
-+  // performance cores, leaving 4 efficiency cores for 4-7 runnable threads.
-+  // After 64 back-to-back calls (<2 us apart) the thread depresses its own
-+  // priority for 1 ms: anything else runnable goes first, an idle core still
-+  // runs the spinner. TEB->ReservedForWdf (unused outside WDF drivers) holds
-+  // (streak << 48) | last 48-bit tick. Then the real QPC runs as before.
++  // QueryPerformanceCounter: not answered here, only watched for busy-waits.
++  // FSR 3 frame generation's presenter thread paces frames by spinning on QPC
++  // (2-8 million calls a second, every gap under 1 us, log 92129101), and
++  // games have spinners of their own. Each holds one of the phone's 2
++  // performance cores, or one of 4 efficiency cores once iOS parks those.
++  // ml1262 depressed the spinner's priority for 1 ms, which an idle core
++  // ignores: the presenter still made 8 M calls a second. ml1274: 64 calls in
++  // a row from ONE call site, each under 1 us after the last, block the thread
++  // for 1 ms (thread_switch SWITCH_OPTION_WAIT). A spin of N ms then costs
++  // about N/64 ms of CPU and ends at most ~1 ms late. Code that calls QPC
++  // between real work never builds a streak, and a timed scope's begin and
++  // end are two call sites. TEB->ReservedForWdf (unused outside WDF drivers)
++  // holds (call-site tag << 48) | (streak << 40) | last 40-bit tick. Then the
++  // real QPC runs as before.
 +  IOS_LOAD_TEB x17
 +  mrs x16, cntvct_el0
-+  and x16, x16, #0xffffffffffff
 +  ldr x23, [x17, #0x1818] // TEB->ReservedForWdf
-+  and x4, x23, #0xffffffffffff
-+  sub x4, x16, x4
-+  and x4, x4, #0xffffffffffff
++  mov x4, sp
++  ldr x4, [x4]          // the x64 return address (RSP may be 8-aligned: no sp-based load)
++  eor x4, x4, x4, lsr #16
++  and x4, x4, #0xffff   // call-site tag
++  sub x5, x16, x23      // ticks since the last call, in the low 40 bits
++  and x5, x5, #0xffffffffff
++  cmp x5, #24           // 1 us at the 24 MHz generic timer
++  b.hs 5f               // a gap: a new streak
 +  lsr x5, x23, #48
-+  cmp x4, #48           // 2 us at the 24 MHz generic timer
-+  csinc x5, xzr, x5, hs // a gap resets the streak, back-to-back extends it
++  cmp x5, x4
++  b.ne 5f               // another call site: a new streak
++  ubfx x5, x23, #40, #8
++  add x5, x5, #1
 +  cmp x5, #64
-+  b.lo 4f
-+  str x16, [x17, #0x1818] // streak back to 0
++  b.hs 6f
++  b 7f
++5:
++  mov x5, #0
++7:
++  and x16, x16, #0xffffffffff
++  orr x16, x16, x5, lsl #40
++  orr x16, x16, x4, lsl #48
++  str x16, [x17, #0x1818]
++  b ios_fast_none
++6:
++  and x16, x16, #0xffffffffff
++  orr x16, x16, x4, lsl #48 // streak back to 0; the call after the wait has a ~1 ms gap anyway
++  str x16, [x17, #0x1818]
 +  mov x23, x0           // RCX (the counter pointer) across the trap; the kernel only writes x0
 +  mov x0, #0            // thread_switch(MACH_PORT_NULL,
-+  mov x1, #1            //   SWITCH_OPTION_DEPRESS,
++  mov x1, #2            //   SWITCH_OPTION_WAIT,
 +  mov x2, #1            //   1 ms)
 +  mov x16, #-61
 +  svc #0x80
 +  mov x0, x23
-+  b ios_fast_none
-+4:
-+  orr x23, x16, x5, lsl #48
-+  str x23, [x17, #0x1818]
 +  b ios_fast_none
 +
 +ios_fast_tls:           // TlsGetValue(ecx): TEB->TlsSlots[ecx], LastErrorValue = 0

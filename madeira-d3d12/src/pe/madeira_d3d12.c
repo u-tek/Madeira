@@ -1106,8 +1106,14 @@ static void mad_gcv_sample(struct mad_fence *f, UINT64 v) {
  * the moment the value moves, and it returns after 1 ms otherwise, so a caller
  * that also watches something else is never held longer than that. A thread
  * that polls now and then between real work never gets a streak. 0 restores
- * pure polling. */
-#define MAD_FENCE_SPIN_POLLS 64
+ * pure polling.
+ * ml1274: 16 polls, not 64. FSR's fence waits call QueryPerformanceCounter
+ * after every poll, and FEX's QPC busy-wait watch (ml1262, 64 calls) stopped
+ * the thread at the 64th, so the next poll came well over 4 us later and the
+ * streak started over: the wait never engaged (no "fence-poll-wait =" line in
+ * log 92129101, 21,000 polls a frame). At 16 the fence wait comes first, and
+ * its 1 ms waits keep the QPC watch from ever building a streak. */
+#define MAD_FENCE_SPIN_POLLS 16
 #define MAD_FENCE_SPIN_GAP   96   /* generic-timer ticks: 4 us at 24 MHz */
 static int g_fence_poll_wait = -1;
 static long long mad_cfg_int_pe(const char *key, long long dflt);
@@ -12410,6 +12416,10 @@ struct mad_swapchain {
     UINT fx_w, fx_h;
     LONG diag_calls, diag_waitable;   /* ml1270 */
     enum WMTColorSpace hdr_cs;        /* ml1271: the layer's colour space once the game asked for HDR; 0 (sRGB) = never touched */
+    /* ml1275: frame-generation pacing -- the thread that presented last, whether
+     * it is a frame-generation presenter, and the running present interval */
+    DWORD pace_tid; volatile LONG pace_fg;   /* set on the presenting thread */
+    int pace_on; LONG64 pace_last; double pace_avg; UINT64 pace_n;   /* used on the thread that runs the present */
 };
 static IDXGISwapChain4Vtbl g_swap_vtbl;
 
@@ -12623,6 +12633,22 @@ static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UIN
                       (void *)ds, (long)c, sync, flags, GetCurrentThreadId(), nm);
         }
     }
+    {   /* ml1275: presents from a frame-generation presenter thread are paced in mad_present_run */
+        struct mad_swapchain *ps = (struct mad_swapchain *)T;
+        DWORD tid = GetCurrentThreadId();
+        if (tid != ps->pace_tid) {   /* the name is looked up only when the presenting thread changes */
+            char nm[64];
+            LONG fg;
+            mad_thread_name(nm, sizeof nm);
+            fg = strstr(nm, "FSR Presenter") != NULL;
+            ps->pace_tid = tid;
+            if (fg != ps->pace_fg) {
+                d3d12_log("[madeira-d3d12] ml1275 swapchain %p: presents now come from thread %04lx '%s'; frame-generation pacing %s\n",
+                          (void *)ps, tid, nm, fg ? "on" : "off");
+                InterlockedExchange(&ps->pace_fg, fg);
+            }
+        }
+    }
     hr = swap_Present_pool(T, sync, flags);
     QueryPerformanceCounter(&t1);
     InterlockedExchangeAdd64(&g_perf_present_ticks, t1.QuadPart - t0.QuadPart);
@@ -12655,6 +12681,53 @@ static HRESULT swap_Present_inner(IDXGISwapChain4 *T, UINT sync, UINT flags) {
     mad_present_run(s, s->index);
     s->index = (s->index + 1) % s->nbuf;
     return S_OK;
+}
+/* ml1275: FRAME-GENERATION PRESENT PACING. FSR 3 frame generation presents two
+ * frames per game frame from its "AMD FSR Presenter Thread" and spaces them
+ * with its own QPC timing. That timing does not survive here: every D3D queue
+ * feeds one Metal queue, so the composite and the present blit of each frame
+ * wait behind whatever game work was committed in the meantime, and the pair
+ * reaches the display back to back. DXMT's presentDrawable then holds the
+ * second for its 1/60 s minimum (vsync mode 1) and the next pair comes a whole
+ * game frame later (log 92129101: 13-32 presents a second, "super stuttery").
+ * A paced drawable is instead shown no sooner than 0.9x the running average
+ * present interval after the one before. Presents arrive at two per game frame
+ * on average, so that is just under half a game frame and the pair is spread
+ * across it; staying under the real cadence means the pacing never holds back
+ * throughput by itself. madeira.cfg fg-pace = 0 turns it off; fg-pace-floor-us
+ * (default 16667, the 60 fps cap DXMT applies) is the shortest spacing used. */
+static int g_fg_pace = -1; static double g_fg_pace_floor;
+static void mad_fg_present(struct mad_swapchain *s, obj_handle_t cb, obj_handle_t drawable) {
+    LARGE_INTEGER fq;
+    LONG64 now;
+    double after;
+    if (g_fg_pace < 0) {
+        g_fg_pace_floor = (double)mad_cfg_int_pe("fg-pace-floor-us", 16667) / 1e6;
+        g_fg_pace = mad_cfg_int_pe("fg-pace", 1) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] ml1275 fg-pace = %d (frame-generation presents %s), fg-pace-floor-us = %.0f\n", g_fg_pace,
+                  g_fg_pace ? "are spread evenly across the game frame" : "go out as they arrive", g_fg_pace_floor * 1e6);
+    }
+    if (!g_fg_pace || !s->pace_fg) {
+        s->pace_on = 0;
+        MTLCommandBuffer_presentDrawable(cb, drawable);
+        return;
+    }
+    now = mad_qpc();
+    QueryPerformanceFrequency(&fq);
+    if (!s->pace_on) { s->pace_on = 1; s->pace_last = 0; s->pace_avg = 0; }
+    if (s->pace_last) {
+        double dt = (double)(now - s->pace_last) / (double)fq.QuadPart;
+        if (dt > 0.25) s->pace_avg = 0;   /* a load or a hitch: start over */
+        else s->pace_avg = s->pace_avg > 0 ? s->pace_avg * 0.9 + dt * 0.1 : dt;
+    }
+    s->pace_last = now;
+    after = s->pace_avg * 0.9;
+    if (after < g_fg_pace_floor) after = g_fg_pace_floor;
+    if (after > 0.1) after = 0.1;
+    MTLCommandBuffer_presentDrawableAfterMinimumDuration(cb, drawable, after);
+    if ((s->pace_n++ % 600) == 0)
+        d3d12_log("[madeira-d3d12] ml1275 frame-generation pacing: presents %.1f ms apart on average, each shown at least %.1f ms after the last\n",
+                  s->pace_avg * 1e3, after * 1e3);
 }
 /* ml1121: the Metal half of Present; runs on the queue's worker (async) or on the caller. */
 static void mad_mheap_reclaim(struct mad_device *d, int all);
@@ -12779,7 +12852,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         }
         /* Submitted after the frame's own command buffers on the same queue,
          * which is what orders the copy after the rendering. */
-        MTLCommandBuffer_presentDrawable(cb, drawable);
+        mad_fg_present(s, cb, drawable);   /* ml1275: presentDrawable, paced when frame generation presents */
         MTLCommandBuffer_commit(cb);
     }
     InterlockedExchangeAdd64(&g_xp.t_cmt, mad_qpc() - tc); }
