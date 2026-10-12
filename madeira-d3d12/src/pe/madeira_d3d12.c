@@ -959,6 +959,10 @@ struct mad_fence {
     volatile LONG diag_polls;
     UINT64 diag_last;
     volatile LONG diag_trace;
+    /* fence-poll-wait: when the last poll was (generic-timer tick) and how many
+     * back-to-back polls in a row have seen an unchanged value. */
+    volatile UINT64 spin_t;
+    volatile LONG spin_n;
 };
 
 /* ---- ml1270: frame-generation diagnostics --------------------------------
@@ -1092,6 +1096,55 @@ static void mad_gcv_sample(struct mad_fence *f, UINT64 v) {
             d3d12_log("[gcv]   %04lx  +0x%llx <- +0x%llx  x%ld\n", g_gcv_site[i].tid, (unsigned long long)g_gcv_site[i].r0, (unsigned long long)g_gcv_site[i].r1, (long)g_gcv_site[i].n);
     }
 }
+/* madeira.cfg fence-poll-wait (default 1). A thread that busy-polls an unchanged
+ * fence (ml1142: UE's RHI submission thread at 4.4 M calls/s, ~93% of a P core;
+ * FSR 3 frame generation's threads at up to 14,000 polls a frame) holds a core
+ * that the game's own threads need: the phone has 2 performance cores, often
+ * parked when warm, and more runnable threads than cores. After 64 polls in a
+ * row, each under 4 us after the previous one and all seeing the same value,
+ * the poll waits on the fence's condition variable: fence_set_locked wakes it
+ * the moment the value moves, and it returns after 1 ms otherwise, so a caller
+ * that also watches something else is never held longer than that. A thread
+ * that polls now and then between real work never gets a streak. 0 restores
+ * pure polling. */
+#define MAD_FENCE_SPIN_POLLS 64
+#define MAD_FENCE_SPIN_GAP   96   /* generic-timer ticks: 4 us at 24 MHz */
+static int g_fence_poll_wait = -1;
+static inline UINT64 mad_timer_ticks(void) {
+    UINT64 t;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t));
+    return t;
+}
+static UINT64 mad_fence_spin_wait(struct mad_fence *f, UINT64 v) {
+    UINT64 now = mad_timer_ticks(), last = f->spin_t;
+    f->spin_t = now;
+    if (now - last > MAD_FENCE_SPIN_GAP) { f->spin_n = 0; return v; }
+    if (++f->spin_n < MAD_FENCE_SPIN_POLLS) return v;
+    if (g_fence_poll_wait < 0) {
+        g_fence_poll_wait = mad_cfg_int_pe("fence-poll-wait", 1) ? 1 : 0;   /* madeira.cfg fence-poll-wait (default 1): a thread spinning on an unchanged fence waits for it to move (at most 1 ms a poll); 0 = pure polling */
+        d3d12_log("[madeira-d3d12] fence-poll-wait = %d (%s)\n", g_fence_poll_wait,
+                  g_fence_poll_wait ? "a thread spinning on an unchanged fence waits for it to move, at most 1 ms per poll"
+                                    : "GetCompletedValue never waits");
+    }
+    if (!g_fence_poll_wait) return v;
+    EnterCriticalSection(&f->lock);
+    if (f->value == v) SleepConditionVariableCS(&f->cv, &f->lock, 1);
+    if (f->value == v) {
+        /* ml1270's stall report counts polls (2^20 is ~0.25 s of spinning); a wait
+         * stands for 1,024 of them so a stalled fence is still reported in ~1 s */
+        LONG before = f->diag_polls, after = before + 1023;
+        f->diag_polls = after;
+        if ((before < (1 << 20) && after >= (1 << 20)) || (before < (1 << 24) && after >= (1 << 24))) {
+            LeaveCriticalSection(&f->lock);
+            mad_fg_stall_report(f, v, after);
+            EnterCriticalSection(&f->lock);
+        }
+    }
+    v = f->value;
+    LeaveCriticalSection(&f->lock);
+    f->spin_t = mad_timer_ticks();   /* the next poll right after this one still counts as spinning */
+    return v;
+}
 static UINT64 STDMETHODCALLTYPE fence_GetCompletedValue(ID3D12Fence *This) {
     struct mad_fence *f = (struct mad_fence *)This;
     /* ml1273: no lock and no atomics. FSR 3 frame generation's threads poll this
@@ -1104,10 +1157,11 @@ static UINT64 STDMETHODCALLTYPE fence_GetCompletedValue(ID3D12Fence *This) {
     UINT64 v = __atomic_load_n(&f->value, __ATOMIC_ACQUIRE);
     g_perf_polls++;   /* ml1109 */
     if ((++g_gcv_calls & 0x3ffff) == 0) mad_gcv_sample(f, v);   /* ml1142 */
-    if (v != f->diag_last) { f->diag_last = v; f->diag_polls = 0; }   /* ml1270 */
+    if (v != f->diag_last) { f->diag_last = v; f->diag_polls = 0; f->spin_n = 0; }   /* ml1270 */
     else {
         LONG polls = ++f->diag_polls;
         if (polls == (1 << 20) || polls == (1 << 24)) mad_fg_stall_report(f, v, polls);
+        if (g_fence_poll_wait) v = mad_fence_spin_wait(f, v);
     }
     return v;
 }
@@ -1516,6 +1570,11 @@ struct mad_exec {
     /* resources already declared (useResource) on the current encoder, see mad_use_seen */
     obj_handle_t ud_enc; unsigned ud_n, ud_committed;
     struct { obj_handle_t h; UINT32 usage, stages; } ud[96];
+    /* the list's used tail (its last 64 used resources, the same for every draw and
+     * dispatch of the list) already declared on an encoder: [0] render, [1] compute;
+     * ut_pend is this draw's claim, kept only if mad_use_commit runs */
+    struct mad_used_tail { obj_handle_t enc; unsigned nused; UINT32 stages; UINT64 sig; } ut[2], ut_pend;
+    int ut_pend_kind;
 };
 static void mad_capture_pass(struct mad_exec *e, struct mad_resource **rt, unsigned nrt, const struct mad_rtvp *rtp,
                              struct mad_resource *depth, const struct mad_rtvp *dp, unsigned seq);
@@ -3820,11 +3879,15 @@ static int g_use_dedup = -1;
 static void mad_use_begin(struct mad_exec *e, obj_handle_t enc) {
     if (e->ud_enc != enc) { e->ud_enc = enc; e->ud_n = e->ud_committed = 0; }
     else e->ud_n = e->ud_committed;
+    e->ut_pend.enc = 0;
 }
-static void mad_use_commit(struct mad_exec *e) { e->ud_committed = e->ud_n; }
+static void mad_use_commit(struct mad_exec *e) {
+    e->ud_committed = e->ud_n;
+    if (e->ut_pend.enc) { e->ut[e->ut_pend_kind] = e->ut_pend; e->ut_pend.enc = 0; }
+}
 static int mad_use_seen(struct mad_exec *e, obj_handle_t enc, obj_handle_t h, UINT32 usage, UINT32 stages) {
     unsigned i;
-    if (g_use_dedup < 0) g_use_dedup = mad_cfg_int_pe("use-dedup", 1) ? 1 : 0;
+    if (g_use_dedup < 0) g_use_dedup = mad_cfg_int_pe("use-dedup", 1) ? 1 : 0;   /* madeira.cfg use-dedup (default 1): one useResource per resource and encoder; 0 restores one per call */
     if (!g_use_dedup || !enc || !h || e->ud_enc != enc) return 0;
     for (i = 0; i < e->ud_n; i++)
         if (e->ud[i].h == h && (e->ud[i].usage & usage) == usage && (e->ud[i].stages & stages) == stages) return 1;
@@ -3832,6 +3895,30 @@ static int mad_use_seen(struct mad_exec *e, obj_handle_t enc, obj_handle_t h, UI
         e->ud[e->ud_n].h = h; e->ud[e->ud_n].usage = usage; e->ud[e->ud_n].stages = stages; e->ud_n++;
     }
     return 0;
+}
+/* The used-tail loop declares the same up-to-64 resources for every draw of a list,
+ * and each candidate scans up to 96 declarations in mad_use_seen: ~3,000 compares
+ * per draw on the replay the render thread waits for, for nothing after the first
+ * draw on an encoder. Skip it when this encoder already holds the whole tail, the
+ * same handles in the same order, with these stages (kind 0 render, 1 compute). */
+static UINT64 mad_used_tail_sig(const struct mad_exec *e) {   /* the tail's handles, in order: 64 loads, not 3,000 compares */
+    UINT64 sig = e->l->nused;
+    unsigned i;
+    for (i = e->l->nused > 64 ? e->l->nused - 64 : 0; i < e->l->nused; i++) {
+        const struct mad_resource *r = e->l->used[i];
+        sig = sig * 0x9e3779b97f4a7c15ull + (r ? (UINT64)(r->texture ? r->texture : r->buffer) : 0);
+    }
+    return sig;
+}
+static int mad_used_tail_declared(const struct mad_exec *e, int kind, obj_handle_t enc, UINT32 stages, UINT64 sig) {
+    const struct mad_used_tail *t = &e->ut[kind];
+    return g_use_dedup == 1 && enc && t->enc == enc && t->nused == e->l->nused && t->sig == sig && (t->stages & stages) == stages;
+}
+/* Called after the tail loop: claim it for this encoder unless the 256-entry
+ * command buffer may have dropped one of its declarations. */
+static void mad_used_tail_claim(struct mad_exec *e, int kind, obj_handle_t enc, UINT32 stages, UINT64 sig, unsigned nur) {
+    if (g_use_dedup != 1 || !enc || nur >= 256) return;
+    e->ut_pend.enc = enc; e->ut_pend.nused = e->l->nused; e->ut_pend.stages = stages; e->ut_pend.sig = sig; e->ut_pend_kind = kind;
 }
 
 static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
@@ -4134,9 +4221,15 @@ tess_go:
         for (i = 0; i < 16; i++) if (e->vb[i].res) MAD_USE(e->vb[i].res->buffer);
         if (e->ib) MAD_USE(e->ib->buffer);
     }
-    for (i = e->l->nused > 64 ? e->l->nused - 64 : 0; i < e->l->nused; i++) {
-        struct mad_resource *r = e->l->used[i];
-        if (r) MAD_USE(r->texture ? r->texture : r->buffer);
+    {
+        const UINT64 tsig = mad_used_tail_sig(e);
+        if (!mad_used_tail_declared(e, 0, e->renc, use_stages, tsig)) {
+            for (i = e->l->nused > 64 ? e->l->nused - 64 : 0; i < e->l->nused; i++) {
+                struct mad_resource *r = e->l->used[i];
+                if (r) MAD_USE(r->texture ? r->texture : r->buffer);
+            }
+            mad_used_tail_claim(e, 0, e->renc, use_stages, tsig, nur);
+        }
     }
     /* ml1060: with a residency set (ml880) these two loops are a fallback, and once
      * the application has more than 256 viewed resources they are not even that:
@@ -4741,9 +4834,15 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         ur[nur].usage = (u); MAD_APPEND(&ur[nur]); nur++; } } while (0)
     if (e->srv) MAD_CUSE(e->srv->buffer, WMTResourceUsageRead);
     if (e->smp) MAD_CUSE(e->smp->buffer, WMTResourceUsageRead);
-    for (i = e->l->nused > 64 ? e->l->nused - 64 : 0; i < e->l->nused; i++) {
-        struct mad_resource *r = e->l->used[i];
-        if (r) MAD_CUSE(r->texture ? r->texture : r->buffer, (enum WMTResourceUsage)(WMTResourceUsageRead | WMTResourceUsageWrite));
+    {
+        const UINT64 tsig = mad_used_tail_sig(e);
+        if (!mad_used_tail_declared(e, 1, e->cenc, 0, tsig)) {
+            for (i = e->l->nused > 64 ? e->l->nused - 64 : 0; i < e->l->nused; i++) {
+                struct mad_resource *r = e->l->used[i];
+                if (r) MAD_CUSE(r->texture ? r->texture : r->buffer, (enum WMTResourceUsage)(WMTResourceUsageRead | WMTResourceUsageWrite));
+            }
+            mad_used_tail_claim(e, 1, e->cenc, 0, tsig, nur);
+        }
     }
     const int ml1060_cskip = dev->resset && dev->nsrv > 256;   /* same reasoning as exec_draw */
     if (!ml1060_cskip) AcquireSRWLockShared(&dev->list_lock);
