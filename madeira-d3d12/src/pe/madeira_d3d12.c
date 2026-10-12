@@ -1110,6 +1110,7 @@ static void mad_gcv_sample(struct mad_fence *f, UINT64 v) {
 #define MAD_FENCE_SPIN_POLLS 64
 #define MAD_FENCE_SPIN_GAP   96   /* generic-timer ticks: 4 us at 24 MHz */
 static int g_fence_poll_wait = -1;
+static long long mad_cfg_int_pe(const char *key, long long dflt);
 static inline UINT64 mad_timer_ticks(void) {
     UINT64 t;
     __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t));
