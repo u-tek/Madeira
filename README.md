@@ -112,6 +112,7 @@ and some inputs that are not in the repository, such as the toolchains.
 | Controllers and touch controls | [`docs/CONTROLLERS.md`](docs/CONTROLLERS.md) |
 | Keyboard, mouse and trackpad | [`docs/KEYBOARD_MOUSE.md`](docs/KEYBOARD_MOUSE.md) |
 | Audio and video | [`docs/MEDIA.md`](docs/MEDIA.md) |
+| Stellar Blade performance settings and notes | [`docs/STELLAR_BLADE_PERFORMANCE.md`](docs/STELLAR_BLADE_PERFORMANCE.md) |
 | Licensing in detail | [`docs/LICENSING.md`](docs/LICENSING.md) |
 
 ## Licensing

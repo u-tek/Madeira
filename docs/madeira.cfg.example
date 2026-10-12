@@ -54,3 +54,15 @@ env.FEX_EXTENDEDVOLATILEMETADATA = oo2core_5_win64.dll:bink2w64.dll
 # f6-compute-open = 1
 # ml1133: start with ECO on (guest threads at a low QoS class); eco-qos = utility | background | initiated
 # eco = 0
+
+# A thread that spins on GetCompletedValue of an unchanged D3D12 fence (UE's RHI thread,
+# FSR 3 frame generation) waits on the fence after 64 back-to-back polls instead, woken the
+# moment it moves and never held over 1 ms a poll. 0 restores pure polling. [madeira-d3d12]
+# fence-poll-wait = ... in the log says which.
+# fence-poll-wait = 1
+
+# Built-in profilers in the Wine server thread. Unset: only the passive [xp] probe
+# (thread_info, no suspends). 1 (or all): also the samplers that thread_suspend guest
+# threads ([thread-sample], rip-profile, [wprof], [sync-census]); they cost frame time,
+# so set this for profiling sessions only. 0: none.
+# env.MADEIRA_PROFILERS = 1
