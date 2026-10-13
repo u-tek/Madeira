@@ -50,8 +50,23 @@ final class MetalHostView: UIView {
         // Switch emulator) sets exactly this pair on its layer.
         let syncSel = NSSelectorFromString("setDisplaySyncEnabled:")
         if metalLayer.responds(to: syncSel) {
-            metalLayer.perform(syncSel, with: NSNumber(value: false))
-            LogStore.shared.log("MetalLayer: displaySyncEnabled=false (private API, MeloNX pattern)")
+            /* ml1280: madeira.cfg display-sync = 1 / 0 sets display sync through
+             * KVC, which hands the setter a real BOOL. perform(_:with:) passes
+             * the NSNumber's POINTER where the setter takes a BOOL, so what the
+             * line below really sets was never known; it stays the default so
+             * nothing changes unless the key is set. With FSR 3 frame generation
+             * black squares are seen on screen but never in screenshots (log
+             * 36bc4a75): a scanout-time effect, which display sync governs. The
+             * value the layer reports back is logged either way. */
+            let want = MadeiraConfig.get("display-sync")  // 1: display sync on, 0: off (KVC); unset: the old perform() call
+            if want == "1" || want == "0" {
+                metalLayer.setValue(NSNumber(value: want == "1"), forKey: "displaySyncEnabled")
+            } else {
+                metalLayer.perform(syncSel, with: NSNumber(value: false))
+            }
+            let now = (metalLayer.value(forKey: "displaySyncEnabled") as? NSNumber)?.boolValue
+            LogStore.shared.log("MetalLayer: ml1280 displaySyncEnabled now reads \(now.map { String($0) } ?? "?") "
+                                + "(madeira.cfg display-sync = \(want ?? "unset"); private API, MeloNX pattern)")
         }
         /* ml651: was hardcoded 60, which contradicted everything around it —
          * FPSOverlay asks the display link for CAFrameRateRange(preferred: 120)
