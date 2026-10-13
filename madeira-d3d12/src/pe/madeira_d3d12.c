@@ -1396,7 +1396,7 @@ struct mad_cmd {
         struct { struct mad_resource *res; UINT64 off; enum WMTIndexType type; } ib;
         struct { UINT slot; struct mad_resource *res; UINT64 off; UINT stride; } vb;
         struct { struct mad_resource *rt[8]; UINT n; struct mad_resource *depth; struct mad_rtvp v[8], dv; } rts;   /* ml925: + sub-views */
-        struct { struct mad_resource *res[8]; UINT n; UINT all; UINT8 cls[8]; UINT8 cls_noref; } barrier;   /* ml1116: transitioned resources; all = UAV/aliasing/overflow; ml1137: state classes (BC_*) */
+        struct { struct mad_resource *res[8]; UINT n; UINT all; UINT8 cls[8]; UINT8 cls_noref; UINT8 ua; } barrier;   /* ml1116: transitioned resources; all = UAV/aliasing/overflow; ml1137: state classes (BC_*); ml1302: ua = entries that become UAVs */
         struct { struct mad_resource *res; float rgba[4]; float depth; UINT8 stencil; UINT8 flags; struct mad_rtvp v; } clear;   /* ml904: flags = D3D12_CLEAR_FLAGS; ml925: v = the view cleared */
         struct { UINT vcount, icount, vstart, istart; } draw;
         struct { UINT icount, inst, start; INT base; UINT istart; } drawi;
@@ -1596,6 +1596,13 @@ struct mad_queue {
      * submit_lock (the replay and mad_queue_flush both hold it). */
     obj_handle_t f6_pool[64]; unsigned f6_next;
     struct mad_f6_pend { unsigned char idx, kind, natt; struct mad_resource *att[9]; } f6_pend[40]; unsigned f6_npend;
+    /* ml1304: a synced render pass left open at the end of its list, for the
+     * next list of the same ExecuteCommandLists call to continue (see
+     * mad_carry_keep). Touched only under submit_lock. */
+    struct mad_carry {
+        obj_handle_t renc, cb, vis_buf; UINT64 vis_prev; unsigned seq, f6_cur, natt, nrt; UINT w, h;
+        struct mad_resource *rt[8], *depth, *att[9]; struct mad_rtvp rtp[8], dp;
+    } carry;
 };
 
 static HRESULT mad_queue_dxgi_tearoff(struct mad_queue *q, void **out);
@@ -2460,6 +2467,226 @@ static int exec_same_targets(struct mad_exec *e) {
     return 1;
 }
 
+/* ml1302: PREDICTED BARRIER SYNC. Under fence-chain 6 a render pass that did
+ * not sync at its start (it overlaps the encoders before it) is CLOSED at the
+ * next ResourceBarrier, and the draws after the barrier reopen the very same
+ * targets in a new pass that syncs: every attachment is stored and loaded
+ * again. Log b5825805: 26 such closes a frame, and 262 MB of the 400 MB stored
+ * per frame was "rebound" by the next pass. When a pass begins, look ahead in
+ * the list: if a barrier comes before anything else would end this pass, sync
+ * now instead, and the pass stays open across the barrier like any synced
+ * one. Its draws before the barrier lose their overlap with the previous
+ * encoders; the attachments stay on chip. madeira.cfg f6-predict-sync = 0
+ * turns it off. */
+static int g_f6_predict = -1;
+static LONG g_f6_predicted;
+/* A barrier a synced render pass may stay open across: no UAV barrier (pixel
+ * shaders of the pass may have written the UAV, and nothing inside one render
+ * encoder orders that), no transition INTO a UAV state (its draws after the
+ * barrier could write what its draws before it read), no aliasing or unnamed
+ * barrier, and none of the pass's own targets transitioned (its draws so far
+ * are still in tile memory). The first barrier ahead must be one of these, or
+ * the pass is closed there as before. */
+static int mad_barrier_keeps_pass(const struct mad_cmd *c, struct mad_resource *const *rt, unsigned nrt, const struct mad_resource *depth) {
+    unsigned k, j;
+    if (c->u.barrier.all) return 0;
+    for (k = 0; k < c->u.barrier.n; k++) {
+        const struct mad_resource *r = c->u.barrier.res[k];
+        if (c->u.barrier.cls[k] == BC_RAW_UAV || (c->u.barrier.ua & (1u << k)) || r == depth) return 0;
+        for (j = 0; j < nrt; j++) if (rt[j] == r) return 0;
+    }
+    return 1;
+}
+static int exec_barrier_ahead(const struct mad_exec *e) {
+    const struct mad_list *l = e->l;
+    unsigned j, k, lim;
+    if (!l) return 0;
+    lim = e->cur + 8192 < l->ncmds ? e->cur + 8192 : l->ncmds;
+    for (j = e->cur + 1; j < lim; j++) {
+        const struct mad_cmd *c = &l->cmds[j];
+        switch (c->kind) {
+        case MC_BARRIER: return mad_barrier_keeps_pass(c, e->rt, e->nrt, e->depth);
+        case MC_RTS:   /* the same targets keep the pass; anything else ends it */
+            if (c->u.rts.n != e->nrt || c->u.rts.depth != e->depth) return 0;
+            for (k = 0; k < e->nrt; k++) if (c->u.rts.rt[k] != e->rt[k] || !mad_rtvp_eq(&c->u.rts.v[k], &e->rtp[k])) return 0;
+            if (e->depth && !mad_rtvp_eq(&c->u.rts.dv, &e->dp)) return 0;
+            break;
+        case MC_CLEAR_RT: case MC_CLEAR_DS: case MC_DISPATCH: case MC_DISPATCH_INDIRECT: case MC_RESOLVE:
+        case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX:
+            return 0;
+        default: break;
+        }
+    }
+    return 0;
+}
+
+/* ml1304: RENDER PASSES ACROSS COMMAND LISTS. An engine that records in
+ * parallel splits one big pass over several command lists (UE4's depth
+ * pre-pass, shadow depths and base pass each span 3-4 lists in Stellar Blade's
+ * draw dump, log b5825805), and each list started a new Metal pass: the base
+ * pass's eight targets plus depth, ~28 MB at 1064x536, were stored and loaded
+ * again at every list boundary. Lists of one ExecuteCommandLists call are
+ * replayed back to back into the same command buffer, so a list may leave a
+ * pass open and the next one continue it when:
+ *  - the pass synced at its start (fence-chain 6), so nothing pending can be
+ *    overlapping it -- the next list's start-of-list sync has nothing to wait for;
+ *  - no clear is pending, nothing is captured, no other encoder is open;
+ *  - the next list's first draw binds exactly these targets, and before it
+ *    come only state, queries and barriers that keep a pass open
+ *    (mad_barrier_keeps_pass): no clear, copy, dispatch or resolve.
+ * Otherwise the pass is ended first, exactly as at the end of its own list.
+ * It never outlives the ExecuteCommandLists call (whose autorelease pool holds
+ * the encoder) and is ended before any commit. madeira.cfg pass-carry = 0
+ * turns it off. */
+static int g_carry_on = -1;
+static LONG g_carry_kept, g_carry_adopted, g_carry_closed;
+static LONG64 g_carry_bytes;
+static int mad_carry_on(void) {
+    if (g_carry_on < 0) {
+        g_carry_on = mad_cfg_int_pe("pass-carry", 1) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] ml1304 pass-carry = %d (%s)\n", g_carry_on,
+                  g_carry_on ? "a synced render pass continues into the next command list when it draws to the same targets"
+                             : "every command list ends its render pass");
+    }
+    return g_carry_on;
+}
+static void mad_carry_restore(struct mad_exec *e, struct mad_queue *q) {
+    struct mad_carry *k = &q->carry;
+    e->renc = k->renc; e->renc_seq = k->seq;
+    e->enc_nrt = k->nrt; memcpy(e->enc_rt, k->rt, sizeof e->enc_rt); memcpy(e->enc_rtp, k->rtp, sizeof e->enc_rtp);
+    e->enc_depth = k->depth; e->enc_dp = k->dp; e->enc_w = k->w; e->enc_h = k->h;
+    e->enc_vis_buf = k->vis_buf; e->vis_prev = k->vis_prev;
+    e->f6_cur = k->f6_cur; e->f6_natt = k->natt; memcpy(e->f6_att, k->att, sizeof e->f6_att); e->f6_enc_synced = 1;
+    e->pass_draws = 0;
+    memset(k, 0, sizeof *k);
+}
+/* End a carried pass: what exec_end would have done at the end of its list. */
+static void mad_carry_close(struct mad_queue *q) {
+    struct mad_exec *e;
+    if (!q->carry.renc) return;
+    e = calloc(1, sizeof *e);
+    if (!e) {   /* cannot happen in practice; the encoder must still end before a commit */
+        MTLCommandEncoder_endEncoding(q->carry.renc); memset(&q->carry, 0, sizeof q->carry); return;
+    }
+    e->q = q; e->cb = q->carry.cb; e->mode = 6;
+    mad_carry_restore(e, q);
+    InterlockedIncrement(&g_carry_closed);
+    exec_end(e);
+    free(e);
+}
+static int mad_carry_keep(struct mad_exec *e) {
+    struct mad_carry *k = &e->q->carry;
+    if (!e->renc || e->benc || e->cenc || e->npend || e->mode != 6 || !e->f6_enc_synced || g_capture_on) return 0;
+    if ((!e->enc_nrt && !e->enc_depth) || k->renc || !mad_carry_on()) return 0;
+    k->renc = e->renc; k->cb = e->cb; k->seq = e->renc_seq;
+    k->nrt = e->enc_nrt; memcpy(k->rt, e->enc_rt, sizeof k->rt); memcpy(k->rtp, e->enc_rtp, sizeof k->rtp);
+    k->depth = e->enc_depth; k->dp = e->enc_dp; k->w = e->enc_w; k->h = e->enc_h;
+    k->vis_buf = e->enc_vis_buf; k->vis_prev = e->vis_prev;
+    k->f6_cur = e->f6_cur; k->natt = e->f6_natt; memcpy(k->att, e->f6_att, sizeof k->att);
+    e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0; e->enc_vis_buf = 0; e->vis_prev = ~(UINT64)0;
+    InterlockedIncrement(&g_carry_kept);
+    return 1;
+}
+/* 1: the list continues the carried pass; 2: the list encodes nothing at all
+ * (no draw, clear, copy, dispatch or resolve; only state, queries and barriers
+ * that keep a pass open), so the pass stays carried past it -- UE4 puts such
+ * lists of barriers between its parallel ones; 0: end the pass. */
+static int mad_carry_adoptable(const struct mad_carry *k, const struct mad_list *l) {
+    struct mad_resource *rt[8], *depth = NULL;
+    struct mad_rtvp rtp[8], dp;
+    unsigned i, j, nrt = 0;
+    int have = 0, query = 0;
+    memset(rt, 0, sizeof rt); memset(rtp, 0, sizeof rtp); memset(&dp, 0, sizeof dp);
+    if (l->ncmds > 8192) return 0;
+    for (i = 0; i < l->ncmds; i++) {
+        const struct mad_cmd *c = &l->cmds[i];
+        switch (c->kind) {
+        case MC_RTS:
+            memcpy(rt, c->u.rts.rt, sizeof rt); nrt = c->u.rts.n; depth = c->u.rts.depth;
+            memcpy(rtp, c->u.rts.v, sizeof rtp); dp = c->u.rts.dv; have = 1;
+            break;
+        case MC_DRAW: case MC_DRAW_INDEXED: case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT:
+            if (!have || nrt != k->nrt || depth != k->depth) return 0;
+            for (j = 0; j < nrt; j++) if (rt[j] != k->rt[j] || !mad_rtvp_eq(&rtp[j], &k->rtp[j])) return 0;
+            if (depth && !mad_rtvp_eq(&dp, &k->dp)) return 0;
+            return 1;
+        case MC_BARRIER:
+            if (!mad_barrier_keeps_pass(c, k->rt, k->nrt, k->depth)) return 0;
+            break;
+        case MC_QUERY_BEGIN: case MC_QUERY_END: query = 1; break;   /* their slot boundaries need the encoder in hand */
+        case MC_CLEAR_RT: case MC_CLEAR_DS: case MC_DISPATCH: case MC_DISPATCH_INDIRECT: case MC_RESOLVE:
+        case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX:
+            return 0;
+        default: break;
+        }
+    }
+    return query ? 0 : 2;
+}
+static LONG g_carry_passed;
+/* At a list's start: continue the carried pass, keep it past an empty list,
+ * or end it. */
+static void mad_carry_begin_list(struct mad_exec *e) {
+    struct mad_queue *q = e->q;
+    struct mad_carry *k = &q->carry;
+    unsigned i;
+    int how;
+    if (!k->renc) return;
+    how = (k->cb == e->cb && e->mode == 6 && e->l) ? mad_carry_adoptable(k, e->l) : 0;
+    if (how == 2) { InterlockedIncrement(&g_carry_passed); return; }
+    if (how != 1) { mad_carry_close(q); return; }
+    if (g_att_census) {
+        LONG64 b = 0;
+        for (i = 0; i < k->nrt; i++) if (k->rt[i] && k->rt[i]->texture) b += f7_att_bytes(k->rt[i], k->rtp[i].level);
+        if (k->depth && k->depth->texture) b += f7_att_bytes(k->depth, k->dp.level);
+        InterlockedExchangeAdd64(&g_carry_bytes, 2 * b);   /* one store and one load fewer */
+    }
+    mad_carry_restore(e, q);
+    InterlockedIncrement(&g_carry_adopted);
+}
+
+/* ml1303: census of what a pass that ends for new targets hands over to the
+ * next one (census frames only), for deciding how passes could be merged:
+ *   subset   - the new targets are some of the old, each at the same index;
+ *   superset - the old are some of the new, each at the same index;
+ *   mixed    - each side has its own, the shared ones at the same index;
+ *   moved    - a shared target sits at another index (a merge would have to
+ *              remap shader outputs);
+ *   disjoint - nothing shared.
+ * MB is the shared attachments, which a merge would keep on chip (stored once
+ * and loaded once less). */
+static LONG64 g_tr_n[5], g_tr_b[5];
+static void f7_transition_census(struct mad_exec *e) {
+    unsigned i, j; int shared = 0, moved = 0, newonly = 0, oldonly = 0, cls;
+    LONG64 b = 0;
+    for (i = 0; i < e->enc_nrt; i++) {
+        int found = 0;
+        if (!e->enc_rt[i]) continue;
+        for (j = 0; j < e->nrt; j++)
+            if (e->rt[j] == e->enc_rt[i] && mad_rtvp_eq(&e->rtp[j], &e->enc_rtp[i])) {
+                found = 1; if (i != j) moved = 1;
+                if (e->enc_rt[i]->texture) b += f7_att_bytes(e->enc_rt[i], e->enc_rtp[i].level);
+                break;
+            }
+        if (found) shared = 1; else oldonly = 1;
+    }
+    for (j = 0; j < e->nrt; j++) {
+        int found = 0;
+        if (!e->rt[j]) continue;
+        for (i = 0; i < e->enc_nrt; i++) if (e->enc_rt[i] == e->rt[j] && mad_rtvp_eq(&e->rtp[j], &e->enc_rtp[i])) { found = 1; break; }
+        if (!found) newonly = 1;
+    }
+    if (e->enc_depth && e->enc_depth == e->depth && mad_rtvp_eq(&e->enc_dp, &e->dp)) {
+        shared = 1;
+        if (e->depth->texture) b += f7_att_bytes(e->depth, e->dp.level);
+    } else {
+        if (e->enc_depth) oldonly = 1;
+        if (e->depth) newonly = 1;
+    }
+    cls = !shared ? 4 : moved ? 3 : (oldonly && !newonly) ? 0 : (newonly && !oldonly) ? 1 : 2;
+    InterlockedIncrement64(&g_tr_n[cls]);
+    InterlockedExchangeAdd64(&g_tr_b[cls], b);
+}
+
 static unsigned g_said_attachless;
 /* ml1142: madeira.cfg encoder-labels = 1 names every Metal encoder after the
  * pass that opened it ("R#<seq> <vs>|<ps>", "C#<seq> <kernel>", "B#<seq> copy"),
@@ -2481,6 +2708,7 @@ static int exec_begin_render(struct mad_exec *e) {
     int attachless = 0;
     if (exec_same_targets(e)) { InterlockedIncrement(&g_pass_reused); return 1; }
     if (e->renc) InterlockedIncrement(&g_pass_end_rts);
+    if (e->renc && g_att_census && (e->nrt || e->depth) && (e->enc_nrt || e->enc_depth)) f7_transition_census(e);   /* ml1303 */
     e->f7_next_rts = 1;   /* ml1137: the pass being closed hands over to the targets bound now */
     exec_end(e);
     /* ml934: a render pass with NO colour target AND no depth is legal in
@@ -2563,6 +2791,15 @@ static int exec_begin_render(struct mad_exec *e) {
     e->f6_natt = 0;   /* ml1134: what this pass writes, for the same-attachment ordering rule */
     for (i = 0; i < e->nrt && e->f6_natt < 8; i++) if (e->rt[i]) e->f6_att[e->f6_natt++] = e->rt[i];
     if (e->depth) e->f6_att[e->f6_natt++] = e->depth;
+    if (e->renc && e->mode == 6 && !e->f6_sync_needed) {   /* ml1302 */
+        if (g_f6_predict < 0) {
+            g_f6_predict = mad_cfg_int_pe("f6-predict-sync", 1) ? 1 : 0;
+            d3d12_log("[madeira-d3d12] ml1302 f6-predict-sync = %d (%s)\n", g_f6_predict,
+                      g_f6_predict ? "a render pass with a barrier ahead syncs at its start and stays open across it"
+                                   : "a render pass that overlapped is closed at the next barrier");
+        }
+        if (g_f6_predict && exec_barrier_ahead(e)) { e->f6_sync_needed = 1; InterlockedIncrement(&g_f6_predicted); }
+    }
     if (e->renc) exec_fence_render(e, e->renc, 0);   /* ml1091 */
     if (e->renc) {   /* ml1070 */
         LONG64 bytes = 0;
@@ -5090,6 +5327,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     e.vis_prev = ~(UINT64)0;   /* ml1088 */
     l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    mad_carry_begin_list(&e);   /* ml1304 */
     for (i = 0; i < l->ncmds; i++) {
         const struct mad_cmd *c = &l->cmds[i];
         e.cur = i;   /* ml1137 */
@@ -5183,8 +5421,10 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_RESOLVE: exec_resolve(&e, c); break;
         }
     }
-    if (e.renc) InterlockedIncrement(&g_pass_end_list);
-    exec_end(&e);
+    if (!mad_carry_keep(&e)) {   /* ml1304 */
+        if (e.renc) InterlockedIncrement(&g_pass_end_list);
+        exec_end(&e);
+    }
     while (e.npend) exec_flush_clear(&e, 0);
     /* ml1042: a PERIODIC summary. Every per-list line is rate-limited to the first
      * dozen, which is the menu -- so the first run to reach real 3D (black, ~2 FPS)
@@ -5282,6 +5522,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
         q->executed++;
         if (q->open_lists >= 48) mad_queue_flush(q);   /* bound the batch */
     }
+    mad_carry_close(q);   /* ml1304: a carried pass never outlives this call (or its autorelease pool) */
     if (ml1021_q) LeaveCriticalSection(&ml1021_q->submit_lock);   /* ml1021 */
     if (ml1049_pool) NSObject_release(ml1049_pool);
 }
@@ -5440,9 +5681,16 @@ static void mad_perf_present(void) {
                 double np = (double)g_perf_presents;
                 LONG b = InterlockedExchange(&g_f6_begins, 0), sy = InterlockedExchange(&g_f6_synced, 0), at = InterlockedExchange(&g_f6_att_sync, 0);
                 LONG ko = InterlockedExchange(&g_f6_kept_open, 0), jn = InterlockedExchange(&g_f6_joins, 0), rc = InterlockedExchange(&g_f6_rclose, 0);
-                d3d12_log("[perf] ml1134 fence-chain 6 per frame: %.1f encoders, %.1f synced (%.1f for a shared attachment), %.1f overlapped; "
+                LONG pr = InterlockedExchange(&g_f6_predicted, 0);
+                d3d12_log("[perf] ml1134 fence-chain 6 per frame: %.1f encoders, %.1f synced (%.1f for a shared attachment, ml1302 %.1f for a barrier ahead), %.1f overlapped; "
                           "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins\n",
-                          b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np);
+                          b / np, sy / np, at / np, pr / np, (b - sy) / np, ko / np, rc / np, jn / np);
+                {   /* ml1304 */
+                    LONG ck = InterlockedExchange(&g_carry_kept, 0), ca = InterlockedExchange(&g_carry_adopted, 0), cc = InterlockedExchange(&g_carry_closed, 0);
+                    LONG cp = InterlockedExchange(&g_carry_passed, 0);
+                    d3d12_log("[perf] ml1304 render passes left open at a command list's end per frame: %.1f, continued by a later list %.1f "
+                              "(carried past %.1f lists that encode nothing), ended there %.1f\n", ck / np, ca / np, cp / np, cc / np);
+                }
             }
             if (g_f6_used && g_perf_presents) {   /* ml1137 */
                 double np = (double)g_perf_presents;
@@ -5461,6 +5709,13 @@ static void mad_perf_present(void) {
                           InterlockedExchange64(&g_ac_load, 0) / mb / nf, InterlockedExchange64(&g_ac_clear, 0) / mb / nf, InterlockedExchange64(&g_ac_store, 0) / mb / nf,
                           InterlockedExchange64(&g_ac_st_cleared, 0) / mb / nf, InterlockedExchange64(&g_ac_st_read, 0) / mb / nf, InterlockedExchange64(&g_ac_st_rebound, 0) / mb / nf,
                           InterlockedExchange64(&g_ac_st_write, 0) / mb / nf, InterlockedExchange64(&g_ac_st_none, 0) / mb / nf, InterlockedExchange(&g_discards, 0));
+                {   /* ml1303 */
+                    double tn[5], tb[5]; int k;
+                    for (k = 0; k < 5; k++) { tn[k] = InterlockedExchange64(&g_tr_n[k], 0) / nf; tb[k] = InterlockedExchange64(&g_tr_b[k], 0) / mb / nf; }
+                    d3d12_log("[perf] ml1303 pass hand-overs per census frame (count, MB shared): subset %.1f/%.1f, superset %.1f/%.1f, mixed %.1f/%.1f, "
+                              "moved %.1f/%.1f, disjoint %.1f; ml1304 attachment traffic saved by passes continued across lists %.1f MB\n",
+                              tn[0], tb[0], tn[1], tb[1], tn[2], tb[2], tn[3], tb[3], tn[4], InterlockedExchange64(&g_carry_bytes, 0) / mb / nf);
+                }
             }
         }
         d3d12_log("[perf] ml1109 sync per frame: ExecuteCommandLists %.1f, Signal %.1f, fence waits %.1f (game blocked %.1f ms/frame = %.0f%% of wall), "
@@ -5519,6 +5774,7 @@ static void mad_queue_flush(struct mad_queue *q) {
     if (!q) return;
     EnterCriticalSection(&q->submit_lock);   /* ml1021 */
     if (!q->open_cb) { LeaveCriticalSection(&q->submit_lock); return; }
+    mad_carry_close(q);   /* ml1304: before anything else is encoded into, or commits, the buffer */
     if (q->npending == 16) {
         for (unsigned k = 0; k < q->npending; k++) mad_cb_retire(q->device, q->pending[k]);
         q->npending = 0;
@@ -7957,6 +8213,48 @@ static int mad_fg_rw_promote(void) {
     return v;
 }
 
+/* ml1301: LOSSLESS COMPRESSION FOR RENDER TARGETS. Every texture used to carry
+ * PixelFormatView usage, and on Apple GPUs (family 5 and later) that one flag
+ * turns lossless framebuffer compression off ("Optimizing texture data";
+ * MTLTextureUsage.pixelFormatView). Stellar Blade moves ~740 MB of attachment
+ * loads and stores a frame (ml1137 census, log b5825805), all of it
+ * uncompressed. Metal needs the flag only for a view with a different
+ * component LAYOUT; sRGB/linear and same-layout reinterpretations (UNORM vs
+ * UINT, the members of one DXGI typeless family) do not need it, and render
+ * passes here bind the base texture, never a view. So a render-target or
+ * depth texture goes without it, except:
+ * - a UAV texture: ShaderWrite rules compression out anyway, and UAV clears
+ *   and FidelityFX promotions view it in other layouts;
+ * - a shader-readable depth-STENCIL texture: stencil SRVs are X32_Stencil8
+ *   views (ml1101), which may need the flag (madeira.cfg ds-compress = 1
+ *   drops it there too);
+ * - textures that are only sampled: mostly block-compressed, which Metal does
+ *   not compress again, and in the application's heaps (madeira.cfg
+ *   tex-compress-all = 1 includes them).
+ * madeira.cfg rt-compress = 0 restores the old flags. */
+static int mad_cfg_once(const char *key, int def, int *slot, const char *what_on, const char *what_off, const char *tag) {
+    if (*slot < 0) {
+        *slot = mad_cfg_int_pe(key, def) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] %s %s = %d (%s)\n", tag, key, *slot, *slot ? what_on : what_off);
+    }
+    return *slot;
+}
+static int g_rt_compress = -1, g_ds_compress = -1, g_tex_compress_all = -1;
+static LONG g_tex_compressible, g_tex_pfv;
+static int mad_tex_needs_pfv(const D3D12_RESOURCE_DESC *desc, enum WMTPixelFormat pf, int is_depth) {
+    if (!mad_cfg_once("rt-compress", 1, &g_rt_compress, "render targets and depth buffers without PixelFormatView: lossless compression on",
+                      "every texture has PixelFormatView: no lossless compression", "ml1301")) return 1;
+    if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) return 1;
+    if (!(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) &&
+        !mad_cfg_once("tex-compress-all", 0, &g_tex_compress_all, "sampled textures without PixelFormatView too",
+                      "sampled textures keep PixelFormatView", "ml1301")) return 1;
+    if (is_depth && pf == WMTPixelFormatDepth32Float_Stencil8 && !(desc->Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
+        !mad_cfg_once("ds-compress", 0, &g_ds_compress, "depth-stencil textures without PixelFormatView (stencil SRVs view them as X32_Stencil8)",
+                      "shader-readable depth-stencil textures keep PixelFormatView for stencil views", "ml1301")) return 1;
+    if (pf >= WMTPixelFormatBC1_RGBA && pf <= WMTPixelFormatBC7_RGBAUnorm_sRGB) return 1;   /* never compressed again */
+    return 0;
+}
+
 /* ml1145: the Metal texture description a D3D12 resource gets. ONE builder for
  * creation and for GetResourceAllocationInfo, so the size the application
  * plans its heap with is the size the placement really takes. */
@@ -8001,8 +8299,10 @@ static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTText
             ti->pixel_format == WMTPixelFormatRG32Uint)
             ti->usage = (enum WMTTextureUsage)(ti->usage | WMTTextureUsageShaderAtomic);
     }
-    /* Views may reinterpret typeless and sRGB/linear pairs. */
-    ti->usage = (enum WMTTextureUsage)(ti->usage | WMTTextureUsagePixelFormatView);
+    /* Views may reinterpret typeless and sRGB/linear pairs; ml1301: only a
+     * different component layout needs the flag, and it costs compression. */
+    if (mad_tex_needs_pfv(desc, *pf, *is_depth))
+        ti->usage = (enum WMTTextureUsage)(ti->usage | WMTTextureUsagePixelFormatView);
     ti->options = WMTResourceStorageModePrivate;
     return 1;
 }
@@ -8088,6 +8388,14 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         r->is_depth = is_depth;
         r->has_stencil = (pf == WMTPixelFormatDepth32Float_Stencil8);
         r->samples = ti.sample_count;
+        if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {   /* ml1301 census */
+            int pfv = (ti.usage & WMTTextureUsagePixelFormatView) != 0;
+            LONG n = InterlockedIncrement(pfv ? &g_tex_pfv : &g_tex_compressible);
+            if (n <= 6 || (n & (n - 1)) == 0)
+                d3d12_log("[madeira-d3d12] ml1301 %s %ux%u format %u flags 0x%x: %s (%ld so far; %ld compressible, %ld not)\n",
+                          is_depth ? "depth target" : "render target", ti.width, ti.height, (unsigned)desc->Format, (unsigned)desc->Flags,
+                          pfv ? "PixelFormatView, uncompressed" : "lossless compression allowed", n, g_tex_compressible, g_tex_pfv);
+        }
         if ((desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) && !is_depth &&
             ti.sample_count <= 1 && !r->placed_heap && mad_fg_zero_init() && mad_fidelityfx_caller())
             mad_zero_texture(d, r);   /* ml1281 */
@@ -11633,7 +11941,11 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
             if (c->u.barrier.cls_noref == BC_NONE || cls > c->u.barrier.cls_noref) c->u.barrier.cls_noref = cls;
             continue;
         }
-        if (c->u.barrier.n < 8) { c->u.barrier.cls[c->u.barrier.n] = cls; c->u.barrier.res[c->u.barrier.n++] = r; }
+        if (c->u.barrier.n < 8) {
+            if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && (b[i].Transition.StateAfter & D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+                c->u.barrier.ua |= (UINT8)(1u << c->u.barrier.n);   /* ml1302 */
+            c->u.barrier.cls[c->u.barrier.n] = cls; c->u.barrier.res[c->u.barrier.n++] = r;
+        }
         else { c->u.barrier.all = 1; c->u.barrier.cls_noref = BC_ALL; }
     }
 }
