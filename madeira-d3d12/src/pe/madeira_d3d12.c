@@ -748,7 +748,7 @@ struct mad_air_out {
  * IRDescriptorTableEntry and its Set* helpers in the converter's runtime
  * header, which is also where the encodings below come from. */
 struct mad_rtvp { UINT16 level, slice, layers, plane; };
-struct mad_rtv { struct mad_resource *res; struct mad_rtvp p; };
+struct mad_rtv { struct mad_resource *res; struct mad_rtvp p; UINT8 ro; };   /* ml1309: ro = a DSV's D3D12_DSV_FLAG_READ_ONLY_* bits */
 struct mad_descriptor {
     UINT64 gpu_va;          /* sampler resource id, or a buffer address */
     UINT64 texture_view_id; /* texture resource id */
@@ -794,6 +794,7 @@ static struct mad_rtvp mad_slot_view(SIZE_T handle) {
     struct mad_rtvp z = { 0, 0, 1, 0 };
     return handle ? ((struct mad_rtv *)handle)->p : z;
 }
+static UINT8 mad_slot_ro(SIZE_T handle) { return handle ? ((struct mad_rtv *)handle)->ro : 0; }   /* ml1309 */
 
 /* The increment the application uses for handle arithmetic. It has to be the
  * real stride or every descriptor after the first lands in the wrong place. */
@@ -1406,7 +1407,7 @@ struct mad_cmd {
         D3D12_PRIMITIVE_TOPOLOGY topo;
         struct { struct mad_resource *res; UINT64 off; enum WMTIndexType type; } ib;
         struct { UINT slot; struct mad_resource *res; UINT64 off; UINT stride; } vb;
-        struct { struct mad_resource *rt[8]; UINT n; struct mad_resource *depth; struct mad_rtvp v[8], dv; } rts;   /* ml925: + sub-views */
+        struct { struct mad_resource *rt[8]; UINT n; struct mad_resource *depth; struct mad_rtvp v[8], dv; UINT8 dro; } rts;   /* ml925: + sub-views; ml1309: the DSV's read-only bits */
         struct { struct mad_resource *res[8]; UINT n; UINT all; UINT8 cls[8]; UINT8 cls_noref; UINT8 ua; } barrier;   /* ml1116: transitioned resources; all = UAV/aliasing/overflow; ml1137: state classes (BC_*); ml1302: ua = entries that become UAVs */
         struct { struct mad_resource *res; float rgba[4]; float depth; UINT8 stencil; UINT8 flags; struct mad_rtvp v; } clear;   /* ml904: flags = D3D12_CLEAR_FLAGS; ml925: v = the view cleared */
         struct { UINT vcount, icount, vstart, istart; } draw;
@@ -1611,7 +1612,7 @@ struct mad_queue {
      * next list of the same ExecuteCommandLists call to continue (see
      * mad_carry_keep). Touched only under submit_lock. */
     struct mad_carry {
-        obj_handle_t renc, cb, vis_buf; UINT64 vis_prev; unsigned seq, f6_cur, natt, nrt; UINT w, h; int retained;
+        obj_handle_t renc, cb, vis_buf; UINT64 vis_prev; unsigned seq, f6_cur, natt, nrt; UINT w, h; int retained; UINT8 dro;
         struct mad_resource *rt[8], *depth, *att[9]; struct mad_rtvp rtp[8], dp;
     } carry;
 };
@@ -1693,6 +1694,7 @@ struct mad_exec {
     obj_handle_t enc_vis_buf;   /* ml1088: the slot chunk attached to the open encoder (a pass attribute) */
     unsigned pass_draws;        /* ml1098: draws encoded into the open render pass */
     int renc_retained;          /* ml1304: renc carries our own reference (a pass continued across ExecuteCommandLists calls) */
+    UINT8 dro, enc_dro;         /* ml1309: the bound DSV's read-only bits; the aspects the open pass does not store */
     /* ml1134: fence-chain = 6 */
     int f6_sync_needed;         /* a ResourceBarrier (or the list start) since the last sync point */
     int f6_list_start;          /* the next sync also waits for the device fence (other queue, earlier batch) */
@@ -2573,6 +2575,50 @@ static int exec_barrier_ahead(const struct mad_exec *e) {
     return 0;
 }
 
+/* ml1309: READ-ONLY DEPTH IS NOT STORED (madeira.cfg ro-depth-dontcare = 1,
+ * experimental). A pass whose DSV is READ_ONLY_DEPTH (and/or _STENCIL) cannot
+ * change that aspect, yet it was stored at the end of every such pass
+ * (deferred lighting, translucency, fog: ~20 passes a frame in Stellar Blade).
+ * Its store action becomes DontCare when every binding of these targets until
+ * the pass ends keeps those bits and no clear lands in the pass. Metal allows
+ * DontCare to leave arbitrary contents; a tile GPU in practice does not write
+ * at all, which leaves memory exactly as loaded -- the device must confirm. */
+static int g_ro_dontcare = -1;
+static LONG g_ro_dc;
+static int mad_ro_dontcare_on(void) {
+    if (g_ro_dontcare < 0) {
+        g_ro_dontcare = mad_cfg_int_pe("ro-depth-dontcare", 0) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] ml1309 ro-depth-dontcare = %d (%s)\n", g_ro_dontcare,
+                  g_ro_dontcare ? "a read-only depth or stencil aspect is not stored at the end of its pass" : "read-only depth is stored like any attachment");
+    }
+    return g_ro_dontcare;
+}
+/* From command `start` on: do the bindings of these targets keep the `need`
+ * read-only bits until the pass they belong to ends (1), or does one make the
+ * aspect writable (0)? */
+static int mad_dro_holds_from(const struct mad_list *l, unsigned start, struct mad_resource *const *rt, const struct mad_rtvp *rtp,
+                              unsigned nrt, const struct mad_resource *depth, const struct mad_rtvp *dp, UINT8 need) {
+    unsigned j, k, lim;
+    if (!l) return 0;
+    lim = start + 8192 < l->ncmds ? start + 8192 : l->ncmds;
+    for (j = start; j < lim; j++) {
+        const struct mad_cmd *c = &l->cmds[j];
+        switch (c->kind) {
+        case MC_RTS:
+            if (c->u.rts.n != nrt || c->u.rts.depth != depth) return 1;   /* other targets: the pass ends here */
+            for (k = 0; k < nrt; k++) if (c->u.rts.rt[k] != rt[k] || !mad_rtvp_eq(&c->u.rts.v[k], &rtp[k])) return 1;
+            if (depth && !mad_rtvp_eq(&c->u.rts.dv, dp)) return 1;
+            if ((c->u.rts.dro & need) != need) return 0;                  /* the same targets, made writable */
+            break;
+        case MC_CLEAR_RT: case MC_CLEAR_DS: case MC_DISPATCH: case MC_DISPATCH_INDIRECT: case MC_RESOLVE:
+        case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX:
+            return 1;
+        default: break;
+        }
+    }
+    return j >= l->ncmds;   /* the list ends with the pass (a later list continuing it is checked when it adopts it) */
+}
+
 /* ml1304: RENDER PASSES ACROSS COMMAND LISTS. An engine that records in
  * parallel splits one big pass over several command lists (UE4's depth
  * pre-pass, shadow depths and base pass each span 3-4 lists in Stellar Blade's
@@ -2621,7 +2667,7 @@ static void mad_carry_restore(struct mad_exec *e, struct mad_queue *q) {
     e->enc_depth = k->depth; e->enc_dp = k->dp; e->enc_w = k->w; e->enc_h = k->h;
     e->enc_vis_buf = k->vis_buf; e->vis_prev = k->vis_prev;
     e->f6_cur = k->f6_cur; e->f6_natt = k->natt; memcpy(e->f6_att, k->att, sizeof e->f6_att); e->f6_enc_synced = 1;
-    e->pass_draws = 0; e->renc_retained = k->retained;
+    e->pass_draws = 0; e->renc_retained = k->retained; e->enc_dro = k->dro;
     memset(k, 0, sizeof *k);
 }
 /* End a carried pass: what exec_end would have done at the end of its list. */
@@ -2648,7 +2694,7 @@ static int mad_carry_keep(struct mad_exec *e) {
     k->depth = e->enc_depth; k->dp = e->enc_dp; k->w = e->enc_w; k->h = e->enc_h;
     k->vis_buf = e->enc_vis_buf; k->vis_prev = e->vis_prev;
     k->f6_cur = e->f6_cur; k->natt = e->f6_natt; memcpy(k->att, e->f6_att, sizeof k->att);
-    k->retained = e->renc_retained; e->renc_retained = 0;
+    k->retained = e->renc_retained; e->renc_retained = 0; k->dro = e->enc_dro;
     e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0; e->enc_vis_buf = 0; e->vis_prev = ~(UINT64)0;
     InterlockedIncrement(&g_carry_kept);
     return 1;
@@ -2662,6 +2708,7 @@ static int mad_carry_adoptable(const struct mad_carry *k, const struct mad_list 
     struct mad_rtvp rtp[8], dp;
     unsigned i, j, nrt = 0;
     int have = 0, query = 0;
+    UINT8 dro = 0;
     memset(rt, 0, sizeof rt); memset(rtp, 0, sizeof rtp); memset(&dp, 0, sizeof dp);
     if (l->ncmds > 8192) return 0;
     for (i = 0; i < l->ncmds; i++) {
@@ -2669,12 +2716,14 @@ static int mad_carry_adoptable(const struct mad_carry *k, const struct mad_list 
         switch (c->kind) {
         case MC_RTS:
             memcpy(rt, c->u.rts.rt, sizeof rt); nrt = c->u.rts.n; depth = c->u.rts.depth;
-            memcpy(rtp, c->u.rts.v, sizeof rtp); dp = c->u.rts.dv; have = 1;
+            memcpy(rtp, c->u.rts.v, sizeof rtp); dp = c->u.rts.dv; dro = c->u.rts.dro; have = 1;
             break;
         case MC_DRAW: case MC_DRAW_INDEXED: case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT:
             if (!have || nrt != k->nrt || depth != k->depth) return 0;
             for (j = 0; j < nrt; j++) if (rt[j] != k->rt[j] || !mad_rtvp_eq(&rtp[j], &k->rtp[j])) return 0;
             if (depth && !mad_rtvp_eq(&dp, &k->dp)) return 0;
+            if (k->dro && ((dro & k->dro) != k->dro || !mad_dro_holds_from(l, i + 1, k->rt, k->rtp, k->nrt, k->depth, &k->dp, k->dro)))
+                return 0;   /* ml1309: the pass does not store an aspect this list would write */
             return 1;
         case MC_BARRIER:
             if (!mad_barrier_keeps_pass(c, k->rt, k->nrt, k->depth)) return 0;
@@ -2871,6 +2920,7 @@ static int exec_begin_render(struct mad_exec *e) {
         }
         if (!w) { w = r->width >> e->rtp[i].level; h = r->height >> e->rtp[i].level; }
     }
+    e->enc_dro = 0;   /* ml1309 */
     if (e->depth && e->depth->texture) {
         int p = exec_pending_index(e, e->depth, &e->dp);
         UINT8 cf = p >= 0 ? e->pend[p].flags : 0;   /* ml904: which aspects the clear named */
@@ -2885,6 +2935,11 @@ static int exec_begin_render(struct mad_exec *e) {
             rpi.stencil.load_action = (cf & D3D12_CLEAR_FLAG_STENCIL) ? WMTLoadActionClear : WMTLoadActionLoad;
             rpi.stencil.store_action = WMTStoreActionStore;
             if (p >= 0) rpi.stencil.clear_stencil = e->pend[p].stencil;
+        }
+        if ((e->dro & 3) && mad_ro_dontcare_on() && mad_dro_holds_from(e->l, e->cur + 1, e->rt, e->rtp, e->nrt, e->depth, &e->dp, (UINT8)(e->dro & 3))) {   /* ml1309 */
+            if ((e->dro & D3D12_DSV_FLAG_READ_ONLY_DEPTH) && !(cf & D3D12_CLEAR_FLAG_DEPTH)) { rpi.depth.store_action = WMTStoreActionDontCare; e->enc_dro |= 1; }
+            if (e->depth->has_stencil && (e->dro & D3D12_DSV_FLAG_READ_ONLY_STENCIL) && !(cf & D3D12_CLEAR_FLAG_STENCIL)) { rpi.stencil.store_action = WMTStoreActionDontCare; e->enc_dro |= 2; }
+            if (e->enc_dro) InterlockedIncrement(&g_ro_dc);
         }
         if (p >= 0) { rpi.depth.clear_depth = e->pend[p].depth; exec_drop_pending(e, p); }
         if (!w) { w = e->depth->width >> e->dp.level; h = e->depth->height >> e->dp.level; }
@@ -5533,6 +5588,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             }
             memcpy(e.rt, c->u.rts.rt, sizeof e.rt); e.nrt = c->u.rts.n; e.depth = c->u.rts.depth;
             memcpy(e.rtp, c->u.rts.v, sizeof e.rtp); e.dp = c->u.rts.dv;   /* ml925 */
+            e.dro = c->u.rts.dro;   /* ml1309 */
             break;
         case MC_CLEAR_RT: exec_add_clear(&e, c->u.clear.res, &c->u.clear.v, c->u.clear.rgba, 0.0f, 0, 0, 0); break;
         case MC_CLEAR_DS: exec_add_clear(&e, c->u.clear.res, &c->u.clear.v, NULL, c->u.clear.depth, 1, c->u.clear.stencil, c->u.clear.flags); break;
@@ -5877,9 +5933,10 @@ static void mad_perf_present(void) {
                 {   /* ml1304 */
                     LONG ck = InterlockedExchange(&g_carry_kept, 0), ca = InterlockedExchange(&g_carry_adopted, 0), cc = InterlockedExchange(&g_carry_closed, 0);
                     LONG cp = InterlockedExchange(&g_carry_passed, 0), cd = InterlockedExchange(&g_clear_deferred, 0), sr = InterlockedExchange(&g_st_refreshes, 0);
+                    LONG rd = InterlockedExchange(&g_ro_dc, 0);
                     d3d12_log("[perf] ml1304 render passes left open at a command list's end per frame: %.1f, continued by a later list %.1f "
-                              "(carried past %.1f lists that encode nothing), ended there %.1f; ml1305 clears kept for a later pass %.1f; ml1308 stencil copies %.1f\n",
-                              ck / np, ca / np, cp / np, cc / np, cd / np, sr / np);
+                              "(carried past %.1f lists that encode nothing), ended there %.1f; ml1305 clears kept for a later pass %.1f; ml1308 stencil copies %.1f; ml1309 passes not storing read-only depth %.1f\n",
+                              ck / np, ca / np, cp / np, cc / np, cd / np, sr / np, rd / np);
                 }
             }
             if (g_f6_used && g_perf_presents) {   /* ml1137 */
@@ -9772,6 +9829,7 @@ static void STDMETHODCALLTYPE device_CreateDepthStencilView(ID3D12Device *This,
     (void)This;
     if (!v) return;
     v->res = r; v->p.level = 0; v->p.slice = 0; v->p.plane = 0; v->p.layers = 1;
+    v->ro = desc ? (UINT8)(desc->Flags & (D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL)) : 0;   /* ml1309 */
     if (!r) return;
     if (!desc) { mad_view_all(r, &v->p, 0, (UINT)-1, 0); }
     else switch (desc->ViewDimension) {   /* ml925 */
@@ -9801,7 +9859,7 @@ static void STDMETHODCALLTYPE device_CreateRenderTargetView(ID3D12Device *This,
     static unsigned said;
     (void)This;
     if (!v) return;
-    v->res = r; v->p.level = 0; v->p.slice = 0; v->p.plane = 0; v->p.layers = 1;
+    v->res = r; v->p.level = 0; v->p.slice = 0; v->p.plane = 0; v->p.layers = 1; v->ro = 0;
     if (!r) return;
     if (!desc) { mad_view_all(r, &v->p, 0, (UINT)-1, r->tex_type == WMTTextureType3D); }
     else switch (desc->ViewDimension) {   /* ml925 */
@@ -11676,6 +11734,7 @@ static void STDMETHODCALLTYPE list_OMSetRenderTargets(ID3D12GraphicsCommandList 
     c->u.rts.n = rtvs ? n : 0;
     c->u.rts.depth = dsv ? mad_slot_resource(dsv->ptr) : NULL;
     c->u.rts.dv = mad_slot_view(dsv ? dsv->ptr : 0);
+    c->u.rts.dro = mad_slot_ro(dsv ? dsv->ptr : 0);   /* ml1309 */
 }
 static void STDMETHODCALLTYPE list_ClearRenderTargetView(ID3D12GraphicsCommandList *This,
         D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT rgba[4], UINT n, const D3D12_RECT *rects) {
