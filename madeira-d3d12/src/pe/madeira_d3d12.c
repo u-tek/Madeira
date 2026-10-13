@@ -288,6 +288,7 @@ struct mad_device {
      * backed (1,320 texture heaps totalling 1,985 MB for ~280 MB of textures). */
     CRITICAL_SECTION heap_lock;
     obj_handle_t ds_scratch; UINT64 ds_scratch_size;   /* staging for depth/stencil aspect copies (exec_copy_aspect) */
+    struct mad_resource *st_list[64]; unsigned nst;      /* ml1308: textures with a stencil copy (under view_lock) */
     struct mad_texheap { obj_handle_t heap; UINT64 size; struct mad_hblk { UINT64 off, size; } *fl; unsigned nfl, fl_cap; } *theaps;
     unsigned ntheaps, theaps_cap;
     struct mad_hret { unsigned heap; UINT64 off, size, serial; } *hret; unsigned nhret, hret_cap;
@@ -588,6 +589,8 @@ struct mad_resource {
     enum WMTTextureType tex_type; enum WMTPixelFormat tex_pf; UINT tex_mips, tex_layers; UINT tex_depth;   /* ml924: 3D depth */
     UINT promo_ch;   /* ml1279: stored in a four-channel format for read-write access; the channel count of the format it stands for (2, 3), else 0 */
     UINT ffx_reg;    /* ml1280: in the FidelityFX texture registry (fg-tile-probe) */
+    UINT st_nopfv;   /* ml1308: a depth-stencil texture made without PixelFormatView: stencil SRVs read st_copy */
+    obj_handle_t st_copy; volatile LONG st_dirty;   /* ml1308: R8Uint copy of the stencil plane; written since last copied */
     struct mad_xview { UINT type, lvl0, nlvl, sl0, nsl, pf, swz; obj_handle_t tex; UINT64 id; } *xview;
     unsigned nxview, xview_cap;
     UINT64 reserved_bytes;   /* d3d12-tiled-resources: created by CreateReservedResource (fully backed), its tiles x 64 KB */
@@ -1810,13 +1813,15 @@ static obj_handle_t f6_fence(struct mad_queue *q, unsigned idx) {
     if (!q->f6_pool[idx]) q->f6_pool[idx] = MTLDevice_newFence(q->device->mtl_device);
     return q->f6_pool[idx];
 }
-/* One encodeCommands call for all of an encoder's fence operations (a chain). */
-static void f6_encode(obj_handle_t enc, int kind, const obj_handle_t *f, unsigned nwait, obj_handle_t update) {
+/* One encodeCommands call for all of an encoder's fence operations (a chain).
+ * ml1307: for a render encoder the last nfrag waits are at the FRAGMENT stage. */
+static void f6_encode2(obj_handle_t enc, int kind, const obj_handle_t *f, unsigned nwait, unsigned nfrag, obj_handle_t update) {
     union f6_op ops[48];
     unsigned i, n = 0;
     memset(ops, 0, sizeof ops);
     for (i = 0; i < nwait && n < 47; i++, n++) {
-        if (kind == F6_RENDER) { ops[n].r.type = WMTRenderCommandWaitForFence; ops[n].r.fence = f[i]; ops[n].r.stages = (enum WMTRenderStages)(WMTRenderStageVertex | WMTRenderStageObject); }
+        if (kind == F6_RENDER) { ops[n].r.type = WMTRenderCommandWaitForFence; ops[n].r.fence = f[i];
+                                 ops[n].r.stages = i + nfrag >= nwait ? WMTRenderStageFragment : (enum WMTRenderStages)(WMTRenderStageVertex | WMTRenderStageObject); }
         else if (kind == F6_BLIT) { ops[n].b.type = WMTBlitCommandWaitForFence; ops[n].b.fence = f[i]; }
         else { ops[n].c.type = WMTComputeCommandWaitForFence; ops[n].c.fence = f[i]; }
     }
@@ -1831,6 +1836,30 @@ static void f6_encode(obj_handle_t enc, int kind, const obj_handle_t *f, unsigne
     if (kind == F6_RENDER) MTLRenderCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&ops[0]);
     else if (kind == F6_BLIT) MTLBlitCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&ops[0]);
     else MTLComputeCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&ops[0]);
+}
+static void f6_encode(obj_handle_t enc, int kind, const obj_handle_t *f, unsigned nwait, obj_handle_t update) {
+    f6_encode2(enc, kind, f, nwait, 0, update);
+}
+/* ml1307: FRAGMENT-STAGE WAITS (madeira.cfg f6-frag-wait = 1, experimental).
+ * A render pass that syncs waits for every pending encoder before its VERTEX
+ * stage, so on a tile-based GPU its geometry and tiling cannot overlap the
+ * previous pass's fragment work -- every sync point is a bubble (~105 a frame
+ * in log b5825805). What a render pass with attachments writes is its
+ * attachments, which only fragment work after it reads, so a wait for such a
+ * pass can move to the fragment stage. Kept at the vertex stage: compute and
+ * blit encoders (skinning, culling, uploads, indirect arguments), passes with
+ * no attachments (they write UAVs: Nanite-style rasterisers, object culling),
+ * a pass whose attachments this one uses, and the device fence. Not covered:
+ * a vertex shader sampling a texture the previous pass just drew, or pixel
+ * shader UAV writes read by the next vertex stage. */
+static int g_f6_frag_wait = -1;
+static LONG g_f6_frag_waits;
+static int f6_frag_ok(const struct mad_exec *e, const struct mad_f6_pend *p) {
+    unsigned j, k;
+    if (p->kind != F6_RENDER || !p->natt) return 0;
+    for (j = 0; j < p->natt; j++)
+        for (k = 0; k < e->f6_natt; k++) if (e->f6_att[k] && e->f6_att[k] == p->att[j]) return 0;
+    return 1;
 }
 static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
     struct mad_queue *q = e->q;
@@ -1856,9 +1885,21 @@ static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
     }
     if (need) { e->f7_mask = 0; e->f7_all = 0; e->f7_open = 0; e->f7_reason = 0; }
     if (need) {
+        unsigned nfrag = 0;
+        if (g_f6_frag_wait < 0) {
+            g_f6_frag_wait = mad_cfg_int_pe("f6-frag-wait", 0) ? 1 : 0;
+            d3d12_log("[madeira-d3d12] ml1307 f6-frag-wait = %d (%s)\n", g_f6_frag_wait,
+                      g_f6_frag_wait ? "a render pass waits for earlier render passes before its fragment stage, so its geometry overlaps them"
+                                     : "a render pass waits for everything before its vertex stage");
+        }
         if (e->f6_list_start && q->device->enc_fence) waits[nw++] = q->device->enc_fence;
-        for (i = 0; i < q->f6_npend; i++) waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
-        f6_encode(enc, kind, waits, nw, 0);
+        if (kind == F6_RENDER && g_f6_frag_wait) {   /* ml1307: vertex-stage waits first, the fragment-stage ones last */
+            for (i = 0; i < q->f6_npend; i++) if (!f6_frag_ok(e, &q->f6_pend[i])) waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
+            for (i = 0; i < q->f6_npend; i++) if (f6_frag_ok(e, &q->f6_pend[i])) { waits[nw++] = f6_fence(q, q->f6_pend[i].idx); nfrag++; }
+            InterlockedExchangeAdd(&g_f6_frag_waits, (LONG)nfrag);
+        } else
+            for (i = 0; i < q->f6_npend; i++) waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
+        f6_encode2(enc, kind, waits, nw, nfrag, 0);
         InterlockedExchangeAdd(&g_fence_waits, (LONG)nw);
         q->f6_npend = 0; e->f6_sync_needed = 0; e->f6_list_start = 0; e->f6_enc_synced = 1;
         InterlockedIncrement(&g_f6_synced);
@@ -2409,6 +2450,7 @@ static void exec_flush_clear(struct mad_exec *e, int i) {
     if (!rpi.render_target_width) rpi.render_target_width = 1; if (!rpi.render_target_height) rpi.render_target_height = 1;
     rpi.default_raster_sample_count = e->pend[i].res->samples ? e->pend[i].res->samples : 1;
     enc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (enc) g_enc_seq++;
+    if (e->pend[i].is_depth && e->pend[i].res->st_copy) e->pend[i].res->st_dirty = 1;   /* ml1308 */
     e->f6_att[0] = e->pend[i].res; e->f6_natt = 1;   /* ml1134 */
     if (enc) { exec_fence_render(e, enc, 0); exec_fence_render(e, enc, 1); }   /* ml1091: a clear pass writes its target; keep it in the chain */
     e->f6_natt = 0;
@@ -2849,6 +2891,7 @@ static int exec_begin_render(struct mad_exec *e) {
             InterlockedExchangeAdd64(rpi.depth.load_action == WMTLoadActionClear ? &g_ac_clear : &g_ac_load, f7_att_bytes(e->depth, e->dp.level));
     }
     e->renc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (e->renc) e->renc_seq = ++g_enc_seq;
+    if (e->depth && e->depth->st_copy) e->depth->st_dirty = 1;   /* ml1308: its stencil may change in this pass */
     if (g_enc_labels) mad_label(e->renc, "R#%u %s|%s %ux%u", e->renc_seq, e->pso ? e->pso->vs_name : "-", e->pso ? e->pso->ps_name : "-", w, h);   /* ml1142 */
     e->f6_natt = 0;   /* ml1134: what this pass writes, for the same-attachment ordering rule */
     for (i = 0; i < e->nrt && e->f6_natt < 8; i++) if (e->rt[i]) e->f6_att[e->f6_natt++] = e->rt[i];
@@ -2894,6 +2937,48 @@ static int exec_begin_blit(struct mad_exec *e) {
     if (e->benc) exec_fence_blit(e, e->benc, 0);   /* ml1091 */
     if (!e->benc) d3d12_log("[madeira-d3d12] no blit encoder\n");
     return e->benc != 0;
+}
+
+static LONG g_st_copies, g_st_refreshes;   /* ml1308 */
+/* ml1308: copy the stencil plane of r into its R8Uint copy, if anything wrote
+ * r since the last copy. The first blit syncs with everything pending (the
+ * pass that wrote the stencil among it); the barrier being replayed makes
+ * whatever follows sync with the copy. */
+static void exec_st_refresh(struct mad_exec *e, struct mad_resource *r) {
+    struct mad_device *dev = e->q->device;
+    UINT64 row = r->width, img = row * r->height;
+    struct wmtcmd_blit_copy_from_texture_to_buffer k1; struct wmtcmd_blit_copy_from_buffer_to_texture k2;
+    if (!r->st_copy || !r->texture || !img || !InterlockedExchange(&r->st_dirty, 0)) return;
+    EnterCriticalSection(&dev->heap_lock);
+    if (dev->ds_scratch_size < img) {
+        struct WMTBufferInfo bi; UINT64 sz = img < (4u << 20) ? (4u << 20) : (img + 0xffff) & ~(UINT64)0xffff;
+        if (dev->ds_scratch) NSObject_release(dev->ds_scratch);   /* an in-flight command buffer keeps its own reference */
+        memset(&bi, 0, sizeof bi); bi.length = sz; bi.options = WMTResourceStorageModePrivate;
+        dev->ds_scratch = MTLDevice_newBuffer(dev->mtl_device, &bi);
+        dev->ds_scratch_size = dev->ds_scratch ? sz : 0;
+    }
+    LeaveCriticalSection(&dev->heap_lock);
+    if (!dev->ds_scratch) return;
+    e->f6_sync_needed = 1; e->fence_needed = 1;
+    exec_end(e);
+    if (!exec_begin_blit(e)) return;
+    memset(&k1, 0, sizeof k1);
+    k1.type = WMTBlitCommandCopyFromTextureToBuffer;
+    k1.src = r->texture; k1.slice = 0; k1.level = 0;
+    k1.size.width = r->width; k1.size.height = r->height; k1.size.depth = 1;
+    k1.dst = dev->ds_scratch; k1.offset = 0; k1.bytes_per_row = (UINT32)row; k1.bytes_per_image = (UINT32)img;
+    k1.options = 2;   /* MTLBlitOptionStencilFromDepthStencil */
+    MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k1);
+    exec_end(e);
+    if (!exec_begin_blit(e)) return;
+    memset(&k2, 0, sizeof k2);
+    k2.type = WMTBlitCommandCopyFromBufferToTexture;
+    k2.src = dev->ds_scratch; k2.src_offset = 0; k2.bytes_per_row = (UINT32)row; k2.bytes_per_image = (UINT32)img;
+    k2.size.width = r->width; k2.size.height = r->height; k2.size.depth = 1;
+    k2.dst = r->st_copy; k2.slice = 0; k2.level = 0;
+    MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k2);
+    exec_end(e);
+    InterlockedIncrement(&g_st_refreshes);
 }
 
 /* One slot of root values for this draw, from the list's shared chunks. */
@@ -5018,6 +5103,8 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
 #define MAD_FILLPAT_BYTES (256u << 10)   /* ml1151: one exact UAV-clear pattern buffer */
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
+    if (c->kind == MC_COPY_T2T && c->u.tt.dst->st_copy) c->u.tt.dst->st_dirty = 1;   /* ml1308 */
+    if (c->kind == MC_COPY_B2T && c->u.bt.tex->st_copy) c->u.bt.tex->st_dirty = 1;
     switch (c->kind) {   /* ml1116: the destination is written */
     case MC_FILL_BB: exec_note_write(e, c->u.fill.res); break;
     case MC_COPY_BB: exec_note_write(e, c->u.bb.dst); break;
@@ -5451,6 +5538,19 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                     if (hit) exec_flush_clear(&e, (int)pk); else pk++;
                 }
             }
+            if (q->device->nst) {   /* ml1308: a stencil copy is refreshed where its texture becomes readable */
+                unsigned bk;
+                for (bk = 0; bk < c->u.barrier.n; bk++)
+                    if (c->u.barrier.res[bk] && c->u.barrier.res[bk]->st_copy && c->u.barrier.cls[bk] != BC_RAR) exec_st_refresh(&e, c->u.barrier.res[bk]);
+                if (c->u.barrier.all && c->u.barrier.n >= 8) {   /* more entries than were recorded: any written texture with a copy */
+                    struct mad_device *sd = q->device; struct mad_resource *sl[64]; unsigned ns = 0, sk;
+                    EnterCriticalSection(&sd->view_lock);
+                    for (sk = 0; sk < sd->nst; sk++)
+                        if (sd->st_list[sk]->st_dirty && sd->st_list[sk]->refs > 0) { ID3D12Resource_AddRef((ID3D12Resource *)sd->st_list[sk]); sl[ns++] = sd->st_list[sk]; }
+                    LeaveCriticalSection(&sd->view_lock);
+                    for (sk = 0; sk < ns; sk++) { exec_st_refresh(&e, sl[sk]); ID3D12Resource_Release((ID3D12Resource *)sl[sk]); }
+                }
+            }
             if (e.mode == 6) {   /* ml1134: see f6_begin */
                 f7_census_barrier(&e, c);   /* ml1137: counts only */
                 if (g_f6_compute_open < 0) g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;
@@ -5751,16 +5851,16 @@ static void mad_perf_present(void) {
                 double np = (double)g_perf_presents;
                 LONG b = InterlockedExchange(&g_f6_begins, 0), sy = InterlockedExchange(&g_f6_synced, 0), at = InterlockedExchange(&g_f6_att_sync, 0);
                 LONG ko = InterlockedExchange(&g_f6_kept_open, 0), jn = InterlockedExchange(&g_f6_joins, 0), rc = InterlockedExchange(&g_f6_rclose, 0);
-                LONG pr = InterlockedExchange(&g_f6_predicted, 0);
+                LONG pr = InterlockedExchange(&g_f6_predicted, 0), fw = InterlockedExchange(&g_f6_frag_waits, 0);
                 d3d12_log("[perf] ml1134 fence-chain 6 per frame: %.1f encoders, %.1f synced (%.1f for a shared attachment, ml1302 %.1f for a barrier ahead), %.1f overlapped; "
-                          "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins\n",
-                          b / np, sy / np, at / np, pr / np, (b - sy) / np, ko / np, rc / np, jn / np);
+                          "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins; ml1307 fragment-stage waits %.1f\n",
+                          b / np, sy / np, at / np, pr / np, (b - sy) / np, ko / np, rc / np, jn / np, fw / np);
                 {   /* ml1304 */
                     LONG ck = InterlockedExchange(&g_carry_kept, 0), ca = InterlockedExchange(&g_carry_adopted, 0), cc = InterlockedExchange(&g_carry_closed, 0);
-                    LONG cp = InterlockedExchange(&g_carry_passed, 0), cd = InterlockedExchange(&g_clear_deferred, 0);
+                    LONG cp = InterlockedExchange(&g_carry_passed, 0), cd = InterlockedExchange(&g_clear_deferred, 0), sr = InterlockedExchange(&g_st_refreshes, 0);
                     d3d12_log("[perf] ml1304 render passes left open at a command list's end per frame: %.1f, continued by a later list %.1f "
-                              "(carried past %.1f lists that encode nothing), ended there %.1f; ml1305 clears kept for a later pass %.1f\n",
-                              ck / np, ca / np, cp / np, cc / np, cd / np);
+                              "(carried past %.1f lists that encode nothing), ended there %.1f; ml1305 clears kept for a later pass %.1f; ml1308 stencil copies %.1f\n",
+                              ck / np, ca / np, cp / np, cc / np, cd / np, sr / np);
                 }
             }
             if (g_f6_used && g_perf_presents) {   /* ml1137 */
@@ -5806,8 +5906,7 @@ static void mad_perf_present(void) {
                     n += snprintf(line + n, sizeof line - n, " %s %.1f (%.1f ms)", qn[k], (double)c / g_perf_presents,
                                   1000.0 * t / (double)fq.QuadPart / g_perf_presents);
             }
-            d3d12_log("%s
-", line);
+            d3d12_log("%s\n", line);
         }
         g_perf_t0 = now.QuadPart; g_perf_presents = 0; g_perf_cbs = 0; g_perf_gpu_sum = g_perf_gpu_union = g_perf_wait_s = 0; g_perf_first_start = 0;
         g_perf_ecl = g_perf_signals = g_perf_waits = g_perf_polls = g_perf_qwait_sleeps = 0; g_perf_wait_ticks = g_perf_sig_lat_ticks = 0; g_perf_sig_lat_n = 0;
@@ -7215,6 +7314,42 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
 /* ml918: pf = 0 keeps the texture's own format; swz packs four
  * WMTTextureSwizzle values (r | g<<8 | b<<16 | a<<24), 0 = identity. */
 #define MAD_SWZ_IDENTITY (2u | 3u << 8 | 4u << 16 | 5u << 24)
+/* ml1308: STENCIL READS WITHOUT PixelFormatView (madeira.cfg ds-compress = 1).
+ * A stencil SRV of a combined depth-stencil texture is an X32_Stencil8 view,
+ * and that view needs PixelFormatView usage, which turns lossless compression
+ * off for the scene depth -- the attachment loaded and stored by nearly every
+ * pass of a frame. With ds-compress = 1 a single-mip, single-slice depth-stencil
+ * texture is made without it, and its stencil SRVs read an R8Uint COPY of the
+ * stencil plane instead. The copy is refreshed at replay, through the same
+ * staging buffer as plane copies, at a barrier that moves the texture out of
+ * a write state after anything wrote it (a pass with it as depth target, a
+ * clear, a copy into it): D3D12 lets nothing read it as a shader resource
+ * without such a barrier first. */
+static void mad_st_forget(struct mad_resource *r) {
+    struct mad_device *d = r->owner; unsigned k;
+    if (!d) return;
+    EnterCriticalSection(&d->view_lock);
+    for (k = 0; k < d->nst; k++) if (d->st_list[k] == r) { d->st_list[k] = d->st_list[--d->nst]; break; }
+    LeaveCriticalSection(&d->view_lock);
+}
+/* The copy, made on the first stencil SRV; view_lock is held. */
+static obj_handle_t mad_st_copy_locked(struct mad_device *d, struct mad_resource *r) {
+    struct WMTTextureInfo ti;
+    if (r->st_copy) return r->st_copy;
+    memset(&ti, 0, sizeof ti);
+    ti.pixel_format = WMTPixelFormatR8Uint; ti.width = r->width; ti.height = r->height; ti.depth = 1;
+    ti.array_length = 1; ti.mipmap_level_count = 1; ti.sample_count = 1; ti.type = WMTTextureType2DArray;
+    ti.usage = WMTTextureUsageShaderRead; ti.options = WMTResourceStorageModePrivate;
+    r->st_copy = MTLDevice_newTexture(d->mtl_device, &ti);
+    if (!r->st_copy) return 0;
+    mad_resident(d, r->st_copy);
+    r->st_dirty = 1;
+    if (d->nst < 64) d->st_list[d->nst++] = r;
+    if (InterlockedIncrement(&g_st_copies) <= 8)
+        d3d12_log("[madeira-d3d12] ml1308 stencil SRVs of %s %ux%u read an R8Uint copy of its stencil plane (the texture keeps lossless compression)\n",
+                  r->name, r->width, r->height);
+    return r->st_copy;
+}
 static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, enum WMTTextureType want,
                                   UINT lvl0, UINT nlvl, UINT sl0, UINT nsl, enum WMTPixelFormat pf, UINT swz) {
     unsigned k; UINT64 id = 0; obj_handle_t tex;
@@ -7244,7 +7379,10 @@ static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, 
         }
     sw.r = (enum WMTTextureSwizzle)(swz & 0xff); sw.g = (enum WMTTextureSwizzle)((swz >> 8) & 0xff);
     sw.b = (enum WMTTextureSwizzle)((swz >> 16) & 0xff); sw.a = (enum WMTTextureSwizzle)((swz >> 24) & 0xff);
-    tex = MTLTexture_newTextureView(r->texture, pf, want, (uint16_t)lvl0, (uint16_t)nlvl, (uint16_t)sl0, (uint16_t)nsl, sw, &id);
+    if (pf == WMTPixelFormatX32_Stencil8 && r->st_nopfv && mad_st_copy_locked(d, r))   /* ml1308 */
+        tex = MTLTexture_newTextureView(r->st_copy, WMTPixelFormatR8Uint, want, 0, 1, 0, 1, sw, &id);
+    else
+        tex = MTLTexture_newTextureView(r->texture, pf, want, (uint16_t)lvl0, (uint16_t)nlvl, (uint16_t)sl0, (uint16_t)nsl, sw, &id);
     if (!tex || !id) {
         if (said_fail++ < 12)
             d3d12_log("[madeira-d3d12] texture view FAILED: type %u -> %u, levels %u+%u, slices %u+%u of %ux%u (%s)\n",
@@ -7980,6 +8118,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         if (r->texture && !r->borrowed && !r->hp_used && !r->placed_heap) mad_unresident(r->owner, r->texture);
         if (r->hp_used && r->owner) mad_hp_release(r->owner, r);   /* ml1072: block returns after the GPU is done with it */
         { unsigned k; for (k = 0; k < r->nview_old; k++) free(r->view_old[k]); free(r->tview); free(r->xview); }
+        if (r->st_copy) { mad_st_forget(r); mad_unresident(r->owner, r->st_copy); NSObject_release(r->st_copy); r->st_copy = 0; }   /* ml1308 */
         if (r->buffer) NSObject_release(r->buffer);
         if (r->texture && !r->borrowed) NSObject_release(r->texture);
         if (r->resolve_tmp) NSObject_release(r->resolve_tmp);
@@ -8334,8 +8473,9 @@ static int mad_tex_needs_pfv(const D3D12_RESOURCE_DESC *desc, enum WMTPixelForma
         !mad_cfg_once("tex-compress-all", 0, &g_tex_compress_all, "sampled textures without PixelFormatView too",
                       "sampled textures keep PixelFormatView", "ml1301")) return 1;
     if (is_depth && pf == WMTPixelFormatDepth32Float_Stencil8 && !(desc->Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
-        !mad_cfg_once("ds-compress", 0, &g_ds_compress, "depth-stencil textures without PixelFormatView (stencil SRVs view them as X32_Stencil8)",
-                      "shader-readable depth-stencil textures keep PixelFormatView for stencil views", "ml1301")) return 1;
+        (!mad_cfg_once("ds-compress", 0, &g_ds_compress, "ml1308: single-mip depth-stencil textures without PixelFormatView; stencil SRVs read a copy of the stencil plane",
+                       "shader-readable depth-stencil textures keep PixelFormatView for stencil views", "ml1301") ||
+         desc->MipLevels != 1 || desc->DepthOrArraySize > 1 || desc->SampleDesc.Count > 1)) return 1;
     if (pf >= WMTPixelFormatBC1_RGBA && pf <= WMTPixelFormatBC7_RGBAUnorm_sRGB) return 1;   /* never compressed again */
     return 0;
 }
@@ -8472,6 +8612,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         r->name = is_depth ? "DepthTarget" : (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ? "RenderTarget" : "Texture";
         r->is_depth = is_depth;
         r->has_stencil = (pf == WMTPixelFormatDepth32Float_Stencil8);
+        r->st_nopfv = is_depth && r->has_stencil && !(ti.usage & WMTTextureUsagePixelFormatView);   /* ml1308 */
         r->samples = ti.sample_count;
         if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {   /* ml1301 census */
             int pfv = (ti.usage & WMTTextureUsagePixelFormatView) != 0;
