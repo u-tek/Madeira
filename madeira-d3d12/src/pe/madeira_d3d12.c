@@ -474,6 +474,11 @@ static void mad_xp_role(char role) {   /* tell the probe which thread this is (u
 }
 static LONG64 mad_qpc(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 static LONG g_perf_ecl, g_perf_signals, g_perf_waits, g_perf_polls, g_perf_qwait_sleeps; static LONGLONG g_perf_wait_ticks, g_perf_sig_lat_ticks; static LONG g_perf_sig_lat_n;
+/* ml1306: the game's fence waits by the queue that signals the fence (index =
+ * 1 + D3D12 queue type; 0 = signalled from the CPU). Every D3D12 queue feeds ONE
+ * Metal queue, so a wait for a copy or compute queue's fence also waits for all
+ * the graphics work committed before it -- which is what this measures. */
+static LONG g_fw_n[5]; static LONGLONG g_fw_ticks[5];
 #define MAD_SKIP(e_) (mad_skip_at(__LINE__), (e_)->skipped++)
 static void mad_skip_report(void) {
     char buf[1400]; int n = 0; unsigned i;
@@ -954,6 +959,7 @@ struct mad_fence {
     volatile LONG64 submitted;   /* ml1061: highest value a queue has been ASKED to signal */
     volatile LONG64 committed;   /* ml1120: highest value whose Signal batch has been COMMITTED to Metal (or signalled on the CPU) */
     struct { UINT64 value; HANDLE event; LONGLONG t_reg; } waiters[MAD_FENCE_WAITERS];   /* ml1109: t_reg = registration time */
+    volatile LONG sig_q;         /* ml1306: 1 + the D3D12 type of the queue that last signalled it (0 = the CPU) */
     unsigned nwaiters;
     /* ml1270 (frame-generation diagnostics): creation order, GetCompletedValue
      * polls since the value last changed, and how many further operations on
@@ -1034,6 +1040,8 @@ static void fence_set_locked(struct mad_fence *f, UINT64 v) {
         if (f->waiters[i].value <= v) {
             LARGE_INTEGER t; QueryPerformanceCounter(&t);   /* ml1109: how long the game sat on this fence */
             InterlockedExchangeAdd64(&g_perf_wait_ticks, t.QuadPart - f->waiters[i].t_reg);
+            { LONG qi = f->sig_q; if (qi < 0 || qi > 4) qi = 0;   /* ml1306 */
+              InterlockedIncrement(&g_fw_n[qi]); InterlockedExchangeAdd64(&g_fw_ticks[qi], t.QuadPart - f->waiters[i].t_reg); }
             SetEvent(f->waiters[i].event);
         }
         else f->waiters[w++] = f->waiters[i];
@@ -2644,6 +2652,59 @@ static void mad_carry_begin_list(struct mad_exec *e) {
     InterlockedIncrement(&g_carry_adopted);
 }
 
+/* ml1305: DEFERRED CLEARS. A clear whose target the next pass does not bind
+ * became a pass of its own: the clear, then a full store of the target, and
+ * later a full load when something finally draws into it (516 clear-only
+ * passes per 600 lists in log b5825805, ~27 a frame). D3D12 lets nothing read
+ * a cleared render target or depth buffer without a barrier first, so when a
+ * later pass in this list DRAWS into that very subresource before any
+ * barrier, copy or resolve touches it, the clear stays pending and becomes
+ * that pass's load action -- no store, no load. Otherwise it is flushed as
+ * before, at the same point. madeira.cfg clear-defer = 0 turns it off. */
+static int g_clear_defer = -1;
+static LONG g_clear_deferred;
+static int exec_clear_folds_later(const struct mad_exec *e, unsigned k) {
+    const struct mad_list *l = e->l;
+    const struct mad_resource *r = e->pend[k].res;
+    const struct mad_rtvp *v = &e->pend[k].v;
+    unsigned j, i, lim;
+    int bound = 0, dep = e->pend[k].is_depth;
+    if (g_clear_defer < 0) {
+        g_clear_defer = mad_cfg_int_pe("clear-defer", 1) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] ml1305 clear-defer = %d (%s)\n", g_clear_defer,
+                  g_clear_defer ? "a clear becomes the load action of a later pass that draws into its target"
+                                : "a clear whose target the next pass does not bind is a pass of its own");
+    }
+    if (!g_clear_defer || !l) return 0;
+    lim = e->cur + 8192 < l->ncmds ? e->cur + 8192 : l->ncmds;
+    for (j = e->cur + 1; j < lim; j++) {
+        const struct mad_cmd *c = &l->cmds[j];
+        switch (c->kind) {
+        case MC_RTS:
+            bound = 0;
+            if (dep) bound = c->u.rts.depth == r && mad_rtvp_eq(&c->u.rts.dv, v);
+            else for (i = 0; i < c->u.rts.n && !bound; i++) bound = c->u.rts.rt[i] == r && mad_rtvp_eq(&c->u.rts.v[i], v);
+            break;
+        case MC_DRAW: case MC_DRAW_INDEXED: case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT:
+            if ((c->kind == MC_DRAW && !c->u.draw.icount) || (c->kind == MC_DRAW_INDEXED && !c->u.drawi.inst)) break;   /* elided (ml1094) */
+            if (bound) { InterlockedIncrement(&g_clear_deferred); return 1; }
+            break;
+        case MC_BARRIER:
+            if (c->u.barrier.all) return 0;
+            for (i = 0; i < c->u.barrier.n; i++) if (c->u.barrier.res[i] == r) return 0;
+            break;
+        case MC_COPY_T2T: case MC_RESOLVE:
+            if (c->u.tt.src == r || c->u.tt.dst == r) return 0;
+            break;
+        case MC_COPY_T2B: case MC_COPY_B2T:
+            if (c->u.bt.tex == r) return 0;
+            break;
+        default: break;
+        }
+    }
+    return 0;
+}
+
 /* ml1303: census of what a pass that ends for new targets hands over to the
  * next one (census frames only), for deciding how passes could be merged:
  *   subset   - the new targets are some of the old, each at the same index;
@@ -2725,11 +2786,12 @@ static int exec_begin_render(struct mad_exec *e) {
         if (!w || !h) return 0;
         attachless = 1;
     }
-    /* Pending clears for targets outside this pass go first, on their own. */
+    /* Pending clears for targets outside this pass go first, on their own --
+     * ml1305: unless a later pass of this list draws into the target first. */
     for (k = 0; k < e->npend; ) {
         int bound = (e->pend[k].res == e->depth && mad_rtvp_eq(&e->pend[k].v, &e->dp));
         for (i = 0; i < e->nrt && !bound; i++) if (e->rt[i] == e->pend[k].res && mad_rtvp_eq(&e->pend[k].v, &e->rtp[i])) bound = 1;
-        if (!bound) exec_flush_clear(e, (int)k); else k++;
+        if (!bound && !exec_clear_folds_later(e, k)) exec_flush_clear(e, (int)k); else k++;
     }
     memset(&rpi, 0, sizeof rpi);
     for (i = 0; i < e->nrt; i++) exec_note_write(e, e->rt[i]);   /* ml1116 */
@@ -5381,6 +5443,14 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             if (g_barrier_render < 0) { g_barrier_render = mad_cfg_int_pe("barrier-render", 0) ? 1 : 0;
                                         d3d12_log("[madeira-d3d12] ml1098 barrier-render = %d (render passes %s at ResourceBarrier)\n", g_barrier_render, g_barrier_render ? "CLOSED" : "left open"); }
             InterlockedIncrement(&g_barrier_seen);   /* ml1116 */
+            if (e.npend) {   /* ml1305: a pending clear of a transitioned target lands BEFORE the barrier, so whatever reads it next syncs with it */
+                unsigned pk, bk;
+                for (pk = 0; pk < e.npend; ) {
+                    int hit = c->u.barrier.all != 0;
+                    for (bk = 0; bk < c->u.barrier.n && !hit; bk++) if (c->u.barrier.res[bk] == e.pend[pk].res) hit = 1;
+                    if (hit) exec_flush_clear(&e, (int)pk); else pk++;
+                }
+            }
             if (e.mode == 6) {   /* ml1134: see f6_begin */
                 f7_census_barrier(&e, c);   /* ml1137: counts only */
                 if (g_f6_compute_open < 0) g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;
@@ -5687,9 +5757,10 @@ static void mad_perf_present(void) {
                           b / np, sy / np, at / np, pr / np, (b - sy) / np, ko / np, rc / np, jn / np);
                 {   /* ml1304 */
                     LONG ck = InterlockedExchange(&g_carry_kept, 0), ca = InterlockedExchange(&g_carry_adopted, 0), cc = InterlockedExchange(&g_carry_closed, 0);
-                    LONG cp = InterlockedExchange(&g_carry_passed, 0);
+                    LONG cp = InterlockedExchange(&g_carry_passed, 0), cd = InterlockedExchange(&g_clear_deferred, 0);
                     d3d12_log("[perf] ml1304 render passes left open at a command list's end per frame: %.1f, continued by a later list %.1f "
-                              "(carried past %.1f lists that encode nothing), ended there %.1f\n", ck / np, ca / np, cp / np, cc / np);
+                              "(carried past %.1f lists that encode nothing), ended there %.1f; ml1305 clears kept for a later pass %.1f\n",
+                              ck / np, ca / np, cp / np, cc / np, cd / np);
                 }
             }
             if (g_f6_used && g_perf_presents) {   /* ml1137 */
@@ -5725,6 +5796,19 @@ static void mad_perf_present(void) {
                   g_perf_presents ? 1000.0 * g_perf_wait_ticks / (double)fq.QuadPart / g_perf_presents : 0.0, 100.0 * g_perf_wait_ticks / (double)fq.QuadPart / wall,
                   g_perf_presents ? (double)g_perf_polls / g_perf_presents : 0.0, g_perf_presents ? (double)g_perf_qwait_sleeps / g_perf_presents : 0.0,
                   g_perf_sig_lat_n ? 1000.0 * g_perf_sig_lat_ticks / (double)fq.QuadPart / g_perf_sig_lat_n : 0.0, g_perf_sig_lat_n);
+        {   /* ml1306 */
+            static const char *const qn[5] = { "CPU", "direct", "bundle", "compute", "copy" };
+            char line[400]; int n = 0, k;
+            n += snprintf(line + n, sizeof line - n, "[perf] ml1306 fence waits per frame by signalling queue:");
+            for (k = 0; k < 5; k++) {
+                LONG c = InterlockedExchange(&g_fw_n[k], 0); LONGLONG t = InterlockedExchange64(&g_fw_ticks[k], 0);
+                if (c && g_perf_presents)
+                    n += snprintf(line + n, sizeof line - n, " %s %.1f (%.1f ms)", qn[k], (double)c / g_perf_presents,
+                                  1000.0 * t / (double)fq.QuadPart / g_perf_presents);
+            }
+            d3d12_log("%s
+", line);
+        }
         g_perf_t0 = now.QuadPart; g_perf_presents = 0; g_perf_cbs = 0; g_perf_gpu_sum = g_perf_gpu_union = g_perf_wait_s = 0; g_perf_first_start = 0;
         g_perf_ecl = g_perf_signals = g_perf_waits = g_perf_polls = g_perf_qwait_sleeps = 0; g_perf_wait_ticks = g_perf_sig_lat_ticks = 0; g_perf_sig_lat_n = 0;
     }
@@ -5978,6 +6062,7 @@ static HRESULT STDMETHODCALLTYPE queue_Signal(ID3D12CommandQueue *This, ID3D12Fe
     {   /* ml1061 */
         struct mad_fence *sf = (struct mad_fence *)fence; LONG64 cur;
         do { cur = sf->submitted; } while ((UINT64)cur < value && InterlockedCompareExchange64(&sf->submitted, (LONG64)value, cur) != cur);
+        sf->sig_q = 1 + (LONG)q->type;   /* ml1306 */
     }
     if (q->sub_thread) {   /* ml1120 */
         struct mad_subjob *j = calloc(1, sizeof *j);
