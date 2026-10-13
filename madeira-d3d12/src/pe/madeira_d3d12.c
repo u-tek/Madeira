@@ -3603,7 +3603,7 @@ static enum WMTPixelFormat mad_rw_promote_pf(enum WMTPixelFormat pf, UINT *ch) {
 /* ml1280: FidelityFX's UAV textures (made by a FidelityFX DLL), kept while
  * madeira.cfg fg-tile-probe = 1 so the probe can read them back (see
  * mad_fg_tile_probe). A resource leaves the list when it is destroyed. */
-#define MAD_FFX_REG 64
+#define MAD_FFX_REG 256   /* 64 filled up with the upscaler's textures before frame generation made its own (log 3192c14d) */
 static struct mad_resource *g_ffx_reg[MAD_FFX_REG];
 static SRWLOCK g_ffx_reg_lock = SRWLOCK_INIT;
 static void mad_ffx_reg_add(struct mad_resource *r) {
@@ -8050,7 +8050,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         if ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !is_depth && mad_fg_tile_probe_on() && mad_fidelityfx_caller()) {
             static LONG said;   /* ml1280 */
             mad_ffx_reg_add(r);
-            if (InterlockedIncrement(&said) <= 48)
+            if (InterlockedIncrement(&said) <= 256)
                 d3d12_log("[fg-probe] ml1280 FidelityFX UAV texture %p %llux%u mips %u format %u (Metal %u) registered\n",
                           (void *)r, (unsigned long long)desc->Width, desc->Height, (unsigned)ti.mipmap_level_count, (unsigned)desc->Format, (unsigned)pf);
         }
@@ -13158,7 +13158,7 @@ static void mad_rb_free(struct mad_rb *b, unsigned n) {
 static LONG g_probe_n, g_probe_hits, g_probe_dumps, g_probe_parity[2], g_probe_hit_parity[2];
 static void mad_fg_tile_probe(struct mad_swapchain *s, struct mad_resource *src) {
     struct mad_device *d = s->queue->device;
-    struct mad_rb fr, rb[MAD_FFX_REG * 5 + 1];
+    struct mad_rb fr, *rb;
     struct mad_resource *reg[MAD_FFX_REG];
     obj_handle_t cb, benc;
     unsigned char *cell;
@@ -13207,25 +13207,48 @@ static void mad_fg_tile_probe(struct mad_swapchain *s, struct mad_resource *src)
     for (i = 0; i < MAD_FFX_REG; i++)
         if (g_ffx_reg[i] && g_ffx_reg[i]->refs > 0) { reg[nreg++] = g_ffx_reg[i]; res_AddRef((ID3D12Resource *)g_ffx_reg[i]); }
     ReleaseSRWLockShared(&g_ffx_reg_lock);
-    cb = MTLCommandQueue_commandBuffer(d->mtl_queue);
+    rb = calloc((size_t)nreg * 13 + 1, sizeof *rb);
+    cb = rb ? MTLCommandQueue_commandBuffer(d->mtl_queue) : 0;
     benc = cb ? MTLCommandBuffer_blitCommandEncoder(cb) : 0;
     if (benc) {
         for (i = 0; i < nreg; i++) {
             UINT m;
-            for (m = 0; m < 5 && m < reg[i]->tex_mips; m++)
+            for (m = 0; m < 13 && m < reg[i]->tex_mips; m++)
                 if (mad_rb_encode(d, benc, reg[i], m, &rb[nrb])) nrb++;
         }
         MTLCommandEncoder_endEncoding(benc);
         MTLCommandBuffer_commit(cb);
         MTLCommandBuffer_waitUntilCompleted(cb);
     }
-    for (i = 0; i < nt; i++) {   /* the texels under each tile's centre */
+    if (g_probe_hits <= 3) {   /* which FidelityFX texture levels hold NaN or Inf at all */
+        UINT j;
+        for (j = 0; j < nrb; j++) {
+            UINT nan = 0, inf = 0, apos = 0, zero = 0, x, y, k, fl = rb[j].pf == 115 || rb[j].pf == 65 || rb[j].pf == 25 || rb[j].pf == 125 || rb[j].pf == 105 || rb[j].pf == 55;
+            for (y = 0; y < rb[j].h; y++)
+                for (x = 0; x < rb[j].w; x++) {
+                    float v[4]; int isnan = 0, isinf = 0;
+                    mad_rb_texel(&rb[j], x, y, v);
+                    for (k = 0; k < 4; k++) {
+                        if (v[k] != v[k]) isnan = 1;
+                        else if (fl && (v[k] > 3.0e38f || v[k] < -3.0e38f)) isinf = 1;
+                    }
+                    nan += isnan; inf += isinf;
+                    if (v[0] == 0.0f && v[1] == 0.0f && v[2] == 0.0f && v[3] == 0.0f) zero++;
+                    if ((rb[j].pf == 115 || rb[j].pf == 125) && v[3] > 0.0f) apos++;
+                }
+            d3d12_log("[fg-probe] ml1280   census tex %p %ux%u fmt%u pf%u mip %u (%ux%u): %u NaN, %u Inf, %u alpha>0, %u all-zero\n",
+                      (void *)rb[j].r, rb[j].r->width, rb[j].r->height, (unsigned)rb[j].r->desc.Format, rb[j].pf, rb[j].mip,
+                      rb[j].w, rb[j].h, nan, inf, apos, zero);
+        }
+    }
+    for (i = 0; i < nt && g_probe_hits <= 4; i++) {   /* the texels under each tile's centre */
         UINT j; float v[4];
         mad_rb_texel(&fr, tx[i], ty[i], v);
         d3d12_log("[fg-probe] ml1280   tile at (%u,%u): presented %.4g %.4g %.4g %.4g\n", tx[i], ty[i], v[0], v[1], v[2], v[3]);
         for (j = 0; j < nrb; j++) {
             const struct mad_rb *b = &rb[j];
             UINT bx, by;
+            if (b->r->width * 2 < fr.w) continue;   /* display-size and half-size textures (the inpainting pyramid) */
             UINT bw0 = b->r->width ? b->r->width : 1;
             bx = (UINT)((UINT64)tx[i] * bw0 / fr.w) >> b->mip;   /* scaled across the whole display */
             by = (UINT)((UINT64)ty[i] * (b->r->height ? b->r->height : 1) / fr.h) >> b->mip;
@@ -13249,7 +13272,7 @@ static void mad_fg_tile_probe(struct mad_swapchain *s, struct mad_resource *src)
         d3d12_log("[fg-probe] ml1280 dump %ld: the presented frame and %u FidelityFX texture level(s) written to Documents/capture (fgprobe%ld_*)\n",
                   (long)dn, nrb, (long)dn);
     }
-    mad_rb_free(rb, nrb);
+    if (rb) { mad_rb_free(rb, nrb); free(rb); }
     mad_rb_free(&fr, 1);
     for (i = 0; i < nreg; i++) res_Release((ID3D12Resource *)reg[i]);
 }
