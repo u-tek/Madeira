@@ -3596,8 +3596,7 @@ static enum WMTPixelFormat mad_rw_promote_pf(enum WMTPixelFormat pf, UINT *ch) {
     case WMTPixelFormatRG32Float:    *ch = 2; return WMTPixelFormatRGBA32Float;
     case WMTPixelFormatRG32Uint:     *ch = 2; return WMTPixelFormatRGBA32Uint;
     case WMTPixelFormatRG32Sint:     *ch = 2; return WMTPixelFormatRGBA32Sint;
-    case WMTPixelFormatRG11B10Float: *ch = 3; return WMTPixelFormatRGBA16Float;
-    default: return (enum WMTPixelFormat)0;
+    default: return (enum WMTPixelFormat)0;   /* R11G11B10: FidelityFX keeps no UAV in it (log 5c7cf340: only game textures matched) */
     }
 }
 /* ml1279: the DXGI format whose texel layout matches a promoted texture's
@@ -7863,9 +7862,15 @@ static int mad_fidelityfx_caller(void) {
         L"amd_fidelityfx_loader_dx12.dll", L"ffx_backend_dx12_x64.dll", L"ffx_frameinterpolation_x64.dll",
         L"ffx_fsr3_x64.dll", L"ffx_fsr3upscaler_x64.dll", L"ffx_opticalflow_x64.dll",
     };
+    static ULONG_PTR exe_lo, exe_hi;
     volatile ULONG_PTR here = 0;
     ULONG_PTR *p, *end;
     unsigned i;
+    if (!exe_lo) {
+        HMODULE m = GetModuleHandleW(NULL); IMAGE_DOS_HEADER *dh = (IMAGE_DOS_HEADER *)m;
+        IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)((BYTE *)m + dh->e_lfanew);
+        exe_hi = (ULONG_PTR)m + nt->OptionalHeader.SizeOfImage; exe_lo = (ULONG_PTR)m;
+    }
     if (!g_ffx_n) {   /* until one is loaded: they come in when the game turns FSR on */
         unsigned n = 0;
         for (i = 0; i < sizeof names / sizeof names[0]; i++) {
@@ -7879,10 +7884,16 @@ static int mad_fidelityfx_caller(void) {
         if (!n) return 0;
         g_ffx_n = n;
     }
-    p = (ULONG_PTR *)&here; end = mad_stack_scan_end(p, 512);   /* ml1273: never past the stack's top */
-    for (; p < end; p++)
+    /* The NEAREST address in the game executable or a FidelityFX DLL decides:
+     * that is the guest caller. Scanning on past a game address found stale
+     * FidelityFX pointers higher up the stack (log 5c7cf340: the game's small
+     * R11G11B10 UAV textures were promoted and their uploads skipped). */
+    p = (ULONG_PTR *)&here; end = mad_stack_scan_end(p, 1024);   /* ml1273: never past the stack's top */
+    for (; p < end; p++) {
+        if (*p >= exe_lo + 0x1000 && *p < exe_hi) return 0;
         for (i = 0; i < g_ffx_n; i++)
             if (*p >= g_ffx_lo[i] && *p < g_ffx_hi[i]) return 1;
+    }
     return 0;
 }
 static int mad_fg_rw_promote(void) {
