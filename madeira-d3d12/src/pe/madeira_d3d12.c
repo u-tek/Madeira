@@ -1611,7 +1611,7 @@ struct mad_queue {
      * next list of the same ExecuteCommandLists call to continue (see
      * mad_carry_keep). Touched only under submit_lock. */
     struct mad_carry {
-        obj_handle_t renc, cb, vis_buf; UINT64 vis_prev; unsigned seq, f6_cur, natt, nrt; UINT w, h;
+        obj_handle_t renc, cb, vis_buf; UINT64 vis_prev; unsigned seq, f6_cur, natt, nrt; UINT w, h; int retained;
         struct mad_resource *rt[8], *depth, *att[9]; struct mad_rtvp rtp[8], dp;
     } carry;
 };
@@ -1692,6 +1692,7 @@ struct mad_exec {
     UINT64 vis_prev;            /* ml1088: the visibility slot the open encoder was last told to count into, ~0 = disabled */
     obj_handle_t enc_vis_buf;   /* ml1088: the slot chunk attached to the open encoder (a pass attribute) */
     unsigned pass_draws;        /* ml1098: draws encoded into the open render pass */
+    int renc_retained;          /* ml1304: renc carries our own reference (a pass continued across ExecuteCommandLists calls) */
     /* ml1134: fence-chain = 6 */
     int f6_sync_needed;         /* a ResourceBarrier (or the list start) since the last sync point */
     int f6_list_start;          /* the next sync also waits for the device fence (other queue, earlier batch) */
@@ -2119,7 +2120,9 @@ static void exec_end(struct mad_exec *e) {
     e->f7_next_rts = 0;
     if (e->renc) {
         if (g_capture_on) { cn = e->enc_nrt; memcpy(crt, e->enc_rt, sizeof crt); memcpy(crtp, e->enc_rtp, sizeof crtp); cdepth = e->enc_depth; cdp = e->enc_dp; cseq = e->renc_seq; cdraws = e->pass_draws; }
-        MTLCommandEncoder_endEncoding(e->renc); e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0;
+        MTLCommandEncoder_endEncoding(e->renc);
+        if (e->renc_retained) { NSObject_release(e->renc); e->renc_retained = 0; }   /* ml1304 */
+        e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0;
         if (e->q->vis && e->q->vis->dirty) { e->q->vis->next++; e->q->vis->dirty = 0; }   /* ml1088: DXMT's endEncoder */
         e->vis_prev = ~(UINT64)0; e->enc_vis_buf = 0;
         e->pass_draws = 0;
@@ -2585,9 +2588,11 @@ static int exec_barrier_ahead(const struct mad_exec *e) {
  *    come only state, queries and barriers that keep a pass open
  *    (mad_barrier_keeps_pass): no clear, copy, dispatch or resolve.
  * Otherwise the pass is ended first, exactly as at the end of its own list.
- * It never outlives the ExecuteCommandLists call (whose autorelease pool holds
- * the encoder) and is ended before any commit. madeira.cfg pass-carry = 0
- * turns it off. */
+ * It is ended before any commit (Signal, Wait and Present all commit), so it
+ * may also continue into the next ExecuteCommandLists call, holding its own
+ * reference to the encoder past that call's autorelease pool (madeira.cfg
+ * pass-carry-ecl = 0 ends it with its call). madeira.cfg pass-carry = 0 turns
+ * it off. */
 static int g_carry_on = -1;
 static LONG g_carry_kept, g_carry_adopted, g_carry_closed;
 static LONG64 g_carry_bytes;
@@ -2600,6 +2605,15 @@ static int mad_carry_on(void) {
     }
     return g_carry_on;
 }
+static int g_carry_ecl = -1;
+static int mad_carry_ecl_on(void) {
+    if (g_carry_ecl < 0) {
+        g_carry_ecl = mad_cfg_int_pe("pass-carry-ecl", 1) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] ml1304 pass-carry-ecl = %d (%s)\n", g_carry_ecl,
+                  g_carry_ecl ? "a carried pass may continue into the next ExecuteCommandLists call" : "a carried pass ends with its ExecuteCommandLists call");
+    }
+    return g_carry_ecl;
+}
 static void mad_carry_restore(struct mad_exec *e, struct mad_queue *q) {
     struct mad_carry *k = &q->carry;
     e->renc = k->renc; e->renc_seq = k->seq;
@@ -2607,7 +2621,7 @@ static void mad_carry_restore(struct mad_exec *e, struct mad_queue *q) {
     e->enc_depth = k->depth; e->enc_dp = k->dp; e->enc_w = k->w; e->enc_h = k->h;
     e->enc_vis_buf = k->vis_buf; e->vis_prev = k->vis_prev;
     e->f6_cur = k->f6_cur; e->f6_natt = k->natt; memcpy(e->f6_att, k->att, sizeof e->f6_att); e->f6_enc_synced = 1;
-    e->pass_draws = 0;
+    e->pass_draws = 0; e->renc_retained = k->retained;
     memset(k, 0, sizeof *k);
 }
 /* End a carried pass: what exec_end would have done at the end of its list. */
@@ -2616,7 +2630,8 @@ static void mad_carry_close(struct mad_queue *q) {
     if (!q->carry.renc) return;
     e = calloc(1, sizeof *e);
     if (!e) {   /* cannot happen in practice; the encoder must still end before a commit */
-        MTLCommandEncoder_endEncoding(q->carry.renc); memset(&q->carry, 0, sizeof q->carry); return;
+        MTLCommandEncoder_endEncoding(q->carry.renc); if (q->carry.retained) NSObject_release(q->carry.renc);
+        memset(&q->carry, 0, sizeof q->carry); return;
     }
     e->q = q; e->cb = q->carry.cb; e->mode = 6;
     mad_carry_restore(e, q);
@@ -2633,6 +2648,7 @@ static int mad_carry_keep(struct mad_exec *e) {
     k->depth = e->enc_depth; k->dp = e->enc_dp; k->w = e->enc_w; k->h = e->enc_h;
     k->vis_buf = e->enc_vis_buf; k->vis_prev = e->vis_prev;
     k->f6_cur = e->f6_cur; k->natt = e->f6_natt; memcpy(k->att, e->f6_att, sizeof k->att);
+    k->retained = e->renc_retained; e->renc_retained = 0;
     e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0; e->enc_vis_buf = 0; e->vis_prev = ~(UINT64)0;
     InterlockedIncrement(&g_carry_kept);
     return 1;
@@ -5692,7 +5708,10 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
         q->executed++;
         if (q->open_lists >= 48) mad_queue_flush(q);   /* bound the batch */
     }
-    mad_carry_close(q);   /* ml1304: a carried pass never outlives this call (or its autorelease pool) */
+    if (q->carry.renc) {   /* ml1304: the next ExecuteCommandLists may continue the pass; any commit (Signal, Wait, Present) ends it */
+        if (mad_carry_ecl_on() && !q->carry.retained) { NSObject_retain(q->carry.renc); q->carry.retained = 1; }   /* outlive this call's autorelease pool */
+        else if (!q->carry.retained) mad_carry_close(q);
+    }
     if (ml1021_q) LeaveCriticalSection(&ml1021_q->submit_lock);   /* ml1021 */
     if (ml1049_pool) NSObject_release(ml1049_pool);
 }
