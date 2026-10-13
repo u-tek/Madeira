@@ -7926,6 +7926,26 @@ static int mad_fg_tile_probe_on(void) {   /* ml1280: madeira.cfg fg-tile-probe (
     }
     return v;
 }
+/* ml1281: D3D12 HANDS OUT A COMMITTED RESOURCE ZERO-FILLED; METAL DOES NOT.
+ * FidelityFX creates its frame-generation textures "uninitialized" and some of
+ * what it reads is never written first -- on Windows those texels are zero.
+ * Here they held whatever the memory held before, and in a half-float
+ * texture stray bits read as NaN: the black squares of log 3192c14d are NaN
+ * pixels in the interpolated frames only, spread in coarse-mip-sized blocks by
+ * the inpainting pyramid. A render-target or UAV texture created by a
+ * FidelityFX DLL is now zero-filled (every mip and slice) before it is
+ * returned. madeira.cfg fg-zero-init = 0 turns it off. */
+static void mad_zero_texture(struct mad_device *d, struct mad_resource *r);
+static int mad_fg_zero_init(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = mad_cfg_int_pe("fg-zero-init", 1) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] ml1281 fg-zero-init = %d (%s)\n", v,
+                  v ? "FidelityFX's render-target and UAV textures start zero-filled, as committed resources do on Windows"
+                    : "FidelityFX's textures start with whatever their memory held");
+    }
+    return v;
+}
 static int mad_fg_rw_promote(void) {
     static int v = -1;
     if (v < 0) {
@@ -8068,6 +8088,9 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         r->is_depth = is_depth;
         r->has_stencil = (pf == WMTPixelFormatDepth32Float_Stencil8);
         r->samples = ti.sample_count;
+        if ((desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) && !is_depth &&
+            ti.sample_count <= 1 && !r->placed_heap && mad_fg_zero_init() && mad_fidelityfx_caller())
+            mad_zero_texture(d, r);   /* ml1281 */
         if (!r->placed_heap) {   /* ml1057; ml1145: a placed texture costs nothing beyond its heap */
             UINT fb = 0, blk = 1; UINT64 px, bytes;
             mad_format_info(desc->Format, &fb, &blk);
@@ -13154,6 +13177,52 @@ static int mad_rb_black(const struct mad_rb *b, UINT x, UINT y) {   /* rgb all b
 static void mad_rb_free(struct mad_rb *b, unsigned n) {
     unsigned i;
     for (i = 0; i < n; i++) if (b[i].buf) { NSObject_release(b[i].buf); b[i].buf = 0; }
+}
+/* ml1281: zero every mip and slice of a new texture (see mad_fg_zero_init),
+ * from one zeroed shared buffer, and wait: the texture is not handed back
+ * before it is zero. */
+static void mad_zero_texture(struct mad_device *d, struct mad_resource *r) {
+    UINT bpp = mad_rb_bytes((UINT)r->tex_pf), w0 = 0, h0 = 0, d0 = 0, m, sl, n = 0;
+    struct WMTBufferInfo bi; obj_handle_t zb, cb, benc;
+    static LONG said, said_fail;
+    if (!bpp || !r->texture || !d->mtl_queue || r->tex_type == WMTTextureType3D) return;
+    mad_mip_dims(r, 0, &w0, &h0, &d0);
+    if (!w0 || !h0) return;
+    memset(&bi, 0, sizeof bi); bi.length = (UINT64)w0 * h0 * bpp; bi.options = WMTResourceStorageModeShared;
+    zb = MTLDevice_newBuffer(d->mtl_device, &bi);
+    if (!zb || !bi.memory.ptr) {
+        if (zb) NSObject_release(zb);
+        if (InterlockedIncrement(&said_fail) <= 4) d3d12_log("[madeira-d3d12] ml1281 zero-fill of a %ux%u texture: no staging buffer\n", w0, h0);
+        return;
+    }
+    memset(bi.memory.ptr, 0, (size_t)bi.length);
+    cb = MTLCommandQueue_commandBuffer(d->mtl_queue);
+    benc = cb ? MTLCommandBuffer_blitCommandEncoder(cb) : 0;
+    if (benc) {
+        for (m = 0; m < r->tex_mips; m++) {
+            UINT w = 0, h = 0, dd = 0;
+            mad_mip_dims(r, m, &w, &h, &dd);
+            if (!w || !h) continue;
+            for (sl = 0; sl < (r->tex_layers ? r->tex_layers : 1); sl++) {
+                struct wmtcmd_blit_copy_from_buffer_to_texture k;
+                memset(&k, 0, sizeof k);
+                k.type = WMTBlitCommandCopyFromBufferToTexture;
+                k.src = zb; k.src_offset = 0;
+                k.bytes_per_row = w * bpp; k.bytes_per_image = w * bpp * h;
+                k.size.width = w; k.size.height = h; k.size.depth = 1;
+                k.dst = r->texture; k.slice = sl; k.level = m;
+                MTLBlitCommandEncoder_encodeCommands(benc, (const struct wmtcmd_base *)&k);
+                n++;
+            }
+        }
+        MTLCommandEncoder_endEncoding(benc);
+        MTLCommandBuffer_commit(cb);
+        MTLCommandBuffer_waitUntilCompleted(cb);
+    }
+    NSObject_release(zb);
+    if (InterlockedIncrement(&said) <= 32)
+        d3d12_log("[madeira-d3d12] ml1281 FidelityFX texture %ux%u (format %u, %u mips) zero-filled (%u copies)\n",
+                  r->width, r->height, (unsigned)r->desc.Format, r->tex_mips, n);
 }
 static LONG g_probe_n, g_probe_hits, g_probe_dumps, g_probe_parity[2], g_probe_hit_parity[2];
 static void mad_fg_tile_probe(struct mad_swapchain *s, struct mad_resource *src) {
