@@ -581,6 +581,7 @@ struct mad_resource {
      * MTLTextureType2DArray", 6520 reports in one run). Views are cached per
      * (type, levels, slices). */
     enum WMTTextureType tex_type; enum WMTPixelFormat tex_pf; UINT tex_mips, tex_layers; UINT tex_depth;   /* ml924: 3D depth */
+    UINT promo_ch;   /* ml1279: stored in a four-channel format for read-write access; the channel count of the format it stands for (2, 3), else 0 */
     struct mad_xview { UINT type, lvl0, nlvl, sl0, nsl, pf, swz; obj_handle_t tex; UINT64 id; } *xview;
     unsigned nxview, xview_cap;
     UINT64 reserved_bytes;   /* d3d12-tiled-resources: created by CreateReservedResource (fully backed), its tiles x 64 KB */
@@ -1164,7 +1165,10 @@ static UINT64 mad_fence_spin_wait(struct mad_fence *f, UINT64 v) {
  * 2 us after the last, the thread sleeps 500 us before reading the counter.
  * A wait of N ms then costs ~N/64 of a millisecond of CPU and ends at most
  * ~0.5 ms late. Only FidelityFX's modules are patched; the game's own timing
- * is untouched. madeira.cfg fg-qpc-nap = 0 leaves the imports alone. */
+ * is untouched. madeira.cfg fg-qpc-nap = 1 turns it on.
+ * Off by default since log 21f49f16: with it and ml1277 on, the game fell
+ * to 4 fps the moment frame generation started (stuck on its loading
+ * screen); with both off (log 5fb69cee) it ran as in Build 53. */
 #define MAD_QPC_NAP_GAP 48   /* generic-timer ticks: 2 us at 24 MHz */
 struct mad_qpc_slot { volatile DWORD tid; UINT streak; UINT64 last; };
 static struct mad_qpc_slot g_qpc_slot[64];
@@ -1237,7 +1241,7 @@ static void mad_qpc_patch_fidelityfx(void) {
     static int enabled = -1;
     unsigned i, k;
     if (enabled < 0) {
-        enabled = mad_cfg_int_pe("fg-qpc-nap", 1) ? 1 : 0;
+        enabled = mad_cfg_int_pe("fg-qpc-nap", 0) ? 1 : 0;
         p_NtDelayExecution = (mad_delay_fn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtDelayExecution");
     }
     if (!enabled || !p_NtDelayExecution) return;
@@ -1252,7 +1256,7 @@ static void mad_qpc_patch_fidelityfx(void) {
         {
             char nm[64];
             WideCharToMultiByte(CP_UTF8, 0, names[i], -1, nm, sizeof nm, NULL, NULL);
-            d3d12_log("[madeira-d3d12] ml1276 %s: %d QueryPerformanceCounter import(s) now nap in busy-waits (madeira.cfg fg-qpc-nap = 0 turns this off)\n",
+            d3d12_log("[madeira-d3d12] ml1276 %s: %d QueryPerformanceCounter import(s) now nap in busy-waits (madeira.cfg fg-qpc-nap = 0 turns this off again)\n",
                       nm, n);
         }
     }
@@ -3562,16 +3566,55 @@ static enum WMTAttributeFormat mad_attr_format(DXGI_FORMAT f) {
     }
 }
 
-/* ml1278: an R10G10B10A2 texture stored as RGBA16Float (see mad_rgb10a2_as_fp16). */
+/* ml1278: an R10G10B10A2 texture stored as RGBA16Float (see mad_rgb10a2_as_fp16);
+ * ml1279: or a FidelityFX read-write texture stored in a four-channel format
+ * (see mad_rw_promote_pf). */
 static int mad_res_promoted(const struct mad_resource *r) {
+    if (r && r->promo_ch) return 1;
     return r && r->tex_pf == WMTPixelFormatRGBA16Float &&
            (r->desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM || r->desc.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS);
 }
 static void mad_promoted_copy_skip(const char *what, const struct mad_resource *r) {
     static LONG said;
     if (InterlockedIncrement(&said) <= 8)
-        d3d12_log("[madeira-d3d12] ml1278 %s copy skipped: '%s' %ux%u is R10G10B10A2 stored as RGBA16Float and the other side is not\n",
-                  what, r->name ? r->name : "?", r->width, r->height);
+        d3d12_log("[madeira-d3d12] ml1278 %s copy skipped: '%s' %ux%u (format %u) is stored as Metal format %u and the other side is not\n",
+                  what, r->name ? r->name : "?", r->width, r->height, (unsigned)r->desc.Format, (unsigned)r->tex_pf);
+}
+/* ml1279: the four-channel format a read-write texture of format pf is stored
+ * in, and the channel count of pf; 0 when pf is read-write capable as it is.
+ * Metal's read-write textures (tier 2) take RGBA 8/16/32 and R 8/16/32 only,
+ * so a typed UAV load of a two-channel or R11G11B10 texture is undefined.
+ * Unorm/snorm 16 and snorm 8 have no tier-2 four-channel twin and stay. */
+static enum WMTPixelFormat mad_rw_promote_pf(enum WMTPixelFormat pf, UINT *ch) {
+    switch (pf) {
+    case WMTPixelFormatRG8Unorm:     *ch = 2; return WMTPixelFormatRGBA8Unorm;
+    case WMTPixelFormatRG8Uint:      *ch = 2; return WMTPixelFormatRGBA8Uint;
+    case WMTPixelFormatRG8Sint:      *ch = 2; return WMTPixelFormatRGBA8Sint;
+    case WMTPixelFormatRG16Float:    *ch = 2; return WMTPixelFormatRGBA16Float;
+    case WMTPixelFormatRG16Uint:     *ch = 2; return WMTPixelFormatRGBA16Uint;
+    case WMTPixelFormatRG16Sint:     *ch = 2; return WMTPixelFormatRGBA16Sint;
+    case WMTPixelFormatRG32Float:    *ch = 2; return WMTPixelFormatRGBA32Float;
+    case WMTPixelFormatRG32Uint:     *ch = 2; return WMTPixelFormatRGBA32Uint;
+    case WMTPixelFormatRG32Sint:     *ch = 2; return WMTPixelFormatRGBA32Sint;
+    case WMTPixelFormatRG11B10Float: *ch = 3; return WMTPixelFormatRGBA16Float;
+    default: return (enum WMTPixelFormat)0;
+    }
+}
+/* ml1279: the DXGI format whose texel layout matches a promoted texture's
+ * storage, for packing clear values. */
+static DXGI_FORMAT mad_pf_dxgi4(enum WMTPixelFormat pf) {
+    switch (pf) {
+    case WMTPixelFormatRGBA8Unorm:   return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case WMTPixelFormatRGBA8Uint:    return DXGI_FORMAT_R8G8B8A8_UINT;
+    case WMTPixelFormatRGBA8Sint:    return DXGI_FORMAT_R8G8B8A8_SINT;
+    case WMTPixelFormatRGBA16Float:  return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case WMTPixelFormatRGBA16Uint:   return DXGI_FORMAT_R16G16B16A16_UINT;
+    case WMTPixelFormatRGBA16Sint:   return DXGI_FORMAT_R16G16B16A16_SINT;
+    case WMTPixelFormatRGBA32Float:  return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case WMTPixelFormatRGBA32Uint:   return DXGI_FORMAT_R32G32B32A32_UINT;
+    case WMTPixelFormatRGBA32Sint:   return DXGI_FORMAT_R32G32B32A32_SINT;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
 }
 
 static UINT mad_pf_bytes(UINT pf) {
@@ -6820,6 +6863,10 @@ static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, 
     if (!swz) swz = MAD_SWZ_IDENTITY;
     if (!pf || (r->is_depth && pf != WMTPixelFormatX32_Stencil8)) pf = r->tex_pf;   /* depth textures keep their format: sampled as depth; ml1101: unless a stencil view */
     if (pf == WMTPixelFormatRGB10A2Unorm && r->tex_pf == WMTPixelFormatRGBA16Float) pf = r->tex_pf;   /* ml1278: an R10G10B10A2 view of a promoted texture */
+    if (r->promo_ch && pf != r->tex_pf) {   /* ml1279: a view in the format the promoted texture stands for */
+        UINT ch = 0; enum WMTPixelFormat up = mad_rw_promote_pf(pf, &ch);
+        if (up) pf = up;
+    }
     if (nlvl == 0 || nlvl == ~0u || lvl0 + nlvl > r->tex_mips) nlvl = r->tex_mips > lvl0 ? r->tex_mips - lvl0 : 1;
     if (nsl == 0 || nsl == ~0u || sl0 + nsl > r->tex_layers) nsl = r->tex_layers > sl0 ? r->tex_layers - sl0 : 1;
     if (want == r->tex_type && lvl0 == 0 && nlvl == r->tex_mips && sl0 == 0 && nsl == r->tex_layers && pf == r->tex_pf && swz == MAD_SWZ_IDENTITY)
@@ -7793,12 +7840,72 @@ static void mad_placed_fallback(const struct mad_memheap *h, const D3D12_RESOURC
                   desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? "buffer" : "texture", (unsigned long long)desc->Width, desc->Height,
                   (unsigned long long)off, (unsigned long long)(h->desc.SizeInBytes >> 10), (unsigned long long)msz, (unsigned long long)mal);
 }
+/* ml1279: FIDELITYFX READ-WRITE TEXTURES IN READ-WRITE FORMATS. FSR 3 frame
+ * generation and upscaling keep intermediates in two-channel UAV textures --
+ * the disocclusion mask (R8G8_UNORM), the dilated motion vectors
+ * (R16G16_FLOAT), optical-flow vectors (R16G16_SINT) -- and read them back with
+ * typed UAV loads, which Metal defines for none of those formats (see
+ * mad_rw_promote_pf). With frame generation on, black squares came up in
+ * disoccluded areas (logs 92129101 to 5fb69cee), and storing the R10G10B10A2
+ * output as RGBA16F (ml1278) did not remove them. Such a texture created by a
+ * FidelityFX module is stored in the four-channel format of the same type, as
+ * ml1278 does for R10G10B10A2: its views use that format, an SRV reads the
+ * extra channels as 0 and 1, UAV clears pack it, and a copy between it and an
+ * unpromoted texture or a buffer is skipped and logged. Only FidelityFX's own
+ * textures: the caller is found by a return address inside one of its DLLs on
+ * the stack, so the game's textures and copies are untouched. madeira.cfg
+ * fg-rw-promote = 0 turns it off. */
+static ULONG_PTR g_ffx_lo[9], g_ffx_hi[9];
+static unsigned g_ffx_n;
+static int mad_fidelityfx_caller(void) {
+    static const WCHAR *const names[] = {
+        L"amd_fidelityfx_dx12.dll", L"amd_fidelityfx_framegeneration_dx12.dll", L"amd_fidelityfx_upscaler_dx12.dll",
+        L"amd_fidelityfx_loader_dx12.dll", L"ffx_backend_dx12_x64.dll", L"ffx_frameinterpolation_x64.dll",
+        L"ffx_fsr3_x64.dll", L"ffx_fsr3upscaler_x64.dll", L"ffx_opticalflow_x64.dll",
+    };
+    volatile ULONG_PTR here = 0;
+    ULONG_PTR *p, *end;
+    unsigned i;
+    if (!g_ffx_n) {   /* until one is loaded: they come in when the game turns FSR on */
+        unsigned n = 0;
+        for (i = 0; i < sizeof names / sizeof names[0]; i++) {
+            HMODULE m = GetModuleHandleW(names[i]);
+            IMAGE_DOS_HEADER *dh = (IMAGE_DOS_HEADER *)m;
+            IMAGE_NT_HEADERS64 *nt;
+            if (!m || dh->e_magic != IMAGE_DOS_SIGNATURE) continue;
+            nt = (IMAGE_NT_HEADERS64 *)((BYTE *)m + dh->e_lfanew);
+            g_ffx_lo[n] = (ULONG_PTR)m; g_ffx_hi[n] = (ULONG_PTR)m + nt->OptionalHeader.SizeOfImage; n++;
+        }
+        if (!n) return 0;
+        g_ffx_n = n;
+    }
+    p = (ULONG_PTR *)&here; end = mad_stack_scan_end(p, 512);   /* ml1273: never past the stack's top */
+    for (; p < end; p++)
+        for (i = 0; i < g_ffx_n; i++)
+            if (*p >= g_ffx_lo[i] && *p < g_ffx_hi[i]) return 1;
+    return 0;
+}
+static int mad_fg_rw_promote(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = mad_cfg_int_pe("fg-rw-promote", 1) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] ml1279 fg-rw-promote = %d (%s)\n", v,
+                  v ? "FidelityFX's two-channel and R11G11B10 UAV textures are stored as four channels, so typed UAV loads work"
+                    : "FidelityFX's UAV textures keep their own formats");
+    }
+    return v;
+}
+
 /* ml1145: the Metal texture description a D3D12 resource gets. ONE builder for
  * creation and for GetResourceAllocationInfo, so the size the application
  * plans its heap with is the size the placement really takes. */
 static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTTextureInfo *ti, enum WMTPixelFormat *pf, int *is_depth) {
     UINT layers = desc->DepthOrArraySize ? desc->DepthOrArraySize : 1;
     if (!mad_map_texture_format(desc->Format, desc->Flags, pf, is_depth)) return 0;
+    if ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !*is_depth) {   /* ml1279 */
+        UINT ch = 0; enum WMTPixelFormat up = mad_rw_promote_pf(*pf, &ch);
+        if (up && mad_fg_rw_promote() && mad_fidelityfx_caller()) *pf = up;
+    }
     memset(ti, 0, sizeof *ti);
     ti->pixel_format = *pf;
     ti->width = (uint32_t)desc->Width;
@@ -7889,6 +7996,16 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
         r->width = ti.width; r->height = ti.height;
         r->gpu_resource_id = ti.gpu_resource_id;
         r->tex_type = ti.type; r->tex_pf = pf; r->tex_mips = ti.mipmap_level_count;   /* ml913 */
+        {   /* ml1279: stored in a four-channel twin of its format (mad_texinfo_from_desc) */
+            enum WMTPixelFormat npf; int nd = 0; UINT ch = 0;
+            if (!is_depth && mad_map_texture_format(desc->Format, 0, &npf, &nd) && npf != pf && mad_rw_promote_pf(npf, &ch) == pf) {
+                static LONG said;
+                r->promo_ch = ch;
+                if (InterlockedIncrement(&said) <= 24)
+                    d3d12_log("[madeira-d3d12] ml1279 FidelityFX UAV texture %llux%u format %u stored as Metal format %u (was %u)\n",
+                              (unsigned long long)desc->Width, desc->Height, (unsigned)desc->Format, (unsigned)pf, (unsigned)npf);
+            }
+        }
         r->tex_layers = ti.type == WMTTextureType3D ? 1 : ti.array_length;
         r->tex_depth = ti.type == WMTTextureType3D ? ti.depth : 1;   /* ml924 */
         /* ml1053: BASE textures were not in the view map, so every sm5 texture
@@ -9149,6 +9266,8 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
                 UINT sel = (m >> (3 * c)) & 7, v;   /* 0-3 = component, 4 = force 0, 5 = force 1 */
                 v = sel <= 3 ? 2 + sel : sel == 4 ? 0 : 1;
                 if (stencil_view) v = sel == 1 ? 2 : (sel == 3 || sel == 5) ? 1 : 0;   /* G <- Metal's R; the rest 0, A = 1 */
+                /* ml1279: a promoted texture's extra channels read as D3D's missing ones: B = 0, A = 1 */
+                if (r->promo_ch) { if (v == 4 && r->promo_ch < 3) v = 0; else if (v == 5) v = 1; }
                 swz |= v << (8 * c);
             }
             view_id = mad_texture_view_id((struct mad_device *)This, r, want, lvl0, nlvl, sl0, nsl, pf, swz);
@@ -11171,7 +11290,10 @@ static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct 
             d3d12_log("[madeira-d3d12] %s: view %s; clearing the named resource '%s' %ux%u (mip %u, format %u)\n",
                       what, why, u.res->name ? u.res->name : "?", u.res->width, u.res->height, u.level, (unsigned)u.fmt);
     }
-    if (mad_res_promoted(u.res)) {   /* ml1278: stored as RGBA16Float, so the texel is packed as that */
+    if (u.res->promo_ch) {   /* ml1279: packed as the four-channel format it is stored in */
+        DXGI_FORMAT f4 = mad_pf_dxgi4(u.res->tex_pf);
+        bpp = (u.res->samples > 1 || f4 == DXGI_FORMAT_UNKNOWN) ? 0 : mad_pack_clear(f4, v, is_float, px);
+    } else if (mad_res_promoted(u.res)) {   /* ml1278: stored as RGBA16Float, so the texel is packed as that */
         UINT32 fv[4];
         if (is_float) memcpy(fv, v, sizeof fv);
         else {   /* a Uint clear of an R10G10B10A2 view writes each value's low bits: 10, 10, 10, 2 */
@@ -12911,14 +13033,15 @@ static void mad_fg_present(struct mad_swapchain *s, obj_handle_t cb, obj_handle_
  * final, and the blit can go to a second Metal queue that holds nothing else.
  * Checked per present: if the queue's last batch has not finished, the blit
  * takes the normal path. It waits on no MTLFence (fences do not cross queues)
- * and updates none. madeira.cfg fg-present-queue = 0 turns this off. */
+ * and updates none. madeira.cfg fg-present-queue = 1 turns it on; off by
+ * default since log 21f49f16 (see ml1276). */
 static int g_present_direct = -1;
 static LONG64 g_present_direct_n, g_present_direct_miss;
 static obj_handle_t mad_present_cmdbuf(struct mad_swapchain *s, int *direct) {
     struct mad_device *dv = s->queue->device;
     *direct = 0;
     if (g_present_direct < 0) {
-        g_present_direct = mad_cfg_int_pe("fg-present-queue", 1) ? 1 : 0;
+        g_present_direct = mad_cfg_int_pe("fg-present-queue", 0) ? 1 : 0;
         d3d12_log("[madeira-d3d12] ml1277 fg-present-queue = %d (%s)\n", g_present_direct,
                   g_present_direct ? "frame-generation presents whose frame is finished use a second Metal queue"
                                    : "every present waits behind the game's GPU work");

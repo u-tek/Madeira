@@ -374,6 +374,9 @@ static int rewrite_module(Module &m, note_t &note, unsigned *n_rewritten, unsign
 
 }  // namespace
 
+static int rebuild_container(const uint8_t *d, size_t len, uint32_t nparts, const SmallVector<char, 0> &nb, bool ags,
+                             void **out, size_t *out_len);
+
 extern "C" int madeira_ags_rewrite(const void *bc, size_t len, void **out, size_t *out_len,
                                    char *note_buf, size_t note_cap)
 {
@@ -421,10 +424,21 @@ extern "C" int madeira_ags_rewrite(const void *bc, size_t len, void **out, size_
     { raw_svector_ostream os(nb); WriteBitcodeToFile(**mod, os); }
     while (nb.size() & 3) nb.push_back(0);
 
-    /* Rebuild the container: the new DXIL part, SFI0 with the 64-bit atomic
-     * feature bits, PSV0 with the magic resource dropped from its bind table,
-     * everything else as it was except HASH (stale) and the debug/statistics
-     * copies of the old bitcode (ILDB, STAT). */
+    if (!rebuild_container(d, len, nparts, nb, true, out, out_len)) return -1;
+    if (n_used) snprintf(note_buf, note_cap, "rewrote %u AGS 64-bit atomic(s); %u read the old value (Metal cannot return it)", n, n_used);
+    else say(note, "rewrote %s%u AGS 64-bit atomic(s)", "", n);
+    return 1;
+}
+
+/* Rebuild the container around new bitcode: the new DXIL part, everything else
+ * as it was except HASH (stale) and the debug/statistics copies of the old
+ * bitcode (ILDB, STAT). For the AGS rewrite (ags) also SFI0 with the 64-bit
+ * atomic feature bits and PSV0 with the magic resource dropped from its bind
+ * table. Returns 1 with a malloc'd container, 0 when out of memory. */
+static int rebuild_container(const uint8_t *d, size_t len, uint32_t nparts, const SmallVector<char, 0> &nb, bool ags,
+                             void **out, size_t *out_len)
+{
+    (void)len;
     std::vector<std::pair<uint32_t, std::vector<uint8_t>>> parts;
     for (uint32_t i = 0; i < nparts; i++) {
         uint32_t off = rd32(d + 32 + 4 * i), sz = rd32(d + off + 4);
@@ -439,6 +453,8 @@ extern "C" int madeira_ags_rewrite(const void *bc, size_t len, void **out, size_
             wr32(q.data() + 20, (uint32_t)nb.size());
             memcpy(q.data() + 24, nb.data(), nb.size());
             p.swap(q);
+        } else if (!ags) {
+            /* kept as it was */
         } else if (!memcmp(&cc, "SFI0", 4) && p.size() >= 8) {
             uint64_t fl; memcpy(&fl, p.data(), 8); fl |= kSfi0Int64Ops | kSfi0AtomicInt64Typed; memcpy(p.data(), &fl, 8);
         } else if (!memcmp(&cc, "PSV0", 4) && p.size() >= 4) {
@@ -470,7 +486,7 @@ extern "C" int madeira_ags_rewrite(const void *bc, size_t len, void **out, size_
     size_t total = 32 + 4 * parts.size();
     for (auto &p : parts) total += 8 + p.second.size();
     uint8_t *o = (uint8_t *)malloc(total);
-    if (!o) return -1;
+    if (!o) return 0;
     memcpy(o, d, 24);
     memset(o + 4, 0, 16);                     /* digest: the converter does not check it */
     wr32(o + 24, (uint32_t)total);
@@ -484,7 +500,108 @@ extern "C" int madeira_ags_rewrite(const void *bc, size_t len, void **out, size_
         w += 8 + parts[i].second.size();
     }
     *out = o; *out_len = total;
-    if (n_used) snprintf(note_buf, note_cap, "rewrote %u AGS 64-bit atomic(s); %u read the old value (Metal cannot return it)", n, n_used);
-    else say(note, "rewrote %s%u AGS 64-bit atomic(s)", "", n);
+    return 1;
+}
+
+/* ml1279: DEVICE-SCOPE FENCES AT THE BARRIERS OF A globallycoherent SHADER.
+ *
+ * AMD's single-pass downsampler (SPD) -- FSR 3 frame generation's inpainting
+ * pyramid, FSR's luminance pyramid -- has every thread group write its tile of
+ * mip 5 to a globallycoherent UAV, then bump an atomic counter; the group that
+ * bumps it last reads all of mip 5 back and builds the mips below it. The only
+ * barriers in it are GroupMemoryBarrierWithGroupSync (thread-group scope):
+ * D3D12 hardware makes globallycoherent stores visible device-wide before the
+ * atomic in practice. Metal's memory model does not: without a device-scope
+ * fence between the stores and the atomic (and between the atomic and the
+ * reads), the last group can read mip 5 before the other groups' stores reach
+ * it. Frame generation then fills disoccluded areas from coarse mips built from
+ * stale or zero texels, which normalise to 0/0 (FSR's ComputeInpainting divides
+ * by the summed weight) -- black squares the size of a coarse mip texel.
+ *
+ * In a compute shader that declares a globallycoherent UAV, every barrier that
+ * syncs the group or fences group-shared memory also fences UAV memory
+ * globally (dx.op.barrier flag UAVFenceGlobal): GroupMemoryBarrierWithGroupSync
+ * becomes AllMemoryBarrierWithGroupSync, which the converter emits as a
+ * device-scope fence. Other shaders are untouched.
+ *
+ * Returns 1 and a malloc'd container when barriers were strengthened, 0 when
+ * the shader needs nothing (nothing allocated), -1 when its bitcode could not
+ * be read (note says why; the caller keeps the original). */
+namespace {
+constexpr unsigned kOpBarrier = 80;
+constexpr uint64_t kBarrierSync = 1, kBarrierUavGlobal = 2, kBarrierTgsm = 8;   /* DXIL BarrierMode */
+constexpr uint32_t kKindCompute = 5;                                           /* DXIL ShaderKind */
+
+static unsigned strengthen_barriers(Module &m)
+{
+    MDTuple *uavs = uav_list(m);
+    if (!uavs) return 0;
+    bool coherent = false;
+    for (const MDOperand &op : uavs->operands()) {   /* UAV record operand 7: globally coherent */
+        auto *e = dyn_cast_or_null<MDTuple>(op.get());
+        if (!e || e->getNumOperands() < 8) continue;
+        bool ok = true;
+        uint64_t gc = md_int(e->getOperand(7), &ok);
+        if (ok && gc) { coherent = true; break; }
+    }
+    if (!coherent) return 0;
+    unsigned n = 0;
+    for (Function &f : m) {
+        if (!f.isDeclaration() || !f.getName().startswith("dx.op.barrier")) continue;
+        for (User *u : f.users()) {
+            auto *ci = dyn_cast<CallInst>(u);
+            if (!ci || ci->arg_size() < 2 || !is_dx_op(ci, kOpBarrier)) continue;
+            auto *c = dyn_cast<ConstantInt>(ci->getArgOperand(1));
+            if (!c) continue;
+            uint64_t fl = c->getZExtValue();
+            if (!(fl & (kBarrierSync | kBarrierTgsm)) || (fl & kBarrierUavGlobal)) continue;
+            ci->setArgOperand(1, ConstantInt::get(c->getType(), fl | kBarrierUavGlobal));
+            n++;
+        }
+    }
+    return n;
+}
+}  // namespace
+
+extern "C" int madeira_coherent_rewrite(const void *bc, size_t len, void **out, size_t *out_len,
+                                        char *note_buf, size_t note_cap)
+{
+    note_t note{note_buf, note_cap};
+    const uint8_t *d = (const uint8_t *)bc;
+    *out = nullptr; *out_len = 0;
+    if (note_buf && note_cap) note_buf[0] = 0;
+    if (len < 32 || memcmp(d, "DXBC", 4)) return 0;
+    uint32_t nparts = rd32(d + 28);
+    if (32 + 4ull * nparts > len) return 0;
+    const uint8_t *dxil = nullptr; uint32_t dxil_size = 0;
+    for (uint32_t i = 0; i < nparts; i++) {
+        uint32_t off = rd32(d + 32 + 4 * i);
+        if (off + 8 > len) return 0;
+        uint32_t sz = rd32(d + off + 4);
+        if (off + 8ull + sz > len) return 0;
+        if (!memcmp(d + off, "DXIL", 4)) { dxil = d + off + 8; dxil_size = sz; }
+    }
+    if (!dxil || dxil_size < 24) return 0;
+    if ((rd32(dxil) >> 16) != kKindCompute) return 0;   /* program version: kind << 16 | major << 4 | minor */
+    uint32_t bc_off = rd32(dxil + 16), bc_size = rd32(dxil + 20);
+    if (8ull + bc_off + bc_size > dxil_size) return 0;
+
+    LLVMContext ctx;
+    ctx.setOpaquePointers(false);   /* DXIL is typed-pointer IR; keep it that way on the way out */
+    auto mb = MemoryBuffer::getMemBuffer(StringRef((const char *)dxil + 8 + bc_off, bc_size), "dxil", false);
+    auto mod = parseBitcodeFile(mb->getMemBufferRef(), ctx);
+    if (!mod) {
+        std::string err = toString(mod.takeError());
+        say(note, "bitcode reader: %s", err.c_str());
+        return -1;
+    }
+    unsigned n = strengthen_barriers(**mod);
+    if (!n) return 0;
+
+    SmallVector<char, 0> nb;
+    { raw_svector_ostream os(nb); WriteBitcodeToFile(**mod, os); }
+    while (nb.size() & 3) nb.push_back(0);
+    if (!rebuild_container(d, len, nparts, nb, false, out, out_len)) return -1;
+    say(note, "%s%u group barrier(s) now also fence device memory (globallycoherent UAV)", "", n);
     return 1;
 }

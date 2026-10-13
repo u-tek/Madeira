@@ -314,6 +314,9 @@ static void mad_air_entry_name(const unsigned char *b, size_t len, char *out, si
 /* ml1149: madeira_ags.cpp (LLVM 15, plain C++ like the IA resolver). */
 extern "C" int madeira_ags_rewrite(const void *bc, size_t len, void **out, size_t *out_len,
                                    char *note, size_t note_cap);
+/* ml1279: madeira_ags.cpp too -- device-scope fences in globallycoherent compute shaders. */
+extern "C" int madeira_coherent_rewrite(const void *bc, size_t len, void **out, size_t *out_len,
+                                        char *note, size_t note_cap);
 
 extern "C" int madeira_sm5_resolve_ia(const void *bc, size_t bclen,
                                       const struct madeira_ir_input_layout *L,
@@ -1362,6 +1365,14 @@ static int mad_ags_enabled(void)
     return enabled;
 }
 
+/* ml1279: read once; madeira.cfg coherent-barriers = 0 turns the rewrite off. */
+static int mad_coherent_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = madeira_cfg_int("coherent-barriers", 1) ? 1 : 0;
+    return enabled;
+}
+
 /* The converter's compatibility flags: D3D12 guarantees the Metal Shader
  * Converter gives only on request. Each is on by default and can be turned off
  * in madeira.cfg for an A/B run; the DXIL cache keys on the result, so a
@@ -1489,6 +1500,7 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     IRMetalLibBinary *lib = NULL;
     IRShaderReflection *refl = NULL;
     void *ags_buf = NULL;   /* ml1149: rewritten container, borrowed by `input` */
+    void *coh_buf = NULL;   /* ml1279: the same for the coherent-barrier rewrite */
     int status = MADEIRA_IR_COMPILE_FAILED;
     const char *entry = (const char *)(uintptr_t)a->entry_point;
     IRShaderStage stage = IRShaderStageInvalid;
@@ -1519,7 +1531,7 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
         size_t hit_len = 0;
         env.converter_ident = g_ir.ident;
         env.build_stamp = MAD_SC_BUILD;
-        env.ags_rewrite = (uint32_t)mad_ags_enabled();
+        env.ags_rewrite = (uint32_t)mad_ags_enabled() | ((uint32_t)mad_coherent_enabled() << 1);   /* ml1279 */
         env.compat_flags = mad_ir_compat_flags();
         mad_dxc_key(a, &env, &dxc_key, &dxc_check);
         if (dxc_slot) hit = mad_dxc_slot_take(dxc_key, dxc_check, &hit_len);
@@ -1637,8 +1649,21 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
             dprintf(2, "[madeira-ir] ml1149 AGS %s: %s%s\n", nm + 4, note,
                     rc < 0 ? " -- converting the original, which the converter will refuse" : "");
         }
-        input = rc == 1 ? g_ir.IRObjectCreateFromDXIL((const uint8_t *)ags_buf, ags_len, IRBytecodeOwnershipNone)
-                        : g_ir.IRObjectCreateFromDXIL(src, src_len, IRBytecodeOwnershipNone);
+        if (rc == 1) { src = (const uint8_t *)ags_buf; src_len = ags_len; }
+        /* ml1279: device-scope fences at the barriers of a compute shader with a
+         * globallycoherent UAV (FSR's single-pass downsampler, see madeira_ags.cpp). */
+        if (mad_coherent_enabled()) {
+            size_t coh_len = 0;
+            int rc2 = madeira_coherent_rewrite(src, src_len, &coh_buf, &coh_len, note, sizeof note);
+            if (rc2 != 0 && (a->out_buf || dxc_slot)) {
+                char nm[MADEIRA_IR_ENTRY_MAX];
+                mad_air_entry_name((const uint8_t *)(uintptr_t)a->dxil, (size_t)a->dxil_len, nm, sizeof nm);
+                dprintf(2, "[madeira-ir] ml1279 coherent %s: %s%s\n", nm + 4, note,
+                        rc2 < 0 ? " -- converting it unchanged" : "");
+            }
+            if (rc2 == 1) { src = (const uint8_t *)coh_buf; src_len = coh_len; }
+        }
+        input = g_ir.IRObjectCreateFromDXIL(src, src_len, IRBytecodeOwnershipNone);
     }
     if (!input) { status = MADEIRA_IR_BAD_DXIL; goto done; }
 
@@ -1907,6 +1932,7 @@ done:
     free(irr);
     free(irp);
     free(ags_buf);
+    free(coh_buf);
     free(dxc_blob);
     free(lib_bytes);
     free(lib2_bytes);
