@@ -582,6 +582,7 @@ struct mad_resource {
      * (type, levels, slices). */
     enum WMTTextureType tex_type; enum WMTPixelFormat tex_pf; UINT tex_mips, tex_layers; UINT tex_depth;   /* ml924: 3D depth */
     UINT promo_ch;   /* ml1279: stored in a four-channel format for read-write access; the channel count of the format it stands for (2, 3), else 0 */
+    UINT ffx_reg;    /* ml1280: in the FidelityFX texture registry (fg-tile-probe) */
     struct mad_xview { UINT type, lvl0, nlvl, sl0, nsl, pf, swz; obj_handle_t tex; UINT64 id; } *xview;
     unsigned nxview, xview_cap;
     UINT64 reserved_bytes;   /* d3d12-tiled-resources: created by CreateReservedResource (fully backed), its tiles x 64 KB */
@@ -3598,6 +3599,26 @@ static enum WMTPixelFormat mad_rw_promote_pf(enum WMTPixelFormat pf, UINT *ch) {
     case WMTPixelFormatRG32Sint:     *ch = 2; return WMTPixelFormatRGBA32Sint;
     default: return (enum WMTPixelFormat)0;   /* R11G11B10: FidelityFX keeps no UAV in it (log 5c7cf340: only game textures matched) */
     }
+}
+/* ml1280: FidelityFX's UAV textures (made by a FidelityFX DLL), kept while
+ * madeira.cfg fg-tile-probe = 1 so the probe can read them back (see
+ * mad_fg_tile_probe). A resource leaves the list when it is destroyed. */
+#define MAD_FFX_REG 64
+static struct mad_resource *g_ffx_reg[MAD_FFX_REG];
+static SRWLOCK g_ffx_reg_lock = SRWLOCK_INIT;
+static void mad_ffx_reg_add(struct mad_resource *r) {
+    unsigned i;
+    AcquireSRWLockExclusive(&g_ffx_reg_lock);
+    for (i = 0; i < MAD_FFX_REG; i++) if (!g_ffx_reg[i]) { g_ffx_reg[i] = r; r->ffx_reg = 1; break; }
+    ReleaseSRWLockExclusive(&g_ffx_reg_lock);
+}
+static void mad_ffx_reg_del(struct mad_resource *r) {
+    unsigned i;
+    if (!r->ffx_reg) return;
+    AcquireSRWLockExclusive(&g_ffx_reg_lock);
+    for (i = 0; i < MAD_FFX_REG; i++) if (g_ffx_reg[i] == r) g_ffx_reg[i] = NULL;
+    r->ffx_reg = 0;
+    ReleaseSRWLockExclusive(&g_ffx_reg_lock);
 }
 /* ml1279: the DXGI format whose texel layout matches a promoted texture's
  * storage, for packing clear values. */
@@ -7586,6 +7607,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         /* The backend owns the storage, so releasing the buffer is the whole
          * teardown; there is no separate free to order against it. */
         mad_untrack(r->owner, r);
+        mad_ffx_reg_del(r);   /* ml1280 */
         if (r->owner) {   /* ml920: srv_res / uav_res kept freed resources; the residency
                            * loops read r->texture from them, and a longer walk
                            * (ml918 capture) faulted on a partially unmapped one. */
@@ -7896,6 +7918,14 @@ static int mad_fidelityfx_caller(void) {
     }
     return 0;
 }
+static int mad_fg_tile_probe_on(void) {   /* ml1280: madeira.cfg fg-tile-probe (default 0), see mad_fg_tile_probe */
+    static int v = -1;
+    if (v < 0) {
+        v = mad_cfg_int_pe("fg-tile-probe", 0) ? 1 : 0;
+        if (v) d3d12_log("[fg-probe] ml1280 fg-tile-probe = 1: every frame-generation present is read back and searched for black 8x8 tiles\n");
+    }
+    return v;
+}
 static int mad_fg_rw_promote(void) {
     static int v = -1;
     if (v < 0) {
@@ -8016,6 +8046,13 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                     d3d12_log("[madeira-d3d12] ml1279 FidelityFX UAV texture %llux%u format %u stored as Metal format %u (was %u)\n",
                               (unsigned long long)desc->Width, desc->Height, (unsigned)desc->Format, (unsigned)pf, (unsigned)npf);
             }
+        }
+        if ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !is_depth && mad_fg_tile_probe_on() && mad_fidelityfx_caller()) {
+            static LONG said;   /* ml1280 */
+            mad_ffx_reg_add(r);
+            if (InterlockedIncrement(&said) <= 48)
+                d3d12_log("[fg-probe] ml1280 FidelityFX UAV texture %p %llux%u mips %u format %u (Metal %u) registered\n",
+                          (void *)r, (unsigned long long)desc->Width, desc->Height, (unsigned)ti.mipmap_level_count, (unsigned)desc->Format, (unsigned)pf);
         }
         r->tex_layers = ti.type == WMTTextureType3D ? 1 : ti.array_length;
         r->tex_depth = ti.type == WMTTextureType3D ? ti.depth : 1;   /* ml924 */
@@ -13033,6 +13070,189 @@ static void mad_fg_present(struct mad_swapchain *s, obj_handle_t cb, obj_handle_
         d3d12_log("[madeira-d3d12] ml1275 frame-generation pacing: presents %.1f ms apart on average, each shown at least %.1f ms after the last\n",
                   s->pace_avg * 1e3, after * 1e3);
 }
+/* ml1280: FRAME-GENERATION TILE PROBE (madeira.cfg fg-tile-probe = 1).
+ * With FSR 3 frame generation on, solid black blocks flash up in the presented
+ * frames during fast motion: unions of 8x8 tiles on an 8-pixel grid (a screen
+ * recording, log 36bc4a75), so they are in the image, not in the display path.
+ * Each frame-generation present is read back after the GPU has finished it and
+ * searched for 8x8 tiles whose every pixel is black or NaN, inside the middle
+ * 76% of the width (the game's pillarbox bars are black by design). On a hit,
+ * the texels under the first tiles are logged from every FidelityFX UAV texture
+ * of the display's size and from every mip of the half-size inpainting
+ * pyramid; the first madeira.cfg fg-tile-probe-dumps (default 2) hits also
+ * write every FidelityFX texture (mips 0-4) and the presented frame as raw
+ * files to Documents/capture. Costs a GPU wait and a read-back per present. */
+struct mad_rb { obj_handle_t buf; const unsigned char *cpu; UINT w, h, bpp, pf, mip; struct mad_resource *r; };
+static UINT mad_rb_bytes(UINT pf) {
+    switch (pf) {
+    case 10: case 11: case 12: case 13: case 14: return 1;                 /* R8 */
+    case 20: case 22: case 23: case 24: case 25: case 30: case 31: case 32: case 33: case 34: return 2;   /* R16, RG8 */
+    case 53: case 54: case 55: case 60: case 62: case 63: case 64: case 65:
+    case 70: case 71: case 72: case 73: case 74: case 80: case 81: case 90: case 91: case 92: case 93: return 4;
+    case 103: case 104: case 105: case 110: case 112: case 113: case 114: case 115: return 8;
+    case 123: case 124: case 125: return 16;
+    default: return 0;
+    }
+}
+static float mad_h2f(USHORT h) {
+    UINT s = (UINT)(h >> 15) << 31, e = (h >> 10) & 31, m = h & 1023, u; float f;
+    if (!e) { f = (float)m / 16777216.0f; return s ? -f : f; }   /* subnormal: m * 2^-24 */
+    if (e == 31) u = s | 0x7f800000u | (m << 13);
+    else u = s | ((e + 112) << 23) | (m << 13);
+    memcpy(&f, &u, 4);
+    return f;
+}
+static int mad_rb_encode(struct mad_device *d, obj_handle_t benc, struct mad_resource *r, UINT mip, struct mad_rb *out) {
+    UINT w = 0, h = 0, dd = 0, bpp; UINT64 bpr, total;
+    struct WMTBufferInfo bi; struct wmtcmd_blit_copy_from_texture_to_buffer k;
+    memset(out, 0, sizeof *out);
+    if (!r || !r->texture || r->samples > 1 || r->tex_type == WMTTextureType3D || r->is_depth || mip >= r->tex_mips) return 0;
+    bpp = mad_rb_bytes((UINT)r->tex_pf);
+    if (!bpp) return 0;
+    mad_mip_dims(r, mip, &w, &h, &dd);
+    if (!w || !h) return 0;
+    bpr = (UINT64)w * bpp; total = bpr * h;
+    memset(&bi, 0, sizeof bi); bi.length = total; bi.options = WMTResourceStorageModeShared;
+    out->buf = MTLDevice_newBuffer(d->mtl_device, &bi);
+    if (!out->buf || !bi.memory.ptr) { if (out->buf) NSObject_release(out->buf); out->buf = 0; return 0; }
+    memset(&k, 0, sizeof k);
+    k.type = WMTBlitCommandCopyFromTextureToBuffer;
+    k.src = r->texture; k.slice = 0; k.level = mip;
+    k.size.width = w; k.size.height = h; k.size.depth = 1;
+    k.dst = out->buf; k.offset = 0; k.bytes_per_row = (UINT32)bpr; k.bytes_per_image = (UINT32)total; k.options = 0;
+    MTLBlitCommandEncoder_encodeCommands(benc, (const struct wmtcmd_base *)&k);
+    out->cpu = bi.memory.ptr; out->w = w; out->h = h; out->bpp = bpp; out->pf = (UINT)r->tex_pf; out->mip = mip; out->r = r;
+    return 1;
+}
+/* One texel as up to four floats (unknown layouts: raw words as integers). */
+static void mad_rb_texel(const struct mad_rb *b, UINT x, UINT y, float v[4]) {
+    const unsigned char *p; unsigned k;
+    v[0] = v[1] = v[2] = v[3] = 0.0f;
+    if (!b->cpu || x >= b->w || y >= b->h) return;
+    p = b->cpu + ((UINT64)y * b->w + x) * b->bpp;
+    if (b->pf == 115 || b->pf == 65 || b->pf == 25) {   /* RGBA16F, RG16F, R16F */
+        for (k = 0; k < b->bpp / 2 && k < 4; k++) { USHORT hv; memcpy(&hv, p + 2 * k, 2); v[k] = mad_h2f(hv); }
+    } else if (b->pf == 125 || b->pf == 105 || b->pf == 55) {   /* RGBA32F, RG32F, R32F */
+        for (k = 0; k < b->bpp / 4 && k < 4; k++) memcpy(&v[k], p + 4 * k, 4);
+    } else if (b->pf == 70 || b->pf == 80 || b->pf == 10 || b->pf == 30) {   /* unorm 8 */
+        for (k = 0; k < b->bpp && k < 4; k++) v[k] = p[k] / 255.0f;
+    } else if (b->pf == 90) {   /* RGB10A2 */
+        UINT32 u; memcpy(&u, p, 4);
+        v[0] = (u & 1023) / 1023.0f; v[1] = ((u >> 10) & 1023) / 1023.0f; v[2] = ((u >> 20) & 1023) / 1023.0f; v[3] = (u >> 30) / 3.0f;
+    } else {   /* integer formats: the words as they are */
+        UINT n = b->bpp >= 4 ? b->bpp / 4 : 1;
+        for (k = 0; k < n && k < 4; k++) { UINT32 u = 0; memcpy(&u, p + 4 * k, b->bpp >= 4 ? 4 : b->bpp); v[k] = (float)u; }
+    }
+}
+static int mad_rb_black(const struct mad_rb *b, UINT x, UINT y) {   /* rgb all below 1/1024, or any NaN */
+    float v[4]; unsigned k;
+    mad_rb_texel(b, x, y, v);
+    for (k = 0; k < 3; k++) if (v[k] != v[k]) return 1;
+    for (k = 0; k < 3; k++) if (v[k] > (1.0f / 1024.0f) || v[k] < -(1.0f / 1024.0f)) return 0;
+    return 1;
+}
+static void mad_rb_free(struct mad_rb *b, unsigned n) {
+    unsigned i;
+    for (i = 0; i < n; i++) if (b[i].buf) { NSObject_release(b[i].buf); b[i].buf = 0; }
+}
+static LONG g_probe_n, g_probe_hits, g_probe_dumps, g_probe_parity[2], g_probe_hit_parity[2];
+static void mad_fg_tile_probe(struct mad_swapchain *s, struct mad_resource *src) {
+    struct mad_device *d = s->queue->device;
+    struct mad_rb fr, rb[MAD_FFX_REG * 5 + 1];
+    struct mad_resource *reg[MAD_FFX_REG];
+    obj_handle_t cb, benc;
+    unsigned char *cell;
+    UINT cw, ch, x0, x1, cx, cy, i, nreg = 0, nrb = 0, tiles = 0, tx[4], ty[4], nt = 0;
+    LONG n = InterlockedIncrement(&g_probe_n), par = (LONG)(s->presents & 1);
+    static int maxdumps = -1;
+    if (maxdumps < 0) maxdumps = (int)mad_cfg_int_pe("fg-tile-probe-dumps", 2);
+    if (!d->mtl_queue || !src || !src->texture) return;
+    if (d->gpu_event) MTLSharedEvent_waitUntilSignaledValue(d->gpu_event, (UINT64)d->gpu_serial_committed, 1000);
+    cb = MTLCommandQueue_commandBuffer(d->mtl_queue);
+    if (!cb) return;
+    benc = MTLCommandBuffer_blitCommandEncoder(cb);
+    if (!benc) return;
+    mad_rb_encode(d, benc, src, 0, &fr);
+    MTLCommandEncoder_endEncoding(benc);
+    MTLCommandBuffer_commit(cb);
+    MTLCommandBuffer_waitUntilCompleted(cb);
+    if (!fr.cpu) { mad_rb_free(&fr, 1); return; }
+    InterlockedIncrement(&g_probe_parity[par]);
+    /* 4x4 cells, each all black or not; an 8x8 tile on the 4-pixel grid is 2x2 such cells */
+    cw = fr.w / 4; ch = fr.h / 4;
+    cell = calloc((size_t)cw * ch, 1);
+    if (!cell) { mad_rb_free(&fr, 1); return; }
+    x0 = (UINT)(cw * 0.12); x1 = (UINT)(cw * 0.88);
+    for (cy = 1; cy + 1 < ch; cy++)
+        for (cx = x0; cx < x1; cx++) {
+            UINT px, py, all = 1;
+            for (py = 0; py < 4 && all; py++) for (px = 0; px < 4 && all; px++) all = mad_rb_black(&fr, cx * 4 + px, cy * 4 + py);
+            cell[(size_t)cy * cw + cx] = (unsigned char)all;
+        }
+    for (cy = 1; cy + 2 < ch; cy++)
+        for (cx = x0; cx + 1 < x1; cx++)
+            if (cell[(size_t)cy * cw + cx] && cell[(size_t)cy * cw + cx + 1] && cell[(size_t)(cy + 1) * cw + cx] && cell[(size_t)(cy + 1) * cw + cx + 1]) {
+                tiles++;
+                if (nt < 4 && (!nt || (cx * 4 > tx[nt - 1] + 24 || cy * 4 > ty[nt - 1] + 24))) { tx[nt] = cx * 4 + 4; ty[nt] = cy * 4 + 4; nt++; }
+            }
+    free(cell);
+    if (tiles >= 6) { InterlockedIncrement(&g_probe_hits); InterlockedIncrement(&g_probe_hit_parity[par]); }
+    if ((n % 120) == 1 || (tiles >= 6 && g_probe_hits <= 40))
+        d3d12_log("[fg-probe] ml1280 present #%llu (%s): %u black 8x8 tile(s) in %ux%u; so far %ld of %ld probes had >= 6 (even presents %ld/%ld, odd %ld/%ld)\n",
+                  (unsigned long long)s->presents, par ? "odd" : "even", tiles, fr.w, fr.h, (long)g_probe_hits, (long)n,
+                  (long)g_probe_hit_parity[0], (long)g_probe_parity[0], (long)g_probe_hit_parity[1], (long)g_probe_parity[1]);
+    if (tiles < 6 || g_probe_hits > 12) { mad_rb_free(&fr, 1); return; }
+    /* A hit: read back every FidelityFX texture (mips 0-4) after the same frame. */
+    AcquireSRWLockShared(&g_ffx_reg_lock);
+    for (i = 0; i < MAD_FFX_REG; i++)
+        if (g_ffx_reg[i] && g_ffx_reg[i]->refs > 0) { reg[nreg++] = g_ffx_reg[i]; res_AddRef((ID3D12Resource *)g_ffx_reg[i]); }
+    ReleaseSRWLockShared(&g_ffx_reg_lock);
+    cb = MTLCommandQueue_commandBuffer(d->mtl_queue);
+    benc = cb ? MTLCommandBuffer_blitCommandEncoder(cb) : 0;
+    if (benc) {
+        for (i = 0; i < nreg; i++) {
+            UINT m;
+            for (m = 0; m < 5 && m < reg[i]->tex_mips; m++)
+                if (mad_rb_encode(d, benc, reg[i], m, &rb[nrb])) nrb++;
+        }
+        MTLCommandEncoder_endEncoding(benc);
+        MTLCommandBuffer_commit(cb);
+        MTLCommandBuffer_waitUntilCompleted(cb);
+    }
+    for (i = 0; i < nt; i++) {   /* the texels under each tile's centre */
+        UINT j; float v[4];
+        mad_rb_texel(&fr, tx[i], ty[i], v);
+        d3d12_log("[fg-probe] ml1280   tile at (%u,%u): presented %.4g %.4g %.4g %.4g\n", tx[i], ty[i], v[0], v[1], v[2], v[3]);
+        for (j = 0; j < nrb; j++) {
+            const struct mad_rb *b = &rb[j];
+            UINT bx, by;
+            UINT bw0 = b->r->width ? b->r->width : 1;
+            bx = (UINT)((UINT64)tx[i] * bw0 / fr.w) >> b->mip;   /* scaled across the whole display */
+            by = (UINT)((UINT64)ty[i] * (b->r->height ? b->r->height : 1) / fr.h) >> b->mip;
+            mad_rb_texel(b, bx, by, v);
+            d3d12_log("[fg-probe] ml1280     tex %p %ux%u pf%u fmt%u mip %u (%u,%u): %.4g %.4g %.4g %.4g\n",
+                      (void *)b->r, b->r->width, b->r->height, b->pf, (unsigned)b->r->desc.Format, b->mip, bx, by, v[0], v[1], v[2], v[3]);
+        }
+    }
+    if (g_probe_dumps < maxdumps) {   /* raw files, Documents/capture */
+        LONG dn = InterlockedIncrement(&g_probe_dumps);
+        struct madeira_ctl_args a;
+        memset(&a, 0, sizeof a); a.op = 1; a.ptr = (UINT64)(ULONG_PTR)fr.cpu; a.len = (UINT64)fr.w * fr.h * fr.bpp;
+        snprintf(a.name, sizeof a.name, "fgprobe%ld_presented_%ux%u_pf%u.raw", (long)dn, fr.w, fr.h, fr.pf);
+        MadeiraCtl(&a);
+        for (i = 0; i < nrb; i++) {
+            memset(&a, 0, sizeof a); a.op = 1; a.ptr = (UINT64)(ULONG_PTR)rb[i].cpu; a.len = (UINT64)rb[i].w * rb[i].h * rb[i].bpp;
+            snprintf(a.name, sizeof a.name, "fgprobe%ld_tex%02u_%ux%u_m%u_%ux%u_pf%u_dx%u.raw", (long)dn, i, rb[i].r->width, rb[i].r->height,
+                     rb[i].mip, rb[i].w, rb[i].h, rb[i].pf, (unsigned)rb[i].r->desc.Format);
+            MadeiraCtl(&a);
+        }
+        d3d12_log("[fg-probe] ml1280 dump %ld: the presented frame and %u FidelityFX texture level(s) written to Documents/capture (fgprobe%ld_*)\n",
+                  (long)dn, nrb, (long)dn);
+    }
+    mad_rb_free(rb, nrb);
+    mad_rb_free(&fr, 1);
+    for (i = 0; i < nreg; i++) res_Release((ID3D12Resource *)reg[i]);
+}
 /* ml1277: FRAME-GENERATION PRESENTS ON THEIR OWN METAL QUEUE. Every D3D queue
  * feeds one Metal queue, so the present blit of a frame that FSR has already
  * composited still waits behind all the game work committed since (the next
@@ -13155,6 +13375,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
                           (unsigned long long)s->presents, lat, (unsigned long long)need, waits);
         }
     }
+    if (s->pace_fg && mad_fg_tile_probe_on()) mad_fg_tile_probe(s, src);   /* ml1280 */
     if (g_layer_cfg_layer == s->layer && g_layer_cfg_owner != s) {   /* shared layer taken over, see mad_swap_apply_layer */
         static LONG said;
         if (InterlockedIncrement(&said) <= 8)
