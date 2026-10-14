@@ -988,7 +988,7 @@ struct mad_fence {
     UINT64 value;
     volatile LONG64 submitted;   /* ml1061: highest value a queue has been ASKED to signal */
     volatile LONG64 committed;   /* ml1120: highest value whose Signal batch has been COMMITTED to Metal (or signalled on the CPU) */
-    struct { UINT64 value; HANDLE event; LONGLONG t_reg; } waiters[MAD_FENCE_WAITERS];   /* ml1109: t_reg = registration time */
+    struct { UINT64 value; HANDLE event; LONGLONG t_reg; int slot, stage; } waiters[MAD_FENCE_WAITERS];   /* ml1109: t_reg = registration time; ml1318: census slot, stage */
     volatile LONG sig_q;         /* ml1306: 1 + the D3D12 type of the queue that last signalled it (0 = the CPU) */
     struct { UINT64 value, serial; } sigr[2][8]; unsigned sigr_n[2];   /* ml1315: last GPU signals per timeline (main, copy lane), under lock */
     unsigned nwaiters;
@@ -1027,6 +1027,48 @@ static void mad_thread_name(char *nm, int n) {
         WideCharToMultiByte(CP_UTF8, 0, wn, -1, nm, n, NULL, NULL);
         LocalFree(wn);
     }
+}
+/* ml1318: FENCE WAIT CENSUS. In the gameplay of log 29d2bcf0 the game sat
+ * 25-42 ms a frame in fence waits on the direct queue while the GPU was 20-36 %
+ * busy and no thread filled a core: the frame is a chain of waits, not work.
+ * Per waiting thread and fence: how long, and where the waited-for work was
+ * when the wait began -- not yet signalled by the game (stage 0), signalled but
+ * still in this runtime's queue or open command buffer (1), committed to Metal
+ * (2). Stage 1 time is ours to remove. */
+#define MAD_FW_SLOTS 32
+static struct mad_fw { DWORD tid; unsigned ord; volatile LONG n, st_n[3]; volatile LONG64 ticks, st_ticks[3]; char name[24]; } g_fw[MAD_FW_SLOTS];
+static SRWLOCK g_fw_lock = SRWLOCK_INIT;
+static int mad_fw_slot(unsigned ord) {
+    DWORD tid = GetCurrentThreadId();
+    char nm[64];
+    int i, freei = -1;
+    AcquireSRWLockShared(&g_fw_lock);
+    for (i = 0; i < MAD_FW_SLOTS; i++) if (g_fw[i].tid == tid && g_fw[i].ord == ord) break;
+    ReleaseSRWLockShared(&g_fw_lock);
+    if (i < MAD_FW_SLOTS) return i + 1;
+    mad_thread_name(nm, sizeof nm);
+    AcquireSRWLockExclusive(&g_fw_lock);
+    for (i = 0; i < MAD_FW_SLOTS; i++) {
+        if (g_fw[i].tid == tid && g_fw[i].ord == ord) break;
+        if (!g_fw[i].tid && freei < 0) freei = i;
+    }
+    if (i == MAD_FW_SLOTS && freei >= 0) {
+        i = freei; g_fw[i].ord = ord;
+        memcpy(g_fw[i].name, nm, sizeof g_fw[i].name - 1); g_fw[i].name[sizeof g_fw[i].name - 1] = 0;
+        g_fw[i].tid = tid;
+    }
+    ReleaseSRWLockExclusive(&g_fw_lock);
+    return i < MAD_FW_SLOTS ? i + 1 : 0;
+}
+static int mad_fw_stage(const struct mad_fence *f, UINT64 value) {
+    return value > (UINT64)f->submitted ? 0 : value > (UINT64)f->committed ? 1 : 2;
+}
+static void mad_fw_add(int slot, int stage, LONG64 ticks) {
+    struct mad_fw *w;
+    if (slot <= 0 || slot > MAD_FW_SLOTS || stage < 0 || stage > 2) return;
+    w = &g_fw[slot - 1];
+    InterlockedIncrement(&w->n); InterlockedExchangeAdd64(&w->ticks, ticks);
+    InterlockedIncrement(&w->st_n[stage]); InterlockedExchangeAdd64(&w->st_ticks[stage], ticks);
 }
 static void mad_fg_trace(struct mad_fence *f, const char *op, UINT64 value, int queue) {
     char nm[64];
@@ -1073,6 +1115,7 @@ static void fence_set_locked(struct mad_fence *f, UINT64 v) {
             InterlockedExchangeAdd64(&g_perf_wait_ticks, t.QuadPart - f->waiters[i].t_reg);
             { LONG qi = f->sig_q; if (qi < 0 || qi > 4) qi = 0;   /* ml1306 */
               InterlockedIncrement(&g_fw_n[qi]); InterlockedExchangeAdd64(&g_fw_ticks[qi], t.QuadPart - f->waiters[i].t_reg); }
+            mad_fw_add(f->waiters[i].slot, f->waiters[i].stage, t.QuadPart - f->waiters[i].t_reg);   /* ml1318 */
             SetEvent(f->waiters[i].event);
         }
         else f->waiters[w++] = f->waiters[i];
@@ -1353,10 +1396,16 @@ static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence *This, U
          * can make progress. Re-checked in a loop because a condition variable
          * may wake spuriously and because an intervening signal may not have
          * reached our value yet. */
+        int slot = mad_fw_slot(f->ordinal), stage = mad_fw_stage(f, value);   /* ml1318 */
+        LARGE_INTEGER t0, t1;
+        QueryPerformanceCounter(&t0);
         while (f->value < value)
             SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
+        QueryPerformanceCounter(&t1);
+        mad_fw_add(slot, stage, t1.QuadPart - t0.QuadPart);
     } else if (f->nwaiters < MAD_FENCE_WAITERS) {
         { LARGE_INTEGER t; QueryPerformanceCounter(&t); f->waiters[f->nwaiters].t_reg = t.QuadPart; }   /* ml1109 */
+        f->waiters[f->nwaiters].slot = mad_fw_slot(f->ordinal); f->waiters[f->nwaiters].stage = mad_fw_stage(f, value);   /* ml1318 */
         InterlockedIncrement(&g_perf_waits);
         f->waiters[f->nwaiters].value = value;
         f->waiters[f->nwaiters].event = event;
@@ -6435,6 +6484,33 @@ static void mad_perf_present(void) {
                                   (double)lb / g_perf_presents, (double)lw / g_perf_presents, (double)ld / g_perf_presents);
             }
             d3d12_log("%s\n", line);
+        }
+        if (g_perf_presents) {   /* ml1318 */
+            LONG64 tk[MAD_FW_SLOTS]; int idx[6], ni = 0, i, k;
+            char line[1400]; int len;
+            double ms = 1000.0 / (double)fq.QuadPart / g_perf_presents, np = (double)g_perf_presents;
+            for (i = 0; i < MAD_FW_SLOTS; i++) tk[i] = g_fw[i].tid ? g_fw[i].ticks : 0;
+            for (k = 0; k < 6; k++) {
+                int best = -1;
+                for (i = 0; i < MAD_FW_SLOTS; i++) {
+                    int used = 0, m;
+                    for (m = 0; m < ni; m++) if (idx[m] == i) used = 1;
+                    if (!used && tk[i] > 0 && (best < 0 || tk[i] > tk[best])) best = i;
+                }
+                if (best < 0) break;
+                idx[ni++] = best;
+            }
+            len = snprintf(line, sizeof line, "[perf] ml1318 fence waits per frame by thread (not yet signalled / queued in Madeira / on the GPU):");
+            for (k = 0; k < ni; k++) {
+                struct mad_fw *w = &g_fw[idx[k]];
+                len += snprintf(line + len, sizeof line - len, " '%s' #%u %.1fx %.1f ms (%.1f/%.1f/%.1f);", w->name, w->ord,
+                                w->n / np, w->ticks * ms, w->st_ticks[0] * ms, w->st_ticks[1] * ms, w->st_ticks[2] * ms);
+            }
+            if (ni) d3d12_log("%s\n", line);
+            for (i = 0; i < MAD_FW_SLOTS; i++) {
+                InterlockedExchange(&g_fw[i].n, 0); InterlockedExchange64(&g_fw[i].ticks, 0);
+                for (k = 0; k < 3; k++) { InterlockedExchange(&g_fw[i].st_n[k], 0); InterlockedExchange64(&g_fw[i].st_ticks[k], 0); }
+            }
         }
         {   /* ml1317 */
             LONG rd = InterlockedExchange(&g_reset_detached, 0), rw = InterlockedExchange(&g_reset_waited, 0);
