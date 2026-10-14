@@ -4680,7 +4680,13 @@ static struct wmtcmd_base *mad_rfilter(struct mad_exec *e, struct wmtcmd_base *h
     return (struct wmtcmd_base *)anchor.next.ptr;
 }
 
+/* ml1313: where the replay worker's time per draw goes, sampled on 1 draw in
+ * 32: building the draw (bindings, argument slot, residency, pass changes) vs
+ * the Metal encoder calls (the encodeCommands unix call). */
+static unsigned g_dc_seq;
+static LONG64 g_dc_n, g_dc_prep, g_dc_mtl;
 static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
+    LONG64 dc_t0 = (++g_dc_seq & 31) == 0 ? mad_qpc() : 0, dc_t1 = 0;   /* ml1313 */
     struct wmtcmd_render_setpso c_pso;
     struct wmtcmd_render_draw_indirect c_di;
     struct wmtcmd_render_setblendcolor c_bl;
@@ -5189,13 +5195,19 @@ tess_go:
             e->vis_prev = want;
             tail->next.ptr = NULL;
             c_vis.next.ptr = mad_rfilter(e, (struct wmtcmd_base *)&c_pso);   /* ml1310 */
+            if (dc_t0) dc_t1 = mad_qpc();   /* ml1313 */
             MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&c_vis);
         } else {
             tail->next.ptr = NULL;
             {   /* ml1310 */
                 const struct wmtcmd_base *h = mad_rfilter(e, (struct wmtcmd_base *)&c_pso);
+                if (dc_t0) dc_t1 = mad_qpc();   /* ml1313 */
                 if (h) MTLRenderCommandEncoder_encodeCommands(e->renc, h);
             }
+        }
+        if (dc_t0) {   /* ml1313 */
+            LONG64 dc_t2 = mad_qpc();
+            InterlockedIncrement64(&g_dc_n); InterlockedExchangeAdd64(&g_dc_prep, dc_t1 - dc_t0); InterlockedExchangeAdd64(&g_dc_mtl, dc_t2 - dc_t1);
         }
         if (want != ~(UINT64)0) v->dirty = 1;
     }
@@ -6114,6 +6126,12 @@ static void mad_perf_present(void) {
                   g_perf_presents ? 1000.0 * g_perf_wait_ticks / (double)fq.QuadPart / g_perf_presents : 0.0, 100.0 * g_perf_wait_ticks / (double)fq.QuadPart / wall,
                   g_perf_presents ? (double)g_perf_polls / g_perf_presents : 0.0, g_perf_presents ? (double)g_perf_qwait_sleeps / g_perf_presents : 0.0,
                   g_perf_sig_lat_n ? 1000.0 * g_perf_sig_lat_ticks / (double)fq.QuadPart / g_perf_sig_lat_n : 0.0, g_perf_sig_lat_n);
+        {   /* ml1313 */
+            LONG64 dn = InterlockedExchange64(&g_dc_n, 0), dp = InterlockedExchange64(&g_dc_prep, 0), dm = InterlockedExchange64(&g_dc_mtl, 0);
+            if (dn)
+                d3d12_log("[perf] ml1313 draw encode (1 in 32 sampled): %.2f us building, %.2f us in Metal calls per draw\n",
+                          1e6 * dp / (double)fq.QuadPart / dn, 1e6 * dm / (double)fq.QuadPart / dn);
+        }
         {   /* ml1306 */
             static const char *const qn[5] = { "CPU", "direct", "bundle", "compute", "copy" };
             char line[1024]; int n = 0, k;
