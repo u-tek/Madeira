@@ -1284,43 +1284,4 @@ out:
     return (ret == KERN_SUCCESS);
 }
 
-#ifdef WINE_IOS
-/* The replacement thread_policy_ios.h points server/thread.c's
- * thread_policy_set calls at. The latency, throughput, extended and
- * precedence flavors would each remove the guest thread's QoS class first,
- * and with it the USER_INTERACTIVE class that keeps the game on the
- * performance cores, so they are dropped. A realtime-class thread's time
- * constraint still goes through. Checked once:
- * madeira.cfg wine-thread-policy = 1 applies every flavor, as Wine does. */
-#undef thread_policy_set
-extern kern_return_t thread_policy_set( thread_act_t thread, thread_policy_flavor_t flavor,
-                                        thread_policy_t policy_info, mach_msg_type_number_t count );
-
-kern_return_t madeira_server_thread_policy_set( thread_act_t thread, thread_policy_flavor_t flavor,
-                                                thread_policy_t policy_info, mach_msg_type_number_t count )
-{
-    static int wine_policy = -1;
-
-    if (wine_policy < 0)
-    {
-        wine_policy = madeira_cfg_bool( "wine-thread-policy", 0 );   /* madeira.cfg wine-thread-policy = 1 */
-        fprintf( stderr, "[thread-policy] Windows thread priorities %s\n",
-                 wine_policy ? "set Mach policies (wine-thread-policy = 1): guest threads lose their QoS class"
-                             : "leave guest threads' QoS class alone" );
-    }
-    if (!wine_policy)
-    {
-        switch (flavor)
-        {
-        case THREAD_LATENCY_QOS_POLICY:
-        case THREAD_THROUGHPUT_QOS_POLICY:
-        case THREAD_EXTENDED_POLICY:
-        case THREAD_PRECEDENCE_POLICY:
-            return KERN_SUCCESS;
-        }
-    }
-    return thread_policy_set( thread, flavor, policy_info, count );
-}
-#endif  /* WINE_IOS */
-
 #endif  /* USE_MACH */
