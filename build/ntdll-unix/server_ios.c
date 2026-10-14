@@ -1134,6 +1134,22 @@ struct ios_xp_tcd { uint64_t instr, cyc, ut, st, nj; };
 struct ios_xp_tc { uint16_t len, r0; uint32_t r1; struct ios_xp_tcd c[4]; };
 struct ios_xp_prev { uint64_t tid; uint32_t gen; struct ios_xp_tcd c[2]; };
 struct ios_xp_row { uint64_t tid; uint32_t wtid; double p_ms, e_ms, p_ghz, e_ghz, minst; const char *role; };
+/* ml1312: a host thread's name (PROC_PIDTHREADID64INFO's proc_threadinfo), so
+ * [xp-t] says WHICH host thread an "m<tid>" is -- the main thread, the
+ * wineserver, Metal's completion and compiler threads -- instead of a number. */
+struct ios_xp_thinfo { uint64_t user, sys; int32_t cpu, policy, run_state, flags, sleep_time, curpri, priority, maxpriority; char name[64]; };
+static const char *ios_xp_thname( uint64_t tid, char *buf, size_t len )
+{
+    struct ios_xp_thinfo ti;
+    size_t i;
+    buf[0] = 0;
+    memset( &ti, 0, sizeof(ti) );
+    if (proc_pidinfo( getpid(), 15 /* PROC_PIDTHREADID64INFO */, tid, &ti, sizeof(ti) ) < (int)sizeof(ti)) return buf;
+    for (i = 0; i + 1 < len && i < sizeof(ti.name) && ti.name[i]; i++)
+        buf[i] = (ti.name[i] == ' ' || ti.name[i] == ':' || ti.name[i] == '/') ? '_' : ti.name[i];
+    buf[i] = 0;
+    return buf;
+}
 static struct ios_xp_prev ios_xp_tab[2048];
 
 /* ml1131: [xp-api] REPORTER (measurement only). Once a second, from the xprobe
@@ -1617,8 +1633,13 @@ static void ios_xprobe_main( void )
                         n += snprintf( line + n, sizeof(line) - n, " -%04x:%.0f/%.0f:%.1f/%.1f:%.0f", rows[best].wtid,
                                        rows[best].p_ms, rows[best].e_ms, rows[best].p_ghz, rows[best].e_ghz, rows[best].minst );
                     else
-                        n += snprintf( line + n, sizeof(line) - n, " m%llu:%.0f/%.0f:%.1f/%.1f:%.0f", (unsigned long long)rows[best].tid,
+                    {
+                        char nm[28];   /* ml1312 */
+                        ios_xp_thname( rows[best].tid, nm, sizeof(nm) );
+                        n += snprintf( line + n, sizeof(line) - n, " m%llu%s%s%s:%.0f/%.0f:%.1f/%.1f:%.0f", (unsigned long long)rows[best].tid,
+                                       nm[0] ? "(" : "", nm, nm[0] ? ")" : "",
                                        rows[best].p_ms, rows[best].e_ms, rows[best].p_ghz, rows[best].e_ghz, rows[best].minst );
+                    }
                 }
                 wine_log_write( "%s", line );
             }
