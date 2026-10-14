@@ -127,5 +127,7 @@ extern unsigned long madeira_early_pool_base;     /* pool placeholder next to th
 extern unsigned long madeira_early_intruder_base, madeira_early_intruder_size;   /* ml1135: first mapping above the window when no placeholder fit */
 extern unsigned madeira_early_intruder_tag, madeira_early_intruder_prot;
 extern unsigned long madeira_early_pool_size;
+extern unsigned long madeira_early_jit2_base;     /* jit2-hold: placeholder for the second code region, released by StikJITHelper, else 0 */
+extern unsigned long madeira_early_jit2_size;
 
 #endif // JIT_ALLOCATOR_H

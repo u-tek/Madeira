@@ -802,9 +802,23 @@ enum StikJITHelper {
         // alias must sit at exactly the pool's RX->RW offset. First-fit puts it in the free
         // block above the executable window. Anything else and it is given back: Madeira
         // then runs as without it. ntdll reads WINE_IOS_JIT2_RX / WINE_IOS_JIT2_SIZE.
+        // jit2-hold: that block has been held since image load (madeira_early_va_claim,
+        // JITAllocator.c) so the app's own allocations could not shrink it; release it
+        // now, the next allocation of this size is the debugger's.
+        if madeira_early_jit2_size != 0 {
+            vm_deallocate(mach_task_self_, vm_address_t(madeira_early_jit2_base), vm_size_t(madeira_early_jit2_size))
+            LogStore.shared.log(String(format: "[jit2] jit2-hold: released 0x%lx+%luMB, held since image load, for the code region",
+                                       Int(madeira_early_jit2_base), Int(madeira_early_jit2_size >> 20)))
+            madeira_early_jit2_base = 0
+            madeira_early_jit2_size = 0
+        }
         if MadeiraConfig.flag("MADEIRA_JIT_CODE_REGION", fallback: false) {
             let delta = Int(rwAddr) - Int(rxAddrV)
             let poolEnd = Int(rxAddrV) + poolSize
+            // A block whose RW alias was refused stays mapped until the loop ends, so
+            // first-fit puts the next size somewhere else instead of in the same place.
+            var jit2Plugs: [(vm_address_t, vm_size_t)] = []
+            defer { for (a, sz) in jit2Plugs { vm_deallocate(mach_task_self_, a, sz) } }
             for mb in [192, 160, 128, 96, 64] {
                 let sz = mb << 20
                 guard let p2 = jit26_prepare_region(nil, sz), p2 != UnsafeMutableRawPointer(bitPattern: 0) else {
@@ -835,11 +849,11 @@ enum StikJITHelper {
                 let krm = vm_remap(mach_task_self_, &rw2, vm_size_t(sz), 0, 0 /* VM_FLAGS_FIXED */,
                                    mach_task_self_, vm_address_t(a2), 0, &cur2, &max2, VM_INHERIT_NONE)
                 if krm != KERN_SUCCESS || rw2 != vm_address_t(a2 + delta) {
-                    LogStore.shared.log(String(format: "[jit2] RW alias at 0x%lx refused (kr=%d); code region given back",
+                    LogStore.shared.log(String(format: "[jit2] RW alias at 0x%lx refused (kr=%d); trying the next size elsewhere",
                                                a2 + delta, krm), level: .error)
                     if krm == KERN_SUCCESS { vm_deallocate(mach_task_self_, rw2, vm_size_t(sz)) }
-                    vm_deallocate(mach_task_self_, vm_address_t(a2), vm_size_t(sz))
-                    break
+                    jit2Plugs.append((vm_address_t(a2), vm_size_t(sz)))
+                    continue
                 }
                 if vm_protect(mach_task_self_, rw2, vm_size_t(sz), 0, VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS {
                     LogStore.shared.log("[jit2] RW alias could not be made writable; code region given back", level: .error)
