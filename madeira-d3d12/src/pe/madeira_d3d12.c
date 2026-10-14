@@ -480,6 +480,7 @@ static LONG g_perf_ecl, g_perf_signals, g_perf_waits, g_perf_polls, g_perf_qwait
  * Metal queue, so a wait for a copy or compute queue's fence also waits for all
  * the graphics work committed before it -- which is what this measures. */
 static LONG g_fw_n[5]; static LONGLONG g_fw_ticks[5];
+static LONG g_q_ecl[5], g_q_sig[5], g_q_commit[5];   /* ml1306: per queue type (1 + D3D12 type): ExecuteCommandLists, Signals, command buffers committed */
 #define MAD_SKIP(e_) (mad_skip_at(__LINE__), (e_)->skipped++)
 static void mad_skip_report(void) {
     char buf[1400]; int n = 0; unsigned i;
@@ -5654,7 +5655,17 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     }
 }
 
-static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t cb) {
+/* ml1311: LISTS OF ONE ExecuteCommandLists OVERLAP (madeira.cfg
+ * f6-list-overlap = 1, experimental). D3D12 orders successive
+ * ExecuteCommandLists calls on a queue -- the first finishes before the
+ * second starts -- but lists submitted together may overlap, and any hazard
+ * between them is the application's to cover with a barrier (which syncs
+ * here). In mode 6 every list began with a full sync all the same: ~31 lists
+ * in ~4 calls a frame in Stellar Blade, so ~27 GPU drains a frame D3D12 does
+ * not ask for. With the switch on, only the first list of a call (or of a new
+ * command buffer) starts with one. */
+static int g_list_overlap = -1;
+static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t cb, int first) {
     g_list_seq++;
     struct mad_exec e;
     unsigned i;
@@ -5662,6 +5673,13 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     e.fence_needed = 1;   /* ml1111: the first encoder of a list waits for whatever ran before it */
     e.f6_sync_needed = 1; e.f6_list_start = 1;   /* ml1134: and, in mode 6, for the device fence too */
     e.mode = mad_fence_mode(q->device);          /* ml1136: fixed for the whole list */
+    if (g_list_overlap < 0) {
+        g_list_overlap = mad_cfg_int_pe("f6-list-overlap", 0) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] ml1311 f6-list-overlap = %d (%s)\n", g_list_overlap,
+                  g_list_overlap ? "only the first command list of an ExecuteCommandLists call starts with a full sync"
+                                 : "every command list starts with a full sync");
+    }
+    if (!first && e.mode == 6 && g_list_overlap) { e.f6_sync_needed = 0; e.f6_list_start = 0; }   /* ml1311 */
     e.f7_reason = 2;                             /* ml1137: list start */
     e.q = q; e.l = l; e.cb = cb;
     e.vis_prev = ~(UINT64)0;   /* ml1088 */
@@ -5854,6 +5872,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
     if (ml1021_q) EnterCriticalSection(&ml1021_q->submit_lock);
 
     struct mad_queue *q = (struct mad_queue *)This;
+    int ecl_first = 1;   /* ml1311 */
     mad_prebuild_lists(count, lists);   /* lazy pipelines this batch binds, built in parallel */
     for (UINT i = 0; i < count; i++) {
         struct mad_list *l = (struct mad_list *)lists[i];
@@ -5873,13 +5892,14 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
             if (q->device->resset && InterlockedExchange(&q->device->resset_dirty, 0))
                 MTLResidencySet_commit(q->device->resset);
             mad_queue_revive(q->device);   /* ml1067 */
+            ecl_first = 1;   /* ml1311: a new command buffer starts with a full sync */
             q->open_cb = MTLCommandQueue_commandBuffer(q->device->mtl_queue);
             if (!q->open_cb) { d3d12_log("[madeira-d3d12] no command buffer\n"); q->rejected++; continue; }
             /* commandBuffer returns an AUTORELEASED object locally and an interned
              * one remotely; holding it across calls means taking our own reference. */
             NSObject_retain(q->open_cb);
         }
-        if (l) mad_exec_list(q, l, q->open_cb);
+        if (l) { mad_exec_list(q, l, q->open_cb, ecl_first); ecl_first = 0; }   /* ml1311 */
         q->open_lists++;
         q->executed++;
         if (q->open_lists >= 48) mad_queue_flush(q);   /* bound the batch */
@@ -5916,6 +5936,7 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(ID3D12CommandQueue *This
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);   /* ml1119: caller-thread time in here */
     InterlockedIncrement(&g_perf_ecl);   /* ml1109 */
+    if (q && (UINT)q->type < 4) InterlockedIncrement(&g_q_ecl[1 + q->type]);   /* ml1306 */
     mad_xp_role('E'); InterlockedIncrement64(&g_xp.ecl_calls);   /* ml1128 */
     if (q && q->sub_thread) {   /* ml1120: validate here, replay on the worker */
         struct mad_subjob *j = calloc(1, sizeof *j + (count ? count : 1) * sizeof(struct mad_list *));
@@ -6095,13 +6116,20 @@ static void mad_perf_present(void) {
                   g_perf_sig_lat_n ? 1000.0 * g_perf_sig_lat_ticks / (double)fq.QuadPart / g_perf_sig_lat_n : 0.0, g_perf_sig_lat_n);
         {   /* ml1306 */
             static const char *const qn[5] = { "CPU", "direct", "bundle", "compute", "copy" };
-            char line[400]; int n = 0, k;
+            char line[1024]; int n = 0, k;
             n += snprintf(line + n, sizeof line - n, "[perf] ml1306 fence waits per frame by signalling queue:");
             for (k = 0; k < 5; k++) {
                 LONG c = InterlockedExchange(&g_fw_n[k], 0); LONGLONG t = InterlockedExchange64(&g_fw_ticks[k], 0);
                 if (c && g_perf_presents)
                     n += snprintf(line + n, sizeof line - n, " %s %.1f (%.1f ms)", qn[k], (double)c / g_perf_presents,
                                   1000.0 * t / (double)fq.QuadPart / g_perf_presents);
+            }
+            n += snprintf(line + n, sizeof line - n, "; ExecuteCommandLists/Signals/commits per frame:");
+            for (k = 1; k < 5; k++) {
+                LONG a = InterlockedExchange(&g_q_ecl[k], 0), b = InterlockedExchange(&g_q_sig[k], 0), cc = InterlockedExchange(&g_q_commit[k], 0);
+                if ((a || b || cc) && g_perf_presents)
+                    n += snprintf(line + n, sizeof line - n, " %s %.1f/%.1f/%.1f", qn[k], (double)a / g_perf_presents,
+                                  (double)b / g_perf_presents, (double)cc / g_perf_presents);
             }
             d3d12_log("%s\n", line);
         }
@@ -6184,6 +6212,7 @@ static void mad_queue_flush(struct mad_queue *q) {
         q->batch_serial[(q->batches + 1) & 63] = serial;
     }
     q->pending[q->npending++] = q->open_cb;      /* the reference taken at open moves here */
+    if ((UINT)q->type < 4) InterlockedIncrement(&g_q_commit[1 + q->type]);   /* ml1306 */
     q->open_cb = 0; q->open_lists = 0; q->batches++;
     if (q->batches <= 3 || (q->batches % 500) == 0)
         d3d12_log("[madeira-d3d12] batch #%llu committed (%llu lists so far)\n",
@@ -6374,6 +6403,7 @@ static HRESULT STDMETHODCALLTYPE queue_Signal(ID3D12CommandQueue *This, ID3D12Fe
 static HRESULT mad_signal_run(struct mad_queue *q, ID3D12Fence *fence, UINT64 value) {
     mad_queue_flush(q);                              /* ml884: commit the batch this signal covers */
     InterlockedIncrement(&g_perf_signals);           /* ml1109 */
+    if ((UINT)q->type < 4) InterlockedIncrement(&g_q_sig[1 + q->type]);   /* ml1306 */
     if (mad_signal_async(q, fence, value)) { mad_fence_committed((struct mad_fence *)fence, value); return S_OK; }
     /* The fence must not advance until the work submitted before it has
      * actually finished on the GPU. Signalling at submission time would make
