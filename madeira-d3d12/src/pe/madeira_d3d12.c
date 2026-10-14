@@ -126,6 +126,25 @@ void madeira_d3d12_note_unimplemented(const char *iface, const char *method) {
  * matched to the draw that caused it. */
 static char g_last_entry[64];
 static struct mad_device *g_last_device;   /* ml887: GetDevice fallback for children without a back pointer */
+/* ml1315: COPY LANE. Every D3D12 queue fed ONE Metal queue and ONE GPU timeline,
+ * and with fence-chain 6 every batch also waits for the device fence that the
+ * batches before it moved: a streaming upload on the copy queue ran only after
+ * all the graphics work committed before it, and its fence (which the game
+ * waits on, GPU idle meanwhile) advanced only after that. In the dips of log
+ * b5825805 the GPU was 43-53% busy at 19 fps while the game sat blocked on
+ * fences 23-33 ms a frame, with ~3 more ExecuteCommandLists and ~6 more Signals
+ * a frame than in smooth play. With madeira.cfg copy-lane = 1 (and
+ * async-submit = 1) COPY queues get their own Metal queue, shared event,
+ * serials, device fence and fence worker; a Queue::Wait on a fence the other
+ * timeline signals becomes a GPU wait on that timeline's event (each fence
+ * keeps its last 8 signals per timeline). */
+struct mad_lane {
+    obj_handle_t queue, event, fence;
+    CRITICAL_SECTION lock;
+    volatile LONG64 serial, committed, failed;
+    struct mad_fence_job *jobs; unsigned njobs, jobs_cap;
+    HANDLE wake, thread; volatile LONG quit;
+};
 static unsigned g_enc_seq, g_list_seq, g_dump_draws;
 /* ml1070: RENDER-PASS CENSUS. The Metal HUD shows 27-40 ms of GPU time per frame
  * in the heavy benchmark scenes and 48-76 ms in the first cutscene, at 960x540.
@@ -283,6 +302,7 @@ struct mad_device {
     unsigned nfence_jobs, fence_jobs_cap;
     HANDLE fence_wake, fence_thread;
     volatile LONG fence_quit;   /* ml1064: device teardown stops the worker */
+    struct mad_lane *lane;      /* ml1315: the copy lane (madeira.cfg copy-lane = 1), NULL otherwise */
     volatile LONG queue_poisoned; LONG queues_recreated;   /* ml1067: driver is ignoring our submissions */
     /* ml1072: SMALL-TEXTURE SUB-ALLOCATOR. 12-15k sampled textures averaging ~22 KB
      * each were individual driver allocations (page-granular, plus per-allocation
@@ -484,6 +504,7 @@ static LONG g_perf_ecl, g_perf_signals, g_perf_waits, g_perf_polls, g_perf_qwait
  * Metal queue, so a wait for a copy or compute queue's fence also waits for all
  * the graphics work committed before it -- which is what this measures. */
 static LONG g_fw_n[5]; static LONGLONG g_fw_ticks[5];
+static LONG g_lane_batches, g_lane_waits, g_lane_waits_done;   /* ml1315: copy-lane batches; GPU waits encoded across timelines; waits found already met */
 static LONG g_q_ecl[5], g_q_sig[5], g_q_commit[5];   /* ml1306: per queue type (1 + D3D12 type): ExecuteCommandLists, Signals, command buffers committed */
 #define MAD_SKIP(e_) (mad_skip_at(__LINE__), (e_)->skipped++)
 static void mad_skip_report(void) {
@@ -969,6 +990,7 @@ struct mad_fence {
     volatile LONG64 committed;   /* ml1120: highest value whose Signal batch has been COMMITTED to Metal (or signalled on the CPU) */
     struct { UINT64 value; HANDLE event; LONGLONG t_reg; } waiters[MAD_FENCE_WAITERS];   /* ml1109: t_reg = registration time */
     volatile LONG sig_q;         /* ml1306: 1 + the D3D12 type of the queue that last signalled it (0 = the CPU) */
+    struct { UINT64 value, serial; } sigr[2][8]; unsigned sigr_n[2];   /* ml1315: last GPU signals per timeline (main, copy lane), under lock */
     unsigned nwaiters;
     /* ml1270 (frame-generation diagnostics): creation order, GetCompletedValue
      * polls since the value last changed, and how many further operations on
@@ -1623,6 +1645,7 @@ struct mad_queue {
         obj_handle_t renc, cb, vis_buf; UINT64 vis_prev; unsigned seq, f6_cur, natt, nrt; UINT w, h; int retained; UINT8 dro;
         struct mad_resource *rt[8], *depth, *att[9]; struct mad_rtvp rtp[8], dp;
     } carry;
+    int lane;   /* ml1315: this queue runs on the copy lane */
 };
 
 static HRESULT mad_queue_dxgi_tearoff(struct mad_queue *q, void **out);
@@ -1827,6 +1850,14 @@ static void exec_note_write(struct mad_exec *e, struct mad_resource *r) {   /* m
  *    at commit that waits for everything pending, so "the device fence
  *    passed" still means "every earlier batch finished", as in mode 1. The
  *    Present blit waits for it too. */
+/* ml1315: the device fence and the Metal queue of the timeline q runs on. */
+static obj_handle_t mad_q_dfence(struct mad_queue *q) {
+    if (q->lane && q->device->lane) return q->device->lane->fence;
+    return mad_enc_fence_obj(q->device);
+}
+static obj_handle_t mad_q_mtl(struct mad_queue *q) {
+    return (q->lane && q->device->lane) ? q->device->lane->queue : q->device->mtl_queue;
+}
 enum { F6_RENDER, F6_BLIT, F6_COMPUTE };
 static int g_f6_compute_open = -1;
 union f6_op { struct wmtcmd_render_fence_op r; struct wmtcmd_blit_fence_op b; struct wmtcmd_compute_fence_op c; };
@@ -1913,7 +1944,10 @@ static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
                       g_f6_frag_wait ? "a render pass waits for earlier render passes before its fragment stage, so its geometry overlaps them"
                                      : "a render pass waits for everything before its vertex stage");
         }
-        if (e->f6_list_start && q->device->enc_fence) waits[nw++] = q->device->enc_fence;
+        {   /* ml1315: the device fence of this queue's timeline */
+            obj_handle_t dfn = (q->lane && q->device->lane) ? q->device->lane->fence : q->device->enc_fence;
+            if (e->f6_list_start && dfn) waits[nw++] = dfn;
+        }
         if (kind == F6_RENDER && g_f6_frag_wait) {   /* ml1307: vertex-stage waits first, the fragment-stage ones last */
             for (i = 0; i < q->f6_npend; i++) if (!f6_frag_ok(e, &q->f6_pend[i])) waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
             for (i = 0; i < q->f6_npend; i++) if (f6_frag_ok(e, &q->f6_pend[i])) { waits[nw++] = f6_fence(q, q->f6_pend[i].idx); nfrag++; }
@@ -1944,7 +1978,7 @@ static void f6_join(struct mad_queue *q) {
     obj_handle_t waits[48], benc, dfence;
     unsigned i, nw = 0;
     if (!q->f6_npend || !q->open_cb) return;   /* ml1136: whatever the current mode */
-    dfence = mad_enc_fence_obj(q->device);
+    dfence = mad_q_dfence(q);   /* ml1315 */
     benc = MTLCommandBuffer_blitCommandEncoder(q->open_cb);
     if (!benc) return;
     for (i = 0; i < q->f6_npend; i++) waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
@@ -2011,7 +2045,7 @@ static void exec_fence_render(struct mad_exec *e, obj_handle_t enc, int update) 
     struct wmtcmd_render_fence_op f;
     obj_handle_t fence;
     if (!enc || !e->mode) return;   /* ml1136: the list's own mode */
-    fence = mad_enc_fence_obj(e->q->device);
+    fence = mad_q_dfence(e->q);   /* ml1315 */
     if (!fence) return;
     if (e->mode == 6) { if (update) f6_end(e, F6_RENDER, enc); else f6_begin(e, F6_RENDER, enc); return; }   /* ml1134 */
     if (!update) f6_drain(e, F6_RENDER, enc);   /* ml1136 */
@@ -2039,7 +2073,7 @@ static void exec_fence_blit(struct mad_exec *e, obj_handle_t enc, int update) {
     struct wmtcmd_blit_fence_op f;
     obj_handle_t fence;
     if (!enc || !e->mode) return;   /* ml1136 */
-    fence = mad_enc_fence_obj(e->q->device);
+    fence = mad_q_dfence(e->q);   /* ml1315 */
     if (!fence) return;
     if (e->mode == 6) { if (update) f6_end(e, F6_BLIT, enc); else f6_begin(e, F6_BLIT, enc); return; }   /* ml1134 */
     if (!update) f6_drain(e, F6_BLIT, enc);   /* ml1136 */
@@ -2055,7 +2089,7 @@ static void exec_fence_compute(struct mad_exec *e, obj_handle_t enc, int update)
     struct wmtcmd_compute_fence_op f;
     obj_handle_t fence;
     if (!enc || !e->mode) return;   /* ml1136 */
-    fence = mad_enc_fence_obj(e->q->device);
+    fence = mad_q_dfence(e->q);   /* ml1315 */
     if (!fence) return;
     if (e->mode == 6) { if (update) f6_end(e, F6_COMPUTE, enc); else f6_begin(e, F6_COMPUTE, enc); return; }   /* ml1134 */
     if (!update) f6_drain(e, F6_COMPUTE, enc);   /* ml1136 */
@@ -3163,7 +3197,7 @@ static void exec_mfx(struct mad_exec *e, const struct mad_cmd *c) {
     }
     /* 2. the scaler: it waits for the copy's fence and updates it */
     if (e->mode == 6) { if (e->q->f6_npend) fence = f6_fence(e->q, e->q->f6_pend[e->q->f6_npend - 1].idx); }
-    else if (e->mode) fence = mad_enc_fence_obj(dev);
+    else if (e->mode) fence = mad_q_dfence(e->q);
     memset(&p, 0, sizeof p);
     p.input_content_width = c->u.mfx.rw; p.input_content_height = c->u.mfx.rh;
     p.reset = c->u.mfx.reset != 0; p.depth_reversed = c->u.mfx.rev != 0;
@@ -6029,7 +6063,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
                 MTLResidencySet_commit(q->device->resset);
             mad_queue_revive(q->device);   /* ml1067 */
             ecl_first = 1;   /* ml1311: a new command buffer starts with a full sync */
-            q->open_cb = MTLCommandQueue_commandBuffer(q->device->mtl_queue);
+            q->open_cb = MTLCommandQueue_commandBuffer(mad_q_mtl(q));   /* ml1315 */
             if (!q->open_cb) { d3d12_log("[madeira-d3d12] no command buffer\n"); q->rejected++; continue; }
             /* commandBuffer returns an AUTORELEASED object locally and an interned
              * one remotely; holding it across calls means taking our own reference. */
@@ -6273,6 +6307,12 @@ static void mad_perf_present(void) {
                     n += snprintf(line + n, sizeof line - n, " %s %.1f/%.1f/%.1f", qn[k], (double)a / g_perf_presents,
                                   (double)b / g_perf_presents, (double)cc / g_perf_presents);
             }
+            {   /* ml1315 */
+                LONG lb = InterlockedExchange(&g_lane_batches, 0), lw = InterlockedExchange(&g_lane_waits, 0), ld = InterlockedExchange(&g_lane_waits_done, 0);
+                if ((lb || lw || ld) && g_perf_presents)
+                    n += snprintf(line + n, sizeof line - n, "; ml1315 copy lane per frame: batches %.1f, GPU waits across timelines %.1f (%.1f already met)",
+                                  (double)lb / g_perf_presents, (double)lw / g_perf_presents, (double)ld / g_perf_presents);
+            }
             d3d12_log("%s\n", line);
         }
         g_perf_t0 = now.QuadPart; g_perf_presents = 0; g_perf_cbs = 0; g_perf_gpu_sum = g_perf_gpu_union = g_perf_wait_s = 0; g_perf_first_start = 0;
@@ -6342,15 +6382,27 @@ static void mad_queue_flush(struct mad_queue *q) {
          * useResource lists gone (ml1060) nothing else covered that window. Commit
          * whatever is staged right before the buffer that will use it. */
         if (sd->resset && InterlockedExchange(&sd->resset_dirty, 0)) MTLResidencySet_commit(sd->resset);
-        EnterCriticalSection(&sd->fence_lock);
-        if (sd->gpu_event) {
-            serial = (UINT64)InterlockedIncrement64(&sd->gpu_serial);
-            MTLCommandBuffer_encodeSignalEvent(q->open_cb, sd->gpu_event, serial);
+        if (q->lane && sd->lane) {   /* ml1315: the copy lane's own serials, event and order */
+            struct mad_lane *ln = sd->lane;
+            EnterCriticalSection(&ln->lock);
+            serial = (UINT64)InterlockedIncrement64(&ln->serial);
+            MTLCommandBuffer_encodeSignalEvent(q->open_cb, ln->event, serial);
+            mad_vis_flush(q, q->open_cb);
+            MTLCommandBuffer_commit(q->open_cb);
+            q->last_serial = serial; InterlockedExchange64(&ln->committed, (LONG64)serial);
+            LeaveCriticalSection(&ln->lock);
+            InterlockedIncrement(&g_lane_batches);
+        } else {
+            EnterCriticalSection(&sd->fence_lock);
+            if (sd->gpu_event) {
+                serial = (UINT64)InterlockedIncrement64(&sd->gpu_serial);
+                MTLCommandBuffer_encodeSignalEvent(q->open_cb, sd->gpu_event, serial);
+            }
+            mad_vis_flush(q, q->open_cb);            /* ml1099: under fence_lock, so the pending list is in SERIAL order (Astra) */
+            MTLCommandBuffer_commit(q->open_cb);
+            if (serial) { q->last_serial = serial; InterlockedExchange64(&sd->gpu_serial_committed, (LONG64)serial); }
+            LeaveCriticalSection(&sd->fence_lock);
         }
-        mad_vis_flush(q, q->open_cb);            /* ml1099: under fence_lock, so the pending list is in SERIAL order (Astra) */
-        MTLCommandBuffer_commit(q->open_cb);
-        if (serial) { q->last_serial = serial; InterlockedExchange64(&sd->gpu_serial_committed, (LONG64)serial); }
-        LeaveCriticalSection(&sd->fence_lock);
         q->batch_serial[(q->batches + 1) & 63] = serial;
     }
     q->pending[q->npending++] = q->open_cb;      /* the reference taken at open moves here */
@@ -6457,11 +6509,150 @@ static DWORD WINAPI mad_fence_worker(void *arg) {
     return 0;
 }
 
+/* ml1315: the copy lane's fence worker, as mad_fence_worker for the main timeline. */
+static DWORD WINAPI mad_lane_worker(void *arg) {
+    struct mad_device *d = arg;
+    struct mad_lane *ln = d->lane;
+    for (;;) {
+        struct mad_fence_job job; int have = 0; unsigned k, stalled_ms = 0;
+        EnterCriticalSection(&ln->lock);
+        if (ln->njobs) {
+            job = ln->jobs[0];
+            memmove(&ln->jobs[0], &ln->jobs[1], (ln->njobs - 1) * sizeof job);
+            ln->njobs--; have = 1;
+        }
+        LeaveCriticalSection(&ln->lock);
+        if (!have) {
+            if (ln->quit) return 0;
+            WaitForSingleObject(ln->wake, INFINITE);
+            continue;
+        }
+        while (job.serial && !MTLSharedEvent_waitUntilSignaledValue(ln->event, job.serial, 50)) {
+            int failed = (LONG64)job.serial <= ln->failed;
+            for (k = 0; k < job.ncbs; k++)
+                if (MTLCommandBuffer_status(job.cbs[k]) == WMTCommandBufferStatusError) failed = 1;
+            if (failed) {
+                if ((LONG64)job.serial > ln->failed) InterlockedExchange64(&ln->failed, (LONG64)job.serial);
+                d3d12_log("[madeira-d3d12] ml1315 copy-lane batch %llu FAILED on the GPU; advancing its fence anyway\n", (unsigned long long)job.serial);
+                break;
+            }
+            stalled_ms += 50;
+            if (stalled_ms == 5000 || (stalled_ms % 60000) == 0)
+                d3d12_log("[madeira-d3d12] ml1315 copy-lane GPU STALL: serial %llu not reached after %u ms (event at %llu, committed %lld)\n",
+                          (unsigned long long)job.serial, stalled_ms, (unsigned long long)MTLSharedEvent_signaledValue(ln->event), (long long)ln->committed);
+        }
+        for (k = 0; k < job.ncbs; k++) mad_cb_retire(d, job.cbs[k]);
+        ID3D12Fence_Signal(job.fence, job.value);
+        ID3D12Fence_Release(job.fence);
+    }
+}
+static int mad_copy_lane_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = mad_cfg_int_pe("copy-lane", 0) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] ml1315 copy-lane = %d (%s)\n", on,
+                  on ? "copy queues run on their own Metal queue and GPU timeline" : "every queue feeds one Metal queue in commit order");
+    }
+    return on;
+}
+static struct mad_lane *mad_lane_get(struct mad_device *d) {
+    struct mad_lane *ln;
+    if (d->lane) return d->lane;
+    if (!d->mtl_device || !d->gpu_event) return NULL;
+    EnterCriticalSection(&d->live_lock);
+    if (!d->lane && (ln = calloc(1, sizeof *ln))) {
+        ln->queue = MTLDevice_newCommandQueue(d->mtl_device, 64);
+        ln->event = MTLDevice_newSharedEvent(d->mtl_device);
+        ln->fence = MTLDevice_newFence(d->mtl_device);
+        InitializeCriticalSection(&ln->lock);
+        ln->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (ln->queue && ln->event && ln->fence && ln->wake) {
+            if (d->resset) MTLCommandQueue_addResidencySet(ln->queue, d->resset);
+            d->lane = ln;   /* before the worker starts: it reads d->lane */
+            ln->thread = CreateThread(NULL, 0, mad_lane_worker, d, 0, NULL);
+            if (!ln->thread) d->lane = NULL;
+        }
+        if (!d->lane) {
+            if (ln->queue) NSObject_release(ln->queue);
+            if (ln->event) NSObject_release(ln->event);
+            if (ln->fence) NSObject_release(ln->fence);
+            if (ln->wake) CloseHandle(ln->wake);
+            DeleteCriticalSection(&ln->lock);
+            free(ln);
+            d3d12_log("[madeira-d3d12] ml1315 the copy lane could not be set up; copy queues stay on the main timeline\n");
+        }
+    }
+    LeaveCriticalSection(&d->live_lock);
+    return d->lane;
+}
+/* A Queue::Wait whose signal (committed by now, mad_wait_committed) may sit on
+ * the OTHER timeline: the earliest signal there that reaches `value` becomes a
+ * GPU wait at the current point of this queue's command stream. A signal that
+ * a later one on the same fence superseded only makes the wait longer, never
+ * circular: anything committed on the other timeline was committed before this
+ * Wait ran, so it can only depend on work of this timeline committed earlier. */
+static void mad_lane_wait(struct mad_queue *q, struct mad_fence *f, UINT64 value) {
+    struct mad_device *d = q->device;
+    struct mad_lane *ln = d->lane;
+    UINT64 ss = 0, v;
+    obj_handle_t ev;
+    unsigned k, n;
+    int other = q->lane ? 0 : 1;
+    if (!ln) return;
+    EnterCriticalSection(&f->lock);
+    v = f->value;
+    n = f->sigr_n[other] < 8 ? f->sigr_n[other] : 8;
+    for (k = 0; k < n; k++)
+        if (f->sigr[other][k].value >= value && (!ss || f->sigr[other][k].serial < ss)) ss = f->sigr[other][k].serial;
+    LeaveCriticalSection(&f->lock);
+    if (v >= value || !ss) return;
+    ev = other ? ln->event : d->gpu_event;
+    if (MTLSharedEvent_signaledValue(ev) >= ss) { InterlockedIncrement(&g_lane_waits_done); return; }
+    EnterCriticalSection(&q->submit_lock);
+    mad_carry_close(q);
+    if (!q->open_cb) {
+        if (d->resset && InterlockedExchange(&d->resset_dirty, 0)) MTLResidencySet_commit(d->resset);
+        q->open_cb = MTLCommandQueue_commandBuffer(mad_q_mtl(q));
+        if (q->open_cb) NSObject_retain(q->open_cb);
+    }
+    if (q->open_cb) MTLCommandBuffer_encodeWaitForEvent(q->open_cb, ev, ss);
+    LeaveCriticalSection(&q->submit_lock);
+    InterlockedIncrement(&g_lane_waits);
+}
+static void mad_lane_note_signal(struct mad_queue *q, ID3D12Fence *fence, UINT64 value, UINT64 serial) {   /* ml1315 */
+    struct mad_fence *mf = (struct mad_fence *)fence;
+    int t = q->lane ? 1 : 0;
+    if (!serial) return;
+    EnterCriticalSection(&mf->lock);
+    mf->sigr[t][mf->sigr_n[t] & 7].value = value; mf->sigr[t][mf->sigr_n[t] & 7].serial = serial; mf->sigr_n[t]++;
+    LeaveCriticalSection(&mf->lock);
+}
 static int mad_signal_async(struct mad_queue *q, ID3D12Fence *fence, UINT64 value) {
     struct mad_device *d = q->device;
     struct mad_fence_job *job;
     int ok = 0;
+    UINT64 nserial = 0;   /* ml1315 */
     if (!d->gpu_event || d->ncap) return 0;   /* no timeline, or a capture wants its readback synchronously */
+    if (q->lane && d->lane) {   /* ml1315: the copy lane's fence worker */
+        struct mad_lane *ln = d->lane;
+        UINT64 serial = 0;
+        EnterCriticalSection(&q->submit_lock);
+        EnterCriticalSection(&ln->lock);
+        if (mad_grow((void **)&ln->jobs, &ln->jobs_cap, ln->njobs + 1, sizeof *ln->jobs)) {
+            job = &ln->jobs[ln->njobs++];
+            memset(job, 0, sizeof *job);
+            job->serial = serial = q->last_serial; job->fence = fence; job->value = value;
+            ID3D12Fence_AddRef(fence);
+            job->ncbs = q->npending;
+            memcpy(job->cbs, q->pending, q->npending * sizeof q->pending[0]);
+            q->npending = 0;
+            ok = 1;
+        }
+        LeaveCriticalSection(&ln->lock);
+        LeaveCriticalSection(&q->submit_lock);
+        if (ok) { mad_lane_note_signal(q, fence, value, serial); SetEvent(ln->wake); }
+        return ok;
+    }
     EnterCriticalSection(&q->submit_lock);   /* lock order everywhere: submit_lock, THEN fence_lock (as in flush) */
     EnterCriticalSection(&d->fence_lock);
     if (!d->fence_thread) {
@@ -6471,7 +6662,7 @@ static int mad_signal_async(struct mad_queue *q, ID3D12Fence *fence, UINT64 valu
     if (d->fence_thread && mad_grow((void **)&d->fence_jobs, &d->fence_jobs_cap, d->nfence_jobs + 1, sizeof *d->fence_jobs)) {
         job = &d->fence_jobs[d->nfence_jobs++];
         memset(job, 0, sizeof *job);
-        job->serial = q->last_serial; job->fence = fence; job->value = value;
+        job->serial = nserial = q->last_serial; job->fence = fence; job->value = value;
         ID3D12Fence_AddRef(fence);
         job->ncbs = q->npending;
         memcpy(job->cbs, q->pending, q->npending * sizeof q->pending[0]);
@@ -6480,6 +6671,7 @@ static int mad_signal_async(struct mad_queue *q, ID3D12Fence *fence, UINT64 valu
     }
     LeaveCriticalSection(&d->fence_lock);
     LeaveCriticalSection(&q->submit_lock);
+    if (ok && d->lane) mad_lane_note_signal(q, fence, value, nserial);   /* ml1315: after the locks (f->lock stays a leaf) */
     if (ok) SetEvent(d->fence_wake);
     return ok;
 }
@@ -6651,6 +6843,7 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
         case MAD_SUB_WAIT:
             mad_device_flush_all(q->device);   /* as queue_Wait did: a CPU-side or other-path signal may sit in an open buffer */
             mad_wait_committed((struct mad_fence *)j->fence, j->value);
+            mad_lane_wait(q, (struct mad_fence *)j->fence, j->value);   /* ml1315 */
             ID3D12Fence_Release(j->fence);
             break;
         case MAD_SUB_PRESENT:   /* ml1121 */
@@ -7103,6 +7296,19 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
          * through it (mad_gpu_completed). Released first, a device created and
          * dropped straight away (Ghost of Tsushima's adapter probe) sent
          * signaledValue to a freed MTLSharedEvent. */
+        if (d->lane) {   /* ml1315 */
+            struct mad_lane *ln = d->lane;
+            InterlockedExchange(&ln->quit, 1);
+            SetEvent(ln->wake);
+            WaitForSingleObject(ln->thread, 10000);
+            CloseHandle(ln->thread); CloseHandle(ln->wake);
+            if (ln->queue) NSObject_release(ln->queue);
+            if (ln->event) NSObject_release(ln->event);
+            if (ln->fence) NSObject_release(ln->fence);
+            DeleteCriticalSection(&ln->lock);
+            free(ln->jobs); free(ln);
+            d->lane = NULL;
+        }
         if (d->gpu_event) { NSObject_release(d->gpu_event); d->gpu_event = 0; }
         DeleteCriticalSection(&d->fence_lock); DeleteCriticalSection(&d->ring_lock);
         free(d->fence_jobs); free(d->ring_pool); free(d->ring_retired);
@@ -7157,6 +7363,10 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandQueue(ID3D12Device *This,
                       "races a list being encoded)\n");
     }
     q->device = (struct mad_device *)This;
+    if (desc->Type == D3D12_COMMAND_LIST_TYPE_COPY && q->sub_thread && mad_copy_lane_on() && mad_lane_get(q->device)) {   /* ml1315 */
+        q->lane = 1;
+        d3d12_log("[madeira-d3d12] ml1315 this copy queue runs on the copy lane (its own Metal queue and GPU timeline)\n");
+    }
     {
         struct mad_device *d = (struct mad_device *)This;
         EnterCriticalSection(&d->live_lock);
