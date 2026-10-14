@@ -929,9 +929,12 @@ unsigned long madeira_early_intruder_base, madeira_early_intruder_size;   /* ml1
 unsigned madeira_early_intruder_tag, madeira_early_intruder_prot;
 unsigned long madeira_early_reserve_base;   /* where dyld put the zero-fill segment */
 int madeira_early_window_from_image;        /* 1: window (and placeholder) held since the image was mapped */
+unsigned long madeira_early_jit2_base, madeira_early_jit2_size;   /* jit2-hold: the segment's tail above the window */
 
 #define MADEIRA_VA_RESERVE_SIZE 0x55000000ul
 #define MADEIRA_EARLY_POOL_MIN 0x10000000ul    /* a smaller placeholder is not worth holding */
+#define MADEIRA_EARLY_JIT2_MAX 0x0d000000ul    /* jit2-hold: the largest code region (192MB) plus 16MB */
+#define MADEIRA_EARLY_JIT2_MIN 0x04000000ul    /* the smallest code region StikJITHelper asks for */
 __asm__(".globl _madeira_va_reserve\n"
         ".private_extern _madeira_va_reserve\n"
         ".zerofill __MADEIRA_VA,__reserve,_madeira_va_reserve,0x55000000,14\n");
@@ -947,11 +950,37 @@ __attribute__((constructor(101), used)) static void madeira_early_va_claim(void)
 
     madeira_early_reserve_base = r0;
     if (r0 + MADEIRA_EARLY_POOL_MIN <= win && keep1 <= r1) {
-        if (r1 > keep1) vm_deallocate(mach_task_self(), keep1, r1 - keep1);
-        vm_protect(mach_task_self(), r0, keep1 - r0, 0, VM_PROT_NONE);
+        /* jit2-hold: the second JIT code region (env.MADEIRA_JIT_CODE_REGION,
+         * StikJITHelper.swift) is a debugger allocation placed first-fit, so it lands
+         * in the first free block above the window. With the segment's tail given back
+         * here the app's own start-up allocations fill that space first, by an amount
+         * that varies per launch: build 76's first block was 103MB where build 74's
+         * was 236MB, the code region came up at 96MB instead of 192MB, and FEX's
+         * code buffers rolled over 54 times (12 in build 74), each a 0.3-1.7 s stall
+         * of recompiles on the game and render threads. Keep up to 208MB of the tail
+         * as a PROT_NONE placeholder; StikJITHelper releases it just before it asks
+         * for the code region. madeira.cfg jit2-hold = 0 gives it back here, as before. */
+        vm_size_t hold = r1 > keep1 ? r1 - keep1 : 0;
+        if (hold > MADEIRA_EARLY_JIT2_MAX) hold = MADEIRA_EARLY_JIT2_MAX;
+        if (hold < MADEIRA_EARLY_JIT2_MIN) hold = 0;
+        if (r1 > keep1 + hold) vm_deallocate(mach_task_self(), keep1 + hold, r1 - keep1 - hold);
+        vm_protect(mach_task_self(), r0, keep1 + hold - r0, 0, VM_PROT_NONE);
         madeira_early_window_base = win; madeira_early_window_size = winsz;
         madeira_early_pool_base = r0; madeira_early_pool_size = win - r0;
         madeira_early_window_from_image = 1;
+        if (hold) {
+            /* The region's own switch, read as MadeiraConfig.flag reads it: the cfg
+             * line, else the environment; any value but "0" is on. */
+            char v[32];
+            const char *env = getenv("MADEIRA_JIT_CODE_REGION");
+            int region = madeira_cfg_get("env.MADEIRA_JIT_CODE_REGION", v, sizeof v) ? strcmp(v, "0") != 0
+                                                                                       : env && strcmp(env, "0") != 0;
+            if (region && madeira_cfg_bool("jit2-hold", 1)) {   /* madeira.cfg jit2-hold = 0 gives the tail back at image load */
+                madeira_early_jit2_base = keep1; madeira_early_jit2_size = hold;
+            } else {
+                vm_deallocate(mach_task_self(), keep1, hold);
+            }
+        }
         return;
     }
     vm_deallocate(mach_task_self(), r0, MADEIRA_VA_RESERVE_SIZE);
