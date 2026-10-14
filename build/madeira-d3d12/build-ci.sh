@@ -29,6 +29,10 @@ echo "prebuilt madeira_d3d12.dll: $(wc -c < "$APP/madeira_d3d12.dll") bytes"
     -o "$OUT/madeira_d3d12.dll" "$SRC/madeira_d3d12.c" "$SRC/d3d12.def" \
     -I"$SRC" -I"$R/madeira-d3d12/src" -I"$R/dxmt/src/winemetal" \
     -L"$OUT" -lwinemetal -luuid -lole32
+# ml1316: this exact DLL's function map in the CI log, to name the d3d12.dll+rva
+# samples of the [wprof] worker profiler (madeira.cfg env.MADEIRA_PROFILERS = 1).
+echo "madeira_d3d12.dll ImageBase: $("$TC/bin/llvm-readobj" --file-headers "$OUT/madeira_d3d12.dll" | sed -n 's/^ *ImageBase: //p')"
+"$TC/bin/llvm-nm" -n --defined-only "$OUT/madeira_d3d12.dll" | awk '$2 ~ /^[tT]$/ { print "SYMMAP", $1, $3 }' || true
 cp "$OUT/madeira_d3d12.dll" "$APP/madeira_d3d12.dll"
 cp "$OUT/madeira_d3d12.dll" "$APP/d3d12.dll"
 echo "built madeira_d3d12.dll: $(wc -c < "$APP/madeira_d3d12.dll") bytes (also shipped as d3d12.dll)"

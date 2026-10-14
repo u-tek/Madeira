@@ -1164,6 +1164,22 @@ static inline UINT64 mad_timer_ticks(void) {
     __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t));
     return t;
 }
+static inline UINT64 mad_timer_hz(void) {
+    UINT64 f;
+    __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(f));
+    return f ? f : 24000000;
+}
+/* ml1316: REPLAY CENSUS. Where the submission worker's time goes, per command
+ * class, and inside a draw per phase -- the generic timer (one register read)
+ * around every command, summed per list, so it costs well under 1 % and needs
+ * no sampling. Logged with the 5 s perf lines, per frame. In log cf698f81 the
+ * worker took 13-46 ms a frame and the game waited up to 36 ms a frame for it
+ * in list Reset; ml1313's QueryPerformanceCounter samples could not say which
+ * part (each timestamp is itself a system call). */
+enum { RK_DRAW, RK_DISPATCH, RK_BARRIER, RK_COPY, RK_RTS, RK_CLEAR, RK_QUERY, RK_STATE, RK_MFX, RK_LIST, RK_N };
+enum { DP_REUSE, DP_NEWPASS, DP_ARGSLOT, DP_BIND, DP_USE, DP_FILTER, DP_ENCODE, DP_N };
+static LONG64 g_rk_t[RK_N], g_rk_n[RK_N], g_dp_t[DP_N], g_dp_n[DP_N];
+static int mad_rk_of(int kind);
 static UINT64 mad_fence_spin_wait(struct mad_fence *f, UINT64 v) {
     UINT64 now = mad_timer_ticks(), last = f->spin_t;
     f->spin_t = now;
@@ -1482,6 +1498,8 @@ struct mad_list {
      * chunks. A draw's root arguments must survive until the GPU reads them,
      * so a single buffer rewritten per draw would race the previous draw. */
     volatile LONG inflight;   /* ml1120: submission-worker jobs still holding this list; Reset waits for 0 */
+    struct mad_lstore *lst;   /* ml1317: the recorded arrays' owner while jobs hold them (see mad_reset_detach_on) */
+    volatile LONG rewind_pending;   /* ml1317: a Reset left the argument rings for the next replay to rewind */
     obj_handle_t *rings; void **ring_cpu; UINT64 *ring_gpu; unsigned nrings; unsigned ring_used;
     struct mad_queue *ring_q; UINT64 ring_batch;   /* ml1061: the batch that last read these chunks */
     /* ml1008: ring_gpu is each chunk's GPU address. The DXBC backend's constant
@@ -1524,10 +1542,39 @@ static HRESULT STDMETHODCALLTYPE list_QI(ID3D12GraphicsCommandList *This, REFIID
     return mad_qi(o, riid, out, 1);
 }
 static ULONG STDMETHODCALLTYPE list_AddRef(ID3D12GraphicsCommandList *This) { return mad_addref((struct mad_obj *)This); }
+/* ml1317: RESET WITHOUT WAITING. With async-submit a list's commands are
+ * replayed on the queue's worker after ExecuteCommandLists returns, and Reset
+ * waited for that replay before the game could record into the list again: in
+ * the dips of log cf698f81 the game sat 36 ms a frame in Reset while the
+ * worker was idle 40 % of the time -- the two took turns instead of running
+ * side by side. Now ExecuteCommandLists hands the worker a copy of the closed
+ * list's header, and a Reset that finds the list still in flight gives the
+ * recorded arrays (commands, root constants, the residency tail) to a
+ * reference-counted store the jobs release, and records into fresh ones. The
+ * argument rings stay with the list: replays of one list run in queue order,
+ * so the worker carries ring state from one replay to the next and rewinds the
+ * rings itself at the next replay. madeira.cfg reset-detach = 0 restores the
+ * wait. */
+struct mad_lstore { volatile LONG refs; struct mad_cmd *cmds; UINT32 *cdata; struct mad_resource **used; };
+static void mad_lst_release(struct mad_lstore *st) {
+    if (st && !InterlockedDecrement(&st->refs)) { free(st->cmds); free(st->cdata); free(st->used); free(st); }
+}
+static int g_reset_detach = -1;
+static LONG g_reset_detached, g_reset_waited;
+static int mad_reset_detach_on(void) {
+    if (g_reset_detach < 0) {
+        g_reset_detach = mad_cfg_int_pe("reset-detach", 1) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] ml1317 reset-detach = %d (%s)\n", g_reset_detach,
+                  g_reset_detach ? "a list still being replayed is reset at once; the replay keeps the commands it was given"
+                                 : "Reset waits for the replay of the list");
+    }
+    return g_reset_detach;
+}
 static ULONG STDMETHODCALLTYPE list_Release(ID3D12GraphicsCommandList *This) {
     struct mad_list *l = (struct mad_list *)This;
     LONG r = InterlockedDecrement(&l->refs);
     if (r == 0) { mad_pd_purge(This);   /* ml1143 */
+        if (l->lst) { mad_lst_release(l->lst); l->lst = NULL; }   /* ml1317: no job holds it any more (they hold the list) */
         if (l->alloc && !l->closed) InterlockedDecrement(&l->alloc->recording);
         if (l->alloc) ID3D12CommandAllocator_Release((ID3D12CommandAllocator *)l->alloc);
         for (unsigned k = 0; k < l->nrings; k++) NSObject_release(l->rings[k]);
@@ -1549,10 +1596,26 @@ static HRESULT STDMETHODCALLTYPE list_Reset(ID3D12GraphicsCommandList *This,
                                             ID3D12CommandAllocator *allocator,
                                             ID3D12PipelineState *pso) {
     struct mad_list *l = (struct mad_list *)This;
+    int detached = 0;   /* ml1317 */
     (void)pso;
     if (!l->closed) return E_FAIL;         /* reset while recording */
     if (!allocator) return E_INVALIDARG;
-    if (l->inflight) mad_list_wait_idle(l);   /* ml1120: the submission worker still replays it */
+    if (l->inflight) {
+        if (l->lst && mad_reset_detach_on()) {   /* ml1317 */
+            struct mad_lstore *st = l->lst;
+            st->cmds = l->cmds; st->cdata = l->cdata; st->used = l->used;
+            l->cmds = NULL; l->ccap = 0; l->cdata = NULL; l->cdcap = 0; l->used = NULL; l->ucap = 0;
+            l->lst = NULL;
+            mad_lst_release(st);   /* the list's own reference; the jobs free the arrays */
+            InterlockedExchange(&l->rewind_pending, 1);
+            InterlockedIncrement(&g_reset_detached);
+            detached = 1;
+        } else {
+            mad_list_wait_idle(l);   /* ml1120: the submission worker still replays it */
+            InterlockedIncrement(&g_reset_waited);
+        }
+    }
+    if (l->lst) { mad_lst_release(l->lst); l->lst = NULL; }   /* ml1317: every job holding it has finished */
     if (l->alloc != (struct mad_alloc *)allocator) {
         if (l->alloc) ID3D12CommandAllocator_Release((ID3D12CommandAllocator *)l->alloc);
         l->alloc = (struct mad_alloc *)allocator;
@@ -1564,7 +1627,7 @@ static HRESULT STDMETHODCALLTYPE list_Reset(ID3D12GraphicsCommandList *This,
     l->ncmds = 0;
     l->nused = 0;
     l->ncdata = 0;
-    mad_list_rings_rewind(l);   /* ml1061: only reuses chunks the GPU has finished with */
+    if (!detached) { InterlockedExchange(&l->rewind_pending, 0); mad_list_rings_rewind(l); }   /* ml1061: only reuses chunks the GPU has finished with; ml1317: or the next replay does */
     return S_OK;
 }
 static D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE list_GetType(ID3D12GraphicsCommandList *This) {
@@ -1754,6 +1817,8 @@ struct mad_exec {
      * ut_pend is this draw's claim, kept only if mad_use_commit runs */
     struct mad_used_tail { obj_handle_t enc; unsigned nused; UINT32 stages; UINT64 sig; } ut[2], ut_pend;
     int ut_pend_kind;
+    UINT64 rk_t[12], rk_n[12];   /* ml1316: replay time (timer ticks) and count per command class, this list */
+    UINT64 dp_t[8], dp_n[8];     /* ml1316: exec_draw phases, this list */
 };
 static void mad_capture_pass(struct mad_exec *e, struct mad_resource **rt, unsigned nrt, const struct mad_rtvp *rtp,
                              struct mad_resource *depth, const struct mad_rtvp *dp, unsigned seq);
@@ -4840,10 +4905,9 @@ static struct wmtcmd_base *mad_rfilter(struct mad_exec *e, struct wmtcmd_base *h
 /* ml1313: where the replay worker's time per draw goes, sampled on 1 draw in
  * 32: building the draw (bindings, argument slot, residency, pass changes) vs
  * the Metal encoder calls (the encodeCommands unix call). */
-static unsigned g_dc_seq;
-static LONG64 g_dc_n, g_dc_prep, g_dc_mtl;
 static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
-    LONG64 dc_t0 = (++g_dc_seq & 31) == 0 ? mad_qpc() : 0, dc_t1 = 0;   /* ml1313 */
+    UINT64 dt = mad_timer_ticks(), dn;   /* ml1316 */
+#define MAD_DP(ph) do { dn = mad_timer_ticks(); e->dp_t[ph] += dn - dt; e->dp_n[ph]++; dt = dn; } while (0)
     struct wmtcmd_render_setpso c_pso;
     struct wmtcmd_render_draw_indirect c_di;
     struct wmtcmd_render_setblendcolor c_bl;
@@ -4883,7 +4947,11 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
         MAD_SKIP(e); return;
     }
     if (g_census_on) { exec_capture_draw(e, c); exec_desc_check(e, e->rs, e->root, e->pso->vs_name); }   /* ml910/ml913 */
-    if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
+    {
+        obj_handle_t before = e->renc;
+        if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
+        MAD_DP(e->renc == before ? DP_REUSE : DP_NEWPASS);   /* ml1316 */
+    }
     g_dump_tables = 0;
     if (g_capture_on && g_capture_ps[0] && e->pso->ps_name[0] && strstr(g_capture_ps, e->pso->ps_name) && g_capture_ps_shots < 8) {   /* ml1106; ml1152: any listed ps, 8 shots */
         g_capture_ps_shots++;
@@ -4936,6 +5004,7 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
 tess_go:
     if (!exec_arg_slot(e, &argbuf, &argoff)) { MAD_SKIP(e); return; }
     arg_slot_used = e->l->ring_used - 1;   /* ml1084: the slot exec_arg_slot took, see the draw-params block */
+    MAD_DP(DP_ARGSLOT);   /* ml1316 */
 
     memset(&c_pso, 0, sizeof c_pso); c_pso.type = WMTRenderCommandSetPSO; c_pso.pso = tv ? tv->obj[tfmt].rps : e->pso->rps;
     if (e->pso->has_vd && !gsemu && !tv) {
@@ -5131,6 +5200,7 @@ tess_go:
 #undef MAD_SETBUF
     /* ml1130: no 8 KB clear per draw; each entry is zeroed as it is used */
     const UINT32 use_stages = (UINT32)((gsemu || tv) ? (WMTRenderStageObject | WMTRenderStageMesh | WMTRenderStageFragment) : (WMTRenderStageVertex | WMTRenderStageFragment));
+    MAD_DP(DP_BIND);   /* ml1316 */
     mad_use_begin(e, e->renc);
 #define MAD_USE_U(h, u) do { if ((h) && nur < 256 && !mad_use_seen(e, e->renc, (h), (UINT32)(u), use_stages)) { \
         memset(&ur[nur], 0, sizeof ur[nur]); ur[nur].type = WMTRenderCommandUseResource; ur[nur].resource = (h); \
@@ -5177,6 +5247,7 @@ tess_go:
         d3d12_log("[madeira-d3d12] residency list truncated at 256 per draw (%u views); a real residency set is owed\n", dev->nsrv);
 #undef MAD_USE
 #undef MAD_USE_U
+    MAD_DP(DP_USE);   /* ml1316 */
     if (e->enc_depth && (e->pso->dsso || dev->dsso)) {
         memset(&c_dss, 0, sizeof c_dss); c_dss.type = WMTRenderCommandSetDSSO;
         c_dss.dsso = e->pso->dsso ? e->pso->dsso : dev->dsso;
@@ -5352,23 +5423,21 @@ tess_go:
             e->vis_prev = want;
             tail->next.ptr = NULL;
             c_vis.next.ptr = mad_rfilter(e, (struct wmtcmd_base *)&c_pso);   /* ml1310 */
-            if (dc_t0) dc_t1 = mad_qpc();   /* ml1313 */
+            MAD_DP(DP_FILTER);   /* ml1316 */
             MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&c_vis);
         } else {
             tail->next.ptr = NULL;
             {   /* ml1310 */
                 const struct wmtcmd_base *h = mad_rfilter(e, (struct wmtcmd_base *)&c_pso);
-                if (dc_t0) dc_t1 = mad_qpc();   /* ml1313 */
+                MAD_DP(DP_FILTER);   /* ml1316 */
                 if (h) MTLRenderCommandEncoder_encodeCommands(e->renc, h);
             }
         }
-        if (dc_t0) {   /* ml1313 */
-            LONG64 dc_t2 = mad_qpc();
-            InterlockedIncrement64(&g_dc_n); InterlockedExchangeAdd64(&g_dc_prep, dc_t1 - dc_t0); InterlockedExchangeAdd64(&g_dc_mtl, dc_t2 - dc_t1);
-        }
+        MAD_DP(DP_ENCODE);   /* ml1316 */
         if (want != ~(UINT64)0) v->dirty = 1;
     }
     mad_use_commit(e);   /* this draw's useResource entries reached the encoder */
+#undef MAD_DP
 #undef MAD_APPEND
     e->draws++; e->pass_draws++;   /* ml1098 */
     if (e->nrt && e->rt[0] && e->rtp[0].layers > 1) {   /* ml926: layered draws */
@@ -5834,10 +5903,24 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
  * not ask for. With the switch on, only the first list of a call (or of a new
  * command buffer) starts with one. */
 static int g_list_overlap = -1;
+static int mad_rk_of(int kind) {   /* ml1316 */
+    switch (kind) {
+    case MC_DRAW: case MC_DRAW_INDEXED: case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT: return RK_DRAW;
+    case MC_DISPATCH: case MC_DISPATCH_INDIRECT: return RK_DISPATCH;
+    case MC_BARRIER: return RK_BARRIER;
+    case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX: case MC_RESOLVE: return RK_COPY;
+    case MC_RTS: return RK_RTS;
+    case MC_CLEAR_RT: case MC_CLEAR_DS: return RK_CLEAR;
+    case MC_QUERY_BEGIN: case MC_QUERY_END: case MC_QUERY_RESOLVE: return RK_QUERY;
+    case MC_MFX: return RK_MFX;
+    default: return RK_STATE;
+    }
+}
 static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t cb, int first) {
     g_list_seq++;
     struct mad_exec e;
     unsigned i;
+    UINT64 rk_t0 = mad_timer_ticks(), rk_prev;   /* ml1316 */
     memset(&e, 0, sizeof e);
     e.fence_needed = 1;   /* ml1111: the first encoder of a list waits for whatever ran before it */
     e.f6_sync_needed = 1; e.f6_list_start = 1;   /* ml1134: and, in mode 6, for the device fence too */
@@ -5855,6 +5938,8 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     mad_carry_begin_list(&e);   /* ml1304 */
+    rk_prev = mad_timer_ticks();
+    e.rk_t[RK_LIST] += rk_prev - rk_t0;
     for (i = 0; i < l->ncmds; i++) {
         const struct mad_cmd *c = &l->cmds[i];
         e.cur = i;   /* ml1137 */
@@ -5970,12 +6055,23 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_MFX: exec_mfx(&e, c); break;   /* ml1314 */
         case MC_RESOLVE: exec_resolve(&e, c); break;
         }
+        {   /* ml1316 */
+            UINT64 now = mad_timer_ticks();
+            int k = mad_rk_of(c->kind);
+            e.rk_t[k] += now - rk_prev; e.rk_n[k]++; rk_prev = now;
+        }
     }
     if (!mad_carry_keep(&e)) {   /* ml1304 */
         if (e.renc) InterlockedIncrement(&g_pass_end_list);
         exec_end(&e);
     }
     while (e.npend) exec_flush_clear(&e, 0);
+    {   /* ml1316 */
+        unsigned k;
+        e.rk_t[RK_LIST] += mad_timer_ticks() - rk_prev; e.rk_n[RK_LIST]++;
+        for (k = 0; k < RK_N; k++) if (e.rk_n[k]) { InterlockedExchangeAdd64(&g_rk_t[k], (LONG64)e.rk_t[k]); InterlockedExchangeAdd64(&g_rk_n[k], (LONG64)e.rk_n[k]); }
+        for (k = 0; k < DP_N; k++) if (e.dp_n[k]) { InterlockedExchangeAdd64(&g_dp_t[k], (LONG64)e.dp_t[k]); InterlockedExchangeAdd64(&g_dp_n[k], (LONG64)e.dp_n[k]); }
+    }
     /* ml1042: a PERIODIC summary. Every per-list line is rate-limited to the first
      * dozen, which is the menu -- so the first run to reach real 3D (black, ~2 FPS)
      * left nothing in the log about what the scene actually submitted. One line
@@ -6088,6 +6184,7 @@ struct mad_subjob {
     struct mad_subjob *next;
     int kind;
     UINT count; struct mad_list **lists;   /* ECL: validated, AddRef'd, inflight counted */
+    struct mad_list *snap, **rlists; struct mad_lstore **lsts;   /* ml1317: the lists as closed (replayed instead of the live ones), their stores */
     ID3D12Fence *fence; UINT64 value;      /* SIGNAL / WAIT: AddRef'd */
     struct mad_swapchain *swap; UINT index;   /* PRESENT (ml1121): no reference held -- swap_Release drains the queue first */
 };
@@ -6109,10 +6206,16 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(ID3D12CommandQueue *This
     if (q && (UINT)q->type < 4) InterlockedIncrement(&g_q_ecl[1 + q->type]);   /* ml1306 */
     mad_xp_role('E'); InterlockedIncrement64(&g_xp.ecl_calls);   /* ml1128 */
     if (q && q->sub_thread) {   /* ml1120: validate here, replay on the worker */
-        struct mad_subjob *j = calloc(1, sizeof *j + (count ? count : 1) * sizeof(struct mad_list *));
+        UINT cap = count ? count : 1;
+        int det = mad_reset_detach_on();   /* ml1317 */
+        struct mad_subjob *j = calloc(1, sizeof *j + cap * (sizeof(struct mad_list *) * 2 + sizeof(struct mad_lstore *) + (det ? sizeof(struct mad_list) : 0)));
         if (j) {
             UINT i, n = 0;
             j->kind = MAD_SUB_ECL; j->lists = (struct mad_list **)(j + 1);
+            if (det) {   /* ml1317: pointers first, then the 8-byte-aligned header copies */
+                j->rlists = j->lists + cap; j->lsts = (struct mad_lstore **)(j->rlists + cap);
+                j->snap = (struct mad_list *)(j->lsts + cap);
+            }
             for (i = 0; i < count; i++) {
                 struct mad_list *l = (struct mad_list *)lists[i];
                 if (!l) continue;
@@ -6130,6 +6233,13 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(ID3D12CommandQueue *This
                 }
                 list_AddRef((ID3D12GraphicsCommandList *)l);
                 InterlockedIncrement(&l->inflight);
+                if (j->snap) {   /* ml1317 */
+                    if (!l->lst && (l->lst = calloc(1, sizeof *l->lst))) l->lst->refs = 1;
+                    if (l->lst) InterlockedIncrement(&l->lst->refs);
+                    j->lsts[n] = l->lst;
+                    j->snap[n] = *l;
+                    j->snap[n].alloc = NULL;   /* checked here; the replay must not look at the live allocator */
+                }
                 j->lists[n++] = l;
             }
             j->count = n;
@@ -6284,11 +6394,22 @@ static void mad_perf_present(void) {
                   g_perf_presents ? 1000.0 * g_perf_wait_ticks / (double)fq.QuadPart / g_perf_presents : 0.0, 100.0 * g_perf_wait_ticks / (double)fq.QuadPart / wall,
                   g_perf_presents ? (double)g_perf_polls / g_perf_presents : 0.0, g_perf_presents ? (double)g_perf_qwait_sleeps / g_perf_presents : 0.0,
                   g_perf_sig_lat_n ? 1000.0 * g_perf_sig_lat_ticks / (double)fq.QuadPart / g_perf_sig_lat_n : 0.0, g_perf_sig_lat_n);
-        {   /* ml1313 */
-            LONG64 dn = InterlockedExchange64(&g_dc_n, 0), dp = InterlockedExchange64(&g_dc_prep, 0), dm = InterlockedExchange64(&g_dc_mtl, 0);
-            if (dn)
-                d3d12_log("[perf] ml1313 draw encode (1 in 32 sampled): %.2f us building, %.2f us in Metal calls per draw\n",
-                          1e6 * dp / (double)fq.QuadPart / dn, 1e6 * dm / (double)fq.QuadPart / dn);
+        if (g_perf_presents) {   /* ml1316 */
+            static const char *const rkn[RK_N] = { "draws", "dispatches", "barriers", "copies", "target binds", "clears", "queries", "state", "MetalFX", "list start+end" };
+            static const char *const dpn[DP_N] = { "pass reused", "NEW pass", "argument slot", "bindings", "residency", "state filter", "Metal encode" };
+            double us = 1e6 / (double)mad_timer_hz(), tot = 0, np = (double)g_perf_presents;
+            LONG64 t[RK_N], n[RK_N], dt[DP_N], dn[DP_N];
+            char line[1024]; int len = 0, k;
+            for (k = 0; k < RK_N; k++) { t[k] = InterlockedExchange64(&g_rk_t[k], 0); n[k] = InterlockedExchange64(&g_rk_n[k], 0); tot += t[k]; }
+            for (k = 0; k < DP_N; k++) { dt[k] = InterlockedExchange64(&g_dp_t[k], 0); dn[k] = InterlockedExchange64(&g_dp_n[k], 0); }
+            len += snprintf(line + len, sizeof line - len, "[perf] ml1316 replay per frame: %.2f ms;", tot * us / 1000.0 / np);
+            for (k = 0; k < RK_N; k++)
+                if (n[k]) len += snprintf(line + len, sizeof line - len, " %s %.2f ms (%.0f x %.1f us)", rkn[k], t[k] * us / 1000.0 / np, n[k] / np, t[k] * us / n[k]);
+            d3d12_log("%s\n", line);
+            len = snprintf(line, sizeof line, "[perf] ml1316 per draw phase:");
+            for (k = 0; k < DP_N; k++)
+                if (dn[k]) len += snprintf(line + len, sizeof line - len, " %s %.2f us x %.0f/frame", dpn[k], dt[k] * us / dn[k], dn[k] / np);
+            d3d12_log("%s\n", line);
         }
         {   /* ml1306 */
             static const char *const qn[5] = { "CPU", "direct", "bundle", "compute", "copy" };
@@ -6314,6 +6435,12 @@ static void mad_perf_present(void) {
                                   (double)lb / g_perf_presents, (double)lw / g_perf_presents, (double)ld / g_perf_presents);
             }
             d3d12_log("%s\n", line);
+        }
+        {   /* ml1317 */
+            LONG rd = InterlockedExchange(&g_reset_detached, 0), rw = InterlockedExchange(&g_reset_waited, 0);
+            if ((rd || rw) && g_perf_presents)
+                d3d12_log("[perf] ml1317 list Resets per frame while the list was still being replayed: %.1f returned at once, %.1f waited\n",
+                          (double)rd / g_perf_presents, (double)rw / g_perf_presents);
         }
         g_perf_t0 = now.QuadPart; g_perf_presents = 0; g_perf_cbs = 0; g_perf_gpu_sum = g_perf_gpu_union = g_perf_wait_s = 0; g_perf_first_start = 0;
         g_perf_ecl = g_perf_signals = g_perf_waits = g_perf_polls = g_perf_qwait_sleeps = 0; g_perf_wait_ticks = g_perf_sig_lat_ticks = 0; g_perf_sig_lat_n = 0;
@@ -6829,6 +6956,22 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
         switch (j->kind) {
         case MAD_SUB_ECL: {
             UINT i;
+            if (j->snap) {   /* ml1317 */
+                for (i = 0; i < j->count; i++) {
+                    struct mad_list *l = j->lists[i], *r = &j->snap[i];
+                    if (InterlockedExchange(&l->rewind_pending, 0)) mad_list_rings_rewind(l);   /* before this replay takes any slot */
+                    r->rings = l->rings; r->ring_cpu = l->ring_cpu; r->ring_gpu = l->ring_gpu; r->nrings = l->nrings;
+                    r->ring_used = l->ring_used; r->ring_q = l->ring_q; r->ring_batch = l->ring_batch;
+                    j->rlists[i] = r;
+                }
+                mad_ecl_run((ID3D12CommandQueue *)q, j->count, (ID3D12CommandList *const *)j->rlists);
+                for (i = 0; i < j->count; i++) {
+                    struct mad_list *l = j->lists[i], *r = &j->snap[i];
+                    l->rings = r->rings; l->ring_cpu = r->ring_cpu; l->ring_gpu = r->ring_gpu; l->nrings = r->nrings;
+                    l->ring_used = r->ring_used; l->ring_q = r->ring_q; l->ring_batch = r->ring_batch;
+                    mad_lst_release(j->lsts[i]);   /* before inflight drops: a Reset that sees 0 owns the store alone */
+                }
+            } else
             mad_ecl_run((ID3D12CommandQueue *)q, j->count, (ID3D12CommandList *const *)j->lists);
             for (i = 0; i < j->count; i++) {
                 InterlockedDecrement(&j->lists[i]->inflight);
