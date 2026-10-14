@@ -1758,6 +1758,7 @@ struct mad_queue {
         struct mad_resource *rt[8], *depth, *att[9]; struct mad_rtvp rtp[8], dp;
     } carry;
     int lane;   /* ml1315: this queue runs on the copy lane */
+    UINT64 open_t;   /* ml1319: generic-timer ticks when open_cb was opened */
 };
 
 static HRESULT mad_queue_dxgi_tearoff(struct mad_queue *q, void **out);
@@ -6173,6 +6174,39 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
 
 /* ml1120: the replay itself; runs on the caller (async-submit = 0) or on the
  * queue's submission worker. */
+/* ml1319: COMMIT AS SOON AS IT IS ENCODED. A batch's command buffer went to
+ * the GPU only at the next Signal (or after 48 lists), i.e. after the worker had
+ * encoded every list of the ExecuteCommandLists call. In log c8427c3f the
+ * RHI thread waited 3.7 times a frame (32-49 ms) on fence #8, and ~90 % of
+ * that wait began while the work was still with this runtime: each wait paid
+ * the whole encode and then the whole GPU run, one after the other (frame ~55
+ * ms = RHI ~10 + encode ~17 + GPU ~25). Now the open buffer is committed when
+ * an ExecuteCommandLists call ends, and also between its lists once
+ * commit-early-us (default 1000) of encoding has piled up, so the GPU starts
+ * on the first lists while the worker encodes the rest. Not when 12 buffers
+ * are already uncovered by a Signal (the 16-buffer limit would then wait for
+ * the GPU). It ends a pass carried into the next call (ml1304), which saved
+ * ~5 MB a frame there. madeira.cfg commit-early = 0 restores commit-at-Signal. */
+static int g_commit_early = -1;
+static UINT64 g_commit_early_ticks;
+static LONG g_commit_early_n;
+static int mad_commit_early_on(void) {
+    if (g_commit_early < 0) {
+        long long us = mad_cfg_int_pe("commit-early-us", 1000);
+        g_commit_early = mad_cfg_int_pe("commit-early", 1) ? 1 : 0;
+        g_commit_early_ticks = (UINT64)(us > 0 ? us : 1000) * mad_timer_hz() / 1000000u;
+        d3d12_log("[madeira-d3d12] ml1319 commit-early = %d, commit-early-us = %lld (%s)\n", g_commit_early, us,
+                  g_commit_early ? "encoded work goes to the GPU at the end of every ExecuteCommandLists, and between its lists"
+                                 : "a batch goes to the GPU at the next Signal");
+    }
+    return g_commit_early;
+}
+static void mad_commit_early(struct mad_queue *q, int ecl_end) {
+    if (!q->open_cb || q->npending >= 12 || !mad_commit_early_on()) return;
+    if (!ecl_end && mad_timer_ticks() - q->open_t < g_commit_early_ticks) return;
+    mad_queue_flush(q);
+    InterlockedIncrement(&g_commit_early_n);
+}
 static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList *const *lists) {
     /* ml1021: hold the queue for the WHOLE replay. A concurrent Present ->
      * flush_all must not commit the buffer we are still encoding into. */
@@ -6210,6 +6244,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
             ecl_first = 1;   /* ml1311: a new command buffer starts with a full sync */
             q->open_cb = MTLCommandQueue_commandBuffer(mad_q_mtl(q));   /* ml1315 */
             if (!q->open_cb) { d3d12_log("[madeira-d3d12] no command buffer\n"); q->rejected++; continue; }
+            q->open_t = mad_timer_ticks();   /* ml1319 */
             /* commandBuffer returns an AUTORELEASED object locally and an interned
              * one remotely; holding it across calls means taking our own reference. */
             NSObject_retain(q->open_cb);
@@ -6218,7 +6253,9 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
         q->open_lists++;
         q->executed++;
         if (q->open_lists >= 48) mad_queue_flush(q);   /* bound the batch */
+        else if (i + 1 < count) mad_commit_early(q, 0);   /* ml1319 */
     }
+    mad_commit_early(q, 1);   /* ml1319: before the carry below keeps a pass open for the next call */
     if (q->carry.renc) {   /* ml1304: the next ExecuteCommandLists may continue the pass; any commit (Signal, Wait, Present) ends it */
         if (mad_carry_ecl_on() && !q->carry.retained) { NSObject_retain(q->carry.renc); q->carry.retained = 1; }   /* outlive this call's autorelease pool */
         else if (!q->carry.retained) mad_carry_close(q);
@@ -6511,6 +6548,11 @@ static void mad_perf_present(void) {
                 InterlockedExchange(&g_fw[i].n, 0); InterlockedExchange64(&g_fw[i].ticks, 0);
                 for (k = 0; k < 3; k++) { InterlockedExchange(&g_fw[i].st_n[k], 0); InterlockedExchange64(&g_fw[i].st_ticks[k], 0); }
             }
+        }
+        {   /* ml1319 */
+            LONG ce = InterlockedExchange(&g_commit_early_n, 0);
+            if (ce && g_perf_presents)
+                d3d12_log("[perf] ml1319 command buffers committed as soon as encoded: %.1f per frame\n", (double)ce / g_perf_presents);
         }
         {   /* ml1317 */
             LONG rd = InterlockedExchange(&g_reset_detached, 0), rw = InterlockedExchange(&g_reset_waited, 0);
