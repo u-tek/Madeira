@@ -1868,6 +1868,7 @@ struct mad_exec {
     struct mad_used_tail { obj_handle_t enc; unsigned nused; UINT32 stages; UINT64 sig; } ut[2], ut_pend;
     int ut_pend_kind;
     UINT64 rk_t[12], rk_n[12];   /* ml1316: replay time (timer ticks) and count per command class, this list */
+    int gp_ok; char gp_label[64];   /* ml1321: this replay may split its command buffer per encoder; the open encoder's name */
     UINT64 dp_t[8], dp_n[8];     /* ml1316: exec_draw phases, this list */
 };
 static void mad_capture_pass(struct mad_exec *e, struct mad_resource **rt, unsigned nrt, const struct mad_rtvp *rtp,
@@ -2280,8 +2281,71 @@ static void f7_store_census(struct mad_exec *e, const struct mad_resource *r, UI
 done:
     InterlockedExchangeAdd64(cls, b);
 }
+/* ml1321: GPU TIME PER PASS (madeira.cfg gpu-pass-profile = 1). The frame's
+ * GPU time (25 ms at 636x358 in log c8427c3f) had no breakdown: Metal reports
+ * GPU start/end per command buffer only. In one frame of every
+ * gpu-pass-profile-every presents (default 120) every encoder that ends gets
+ * a command buffer of its own (the next encoder syncs with it through the
+ * device fence, as at any commit), tagged with the encoder's name; the
+ * buffer's GPU time is charged to that name. The 5 s perf window logs the
+ * costliest names per profiled frame. Splits stop for a batch once 13 buffers
+ * await a Signal, and never happen inside an occlusion query. */
+static int g_gp_on = -1, g_gp_every = 120;
+static volatile LONG g_gp_frame, g_gp_frames, g_gp_splits;
+static LONG g_gp_count;
+#define MAD_GP_TAGS 512
+#define MAD_GP_NAMES 160
+static struct { obj_handle_t cb; char label[64]; } g_gp_tag[MAD_GP_TAGS];
+static unsigned g_gp_tag_next;
+static struct { char label[64]; double sec; LONG n; } g_gp_name[MAD_GP_NAMES];
+static unsigned g_gp_nname;
+static SRWLOCK g_gp_lock = SRWLOCK_INIT;
+static int mad_gp_on(void) {
+    if (g_gp_on < 0) {
+        g_gp_every = (int)mad_cfg_int_pe("gpu-pass-profile-every", 120);
+        if (g_gp_every < 2) g_gp_every = 2;
+        g_gp_on = mad_cfg_int_pe("gpu-pass-profile", 0) ? 1 : 0;
+        if (g_gp_on) d3d12_log("[madeira-d3d12] ml1321 gpu-pass-profile = 1: one frame in %d gets a command buffer per encoder, GPU time per pass logged\n", g_gp_every);
+    }
+    return g_gp_on;
+}
+static void mad_gp_tag_cb(obj_handle_t cb, const char *label) {
+    AcquireSRWLockExclusive(&g_gp_lock);
+    g_gp_tag[g_gp_tag_next % MAD_GP_TAGS].cb = cb;
+    snprintf(g_gp_tag[g_gp_tag_next % MAD_GP_TAGS].label, sizeof g_gp_tag[0].label, "%s", label[0] ? label : "?");
+    g_gp_tag_next++;
+    ReleaseSRWLockExclusive(&g_gp_lock);
+}
+static void mad_gp_retire(obj_handle_t cb, double sec) {   /* from mad_perf_cb, when the buffer has completed */
+    unsigned i, k;
+    AcquireSRWLockExclusive(&g_gp_lock);
+    for (i = 0; i < MAD_GP_TAGS; i++)
+        if (g_gp_tag[i].cb == cb) {
+            for (k = 0; k < g_gp_nname && strcmp(g_gp_name[k].label, g_gp_tag[i].label); k++) ;
+            if (k == g_gp_nname && g_gp_nname < MAD_GP_NAMES) memcpy(g_gp_name[g_gp_nname++].label, g_gp_tag[i].label, sizeof g_gp_name[0].label);
+            if (k < g_gp_nname) { g_gp_name[k].sec += sec; g_gp_name[k].n++; }
+            g_gp_tag[i].cb = 0;
+            break;
+        }
+    ReleaseSRWLockExclusive(&g_gp_lock);
+}
+static void mad_gp_split(struct mad_exec *e) {
+    struct mad_queue *q = e->q;
+    struct mad_device *d = q->device;
+    if (!q->open_cb || q->open_cb != e->cb || q->npending >= 13 || (q->vis && q->vis->active)) return;
+    mad_gp_tag_cb(q->open_cb, e->gp_label);
+    mad_queue_flush(q);
+    if (d->resset && InterlockedExchange(&d->resset_dirty, 0)) MTLResidencySet_commit(d->resset);
+    q->open_cb = MTLCommandQueue_commandBuffer(mad_q_mtl(q));
+    if (q->open_cb) { NSObject_retain(q->open_cb); q->open_t = mad_timer_ticks(); }
+    else d3d12_log("[madeira-d3d12] ml1321 no command buffer after a profiling split\n");
+    e->cb = q->open_cb;
+    e->f6_sync_needed = 1; e->f6_list_start = 1; e->fence_needed = 1;   /* the next encoder waits for the join that ended the last buffer */
+    InterlockedIncrement(&g_gp_splits);
+}
 static void exec_end(struct mad_exec *e) {
     struct mad_resource *crt[8]; struct mad_resource *cdepth = NULL; struct mad_rtvp crtp[8], cdp; unsigned cn = 0, cseq = 0, cdraws = 0;   /* ml1098 */
+    int gp = 0;   /* ml1321: an encoder ended here */
     if (e->renc) exec_fence_render(e, e->renc, 1);     /* ml1091 */
     if (e->benc) exec_fence_blit(e, e->benc, 1);
     if (e->cenc) exec_fence_compute(e, e->cenc, 1);
@@ -2293,7 +2357,7 @@ static void exec_end(struct mad_exec *e) {
     e->f7_next_rts = 0;
     if (e->renc) {
         if (g_capture_on) { cn = e->enc_nrt; memcpy(crt, e->enc_rt, sizeof crt); memcpy(crtp, e->enc_rtp, sizeof crtp); cdepth = e->enc_depth; cdp = e->enc_dp; cseq = e->renc_seq; cdraws = e->pass_draws; }
-        MTLCommandEncoder_endEncoding(e->renc);
+        MTLCommandEncoder_endEncoding(e->renc); gp = 1;
         if (e->renc_retained) { NSObject_release(e->renc); e->renc_retained = 0; }   /* ml1304 */
         e->rc.enc = 0;   /* ml1310: whatever encoder comes next starts with an empty state cache */
         e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0;
@@ -2301,9 +2365,10 @@ static void exec_end(struct mad_exec *e) {
         e->vis_prev = ~(UINT64)0; e->enc_vis_buf = 0;
         e->pass_draws = 0;
     }
-    if (e->benc) { MTLCommandEncoder_endEncoding(e->benc); e->benc = 0; }
-    if (e->cenc) { MTLCommandEncoder_endEncoding(e->cenc); e->cenc = 0; }
+    if (e->benc) { MTLCommandEncoder_endEncoding(e->benc); e->benc = 0; gp = 1; }
+    if (e->cenc) { MTLCommandEncoder_endEncoding(e->cenc); e->cenc = 0; gp = 1; }
     if (cdraws && g_capture_on) mad_capture_pass(e, crt, cn, crtp, cdepth, &cdp, cseq);   /* ml1098: after the pass, before anything else */
+    if (gp && e->gp_ok && g_gp_frame) mad_gp_split(e);   /* ml1321 */
 }
 
 /* ml1098: one attachment -> one shared buffer, one file later. */
@@ -3139,6 +3204,7 @@ static int exec_begin_render(struct mad_exec *e) {
     e->renc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (e->renc) e->renc_seq = ++g_enc_seq;
     if (e->depth && e->depth->st_copy) e->depth->st_dirty = 1;   /* ml1308: its stencil may change in this pass */
     if (g_enc_labels) mad_label(e->renc, "R#%u %s|%s %ux%u", e->renc_seq, e->pso ? e->pso->vs_name : "-", e->pso ? e->pso->ps_name : "-", w, h);   /* ml1142 */
+    if (g_gp_frame) snprintf(e->gp_label, sizeof e->gp_label, "R %s|%s %ux%u", e->pso ? e->pso->vs_name : "-", e->pso ? e->pso->ps_name : "-", w, h);   /* ml1321 */
     e->f6_natt = 0;   /* ml1134: what this pass writes, for the same-attachment ordering rule */
     for (i = 0; i < e->nrt && e->f6_natt < 8; i++) if (e->rt[i]) e->f6_att[e->f6_natt++] = e->rt[i];
     if (e->depth) e->f6_att[e->f6_natt++] = e->depth;
@@ -3180,6 +3246,7 @@ static int exec_begin_blit(struct mad_exec *e) {
     exec_end(e);
     e->benc = MTLCommandBuffer_blitCommandEncoder(e->cb); if (e->benc) g_enc_seq++;
     if (g_enc_labels) mad_label(e->benc, "B#%u copy", g_enc_seq);   /* ml1142 */
+    if (g_gp_frame) snprintf(e->gp_label, sizeof e->gp_label, "B copy");   /* ml1321 */
     if (e->benc) exec_fence_blit(e, e->benc, 0);   /* ml1091 */
     if (!e->benc) d3d12_log("[madeira-d3d12] no blit encoder\n");
     return e->benc != 0;
@@ -3324,6 +3391,7 @@ static void exec_mfx(struct mad_exec *e, const struct mad_cmd *c) {
     e->f6_sync_needed = 1; e->fence_needed = 1;
     if (exec_begin_blit(e)) {
         struct wmtcmd_blit_copy_from_texture_to_texture k;
+        if (g_gp_frame) snprintf(e->gp_label, sizeof e->gp_label, "MetalFX temporal upscale");   /* ml1321: the scaler shares this buffer */
         memset(&k, 0, sizeof k);
         k.type = WMTBlitCommandCopyFromTextureToTexture;
         k.src = m->out_tex;
@@ -5840,6 +5908,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         exec_end(e);
         e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, false); if (e->cenc) g_enc_seq++;
         if (g_enc_labels) mad_label(e->cenc, "C#%u %s", g_enc_seq, e->cpso->vs_name);   /* ml1142 */
+        if (g_gp_frame) snprintf(e->gp_label, sizeof e->gp_label, "C %s", e->cpso->vs_name);   /* ml1321 */
         if (!e->cenc) { d3d12_log("[madeira-d3d12] no compute encoder\n"); MAD_SKIP(e); return; }
         exec_fence_compute(e, e->cenc, 0);   /* ml1091 */
     }
@@ -5985,6 +6054,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     if (!first && e.mode == 6 && g_list_overlap) { e.f6_sync_needed = 0; e.f6_list_start = 0; }   /* ml1311 */
     e.f7_reason = 2;                             /* ml1137: list start */
     e.q = q; e.l = l; e.cb = cb;
+    e.gp_ok = 1;   /* ml1321 */
     e.vis_prev = ~(UINT64)0;   /* ml1088 */
     l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -6387,6 +6457,7 @@ static void mad_perf_cb(obj_handle_t cb, double wait_s) {
     MadeiraCtl(&a);
     mad_perf_lock();
     g_perf_wait_s += wait_s; g_perf_cbs++;
+    if (a.ret && t.end > t.start && g_gp_on > 0) mad_gp_retire(cb, t.end - t.start);   /* ml1321 */
     if (a.ret && t.end > t.start) {
         double s0 = t.start, e0 = t.end;
         g_perf_gpu_sum += e0 - s0;
@@ -6472,6 +6543,11 @@ static void mad_ab_window(double wall, double frames, double gpu_s, double wait_
 }
 static void mad_perf_present(void) {
     LARGE_INTEGER now, fq; double wall;
+    if (mad_gp_on()) {   /* ml1321 */
+        LONG f = (++g_gp_count % g_gp_every) == 0;
+        InterlockedExchange(&g_gp_frame, f);
+        if (f) InterlockedIncrement(&g_gp_frames);
+    }
     if (g_perf_enabled <= 0) return;
     QueryPerformanceCounter(&now); QueryPerformanceFrequency(&fq);
     mad_perf_lock();
@@ -6623,6 +6699,34 @@ static void mad_perf_present(void) {
                 InterlockedExchange(&g_fw[i].n, 0); InterlockedExchange64(&g_fw[i].ticks, 0);
                 for (k = 0; k < 3; k++) { InterlockedExchange(&g_fw[i].st_n[k], 0); InterlockedExchange64(&g_fw[i].st_ticks[k], 0); }
             }
+        }
+        if (g_gp_on > 0) {   /* ml1321 */
+            LONG frames = InterlockedExchange(&g_gp_frames, 0), splits = InterlockedExchange(&g_gp_splits, 0);
+            int idx[14], ni = 0, i, k;
+            double tot = 0;
+            char line[2000]; int len;
+            AcquireSRWLockExclusive(&g_gp_lock);
+            for (i = 0; i < (int)g_gp_nname; i++) tot += g_gp_name[i].sec;
+            for (k = 0; k < 14; k++) {
+                int best = -1;
+                for (i = 0; i < (int)g_gp_nname; i++) {
+                    int used = 0, m;
+                    for (m = 0; m < ni; m++) if (idx[m] == i) used = 1;
+                    if (!used && g_gp_name[i].sec > 0 && (best < 0 || g_gp_name[i].sec > g_gp_name[best].sec)) best = i;
+                }
+                if (best < 0) break;
+                idx[ni++] = best;
+            }
+            if (frames && ni) {
+                len = snprintf(line, sizeof line, "[perf] ml1321 GPU ms per profiled frame (%ld frames, %.1f splits each): total %.1f;", (long)frames,
+                               (double)splits / frames, tot * 1000.0 / frames);
+                for (k = 0; k < ni; k++)
+                    len += snprintf(line + len, sizeof line - len, " %s %.2f (x%.0f);", g_gp_name[idx[k]].label,
+                                    g_gp_name[idx[k]].sec * 1000.0 / frames, (double)g_gp_name[idx[k]].n / frames);
+                d3d12_log("%s\n", line);
+            }
+            g_gp_nname = 0;
+            ReleaseSRWLockExclusive(&g_gp_lock);
         }
         {   /* ml1319 */
             LONG ce = InterlockedExchange(&g_commit_early_n, 0);
