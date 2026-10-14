@@ -1695,6 +1695,16 @@ struct mad_exec {
     unsigned pass_draws;        /* ml1098: draws encoded into the open render pass */
     int renc_retained;          /* ml1304: renc carries our own reference (a pass continued across ExecuteCommandLists calls) */
     UINT8 dro, enc_dro;         /* ml1309: the bound DSV's read-only bits; the aspects the open pass does not store */
+    struct mad_rcache {         /* ml1310: what the open render encoder already has set (see mad_rfilter) */
+        obj_handle_t enc, pso, dsso, vbuf[31], fbuf[31];
+        UINT64 voff[31], foff[31];
+        UINT32 vset, fset;
+        UINT8 sref; int has_dsso, has_ras, has_vp, has_sc, has_blend;
+        struct wmtcmd_render_setrasterizerstate ras;
+        struct WMTViewport vp; struct WMTScissorRect sc;
+        float blend[4];
+    } rc;
+    struct wmtcmd_render_setbufferoffset rc_off[64]; unsigned rc_noff;   /* ml1310: offset-only binds made for one draw */
     /* ml1134: fence-chain = 6 */
     int f6_sync_needed;         /* a ResourceBarrier (or the list start) since the last sync point */
     int f6_list_start;          /* the next sync also waits for the device fence (other queue, earlier batch) */
@@ -2124,6 +2134,7 @@ static void exec_end(struct mad_exec *e) {
         if (g_capture_on) { cn = e->enc_nrt; memcpy(crt, e->enc_rt, sizeof crt); memcpy(crtp, e->enc_rtp, sizeof crtp); cdepth = e->enc_depth; cdp = e->enc_dp; cseq = e->renc_seq; cdraws = e->pass_draws; }
         MTLCommandEncoder_endEncoding(e->renc);
         if (e->renc_retained) { NSObject_release(e->renc); e->renc_retained = 0; }   /* ml1304 */
+        e->rc.enc = 0;   /* ml1310: whatever encoder comes next starts with an empty state cache */
         e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0;
         if (e->q->vis && e->q->vis->dirty) { e->q->vis->next++; e->q->vis->dirty = 0; }   /* ml1088: DXMT's endEncoder */
         e->vis_prev = ~(UINT64)0; e->enc_vis_buf = 0;
@@ -4563,6 +4574,111 @@ static void mad_used_tail_claim(struct mad_exec *e, int kind, obj_handle_t enc, 
     e->ut_pend.enc = enc; e->ut_pend.nused = e->l->nused; e->ut_pend.stages = stages; e->ut_pend.sig = sig; e->ut_pend_kind = kind;
 }
 
+/* ml1310: REDUNDANT RENDER STATE. Every draw re-sent the pipeline, both
+ * descriptor heaps to two stages, the argument slot, the rasterizer state (five
+ * Metal calls), the depth-stencil state, viewport and scissor -- ~25 Metal calls
+ * a draw, the bulk of the replay worker's 13 ms a frame (ml1120, log b5825805)
+ * and of its CPU in the dips. A render encoder keeps all of that until it ends,
+ * so a command that sets exactly what the encoder already has is dropped, and a
+ * buffer bind that only moves the offset of the buffer already bound at that
+ * index becomes Metal's cheaper offset-only call. The cache belongs to one
+ * encoder: any other encoder starts it empty. Every render state reaches the
+ * encoder through this chain (fence waits are not state), so it cannot go
+ * stale. madeira.cfg rstate-filter = 0 sends everything as before. */
+static int g_rfilter = -1;
+static LONG64 g_rf_in, g_rf_out;
+static struct wmtcmd_base *mad_rfilter(struct mad_exec *e, struct wmtcmd_base *head) {
+    struct mad_rcache *k = &e->rc;
+    struct wmtcmd_base anchor, *prev = &anchor, *c, *nx;
+    LONG nin = 0, nout = 0;
+    if (g_rfilter < 0) {
+        g_rfilter = mad_cfg_int_pe("rstate-filter", 1) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] ml1310 rstate-filter = %d (%s)\n", g_rfilter,
+                  g_rfilter ? "render state the encoder already has is not sent again" : "every draw sends all of its render state");
+    }
+    if (!g_rfilter || !e->renc) return head;
+    if (k->enc != e->renc) { memset(k, 0, sizeof *k); k->enc = e->renc; }
+    e->rc_noff = 0;
+    anchor.next.ptr = head;
+    for (c = head; c; c = nx) {
+        int drop = 0;
+        nx = (struct wmtcmd_base *)c->next.ptr;
+        nin++;
+        switch (c->type) {
+        case WMTRenderCommandSetPSO: {
+            struct wmtcmd_render_setpso *b = (struct wmtcmd_render_setpso *)c;
+            if (b->pso && k->pso == b->pso) drop = 1; else k->pso = b->pso;
+            break;
+        }
+        case WMTRenderCommandSetDSSO: {
+            struct wmtcmd_render_setdsso *b = (struct wmtcmd_render_setdsso *)c;
+            if (k->has_dsso && k->dsso == b->dsso && k->sref == b->stencil_ref) drop = 1;
+            else { k->dsso = b->dsso; k->sref = b->stencil_ref; k->has_dsso = 1; }
+            break;
+        }
+        case WMTRenderCommandSetBlendFactorAndStencilRef: {   /* sets the stencil reference too */
+            struct wmtcmd_render_setblendcolor *b = (struct wmtcmd_render_setblendcolor *)c;
+            if (k->has_blend && k->has_dsso && k->blend[0] == b->red && k->blend[1] == b->green && k->blend[2] == b->blue &&
+                k->blend[3] == b->alpha && k->sref == b->stencil_ref) drop = 1;
+            else {
+                k->blend[0] = b->red; k->blend[1] = b->green; k->blend[2] = b->blue; k->blend[3] = b->alpha; k->has_blend = 1;
+                k->sref = b->stencil_ref;
+                if (!k->has_dsso) k->has_blend = 0;   /* reference known only next to a known DSSO */
+            }
+            break;
+        }
+        case WMTRenderCommandSetRasterizerState: {
+            struct wmtcmd_render_setrasterizerstate *b = (struct wmtcmd_render_setrasterizerstate *)c;
+            if (k->has_ras && k->ras.fill_mode == b->fill_mode && k->ras.cull_mode == b->cull_mode &&
+                k->ras.depth_clip_mode == b->depth_clip_mode && k->ras.winding == b->winding && k->ras.depth_bias == b->depth_bias &&
+                k->ras.scole_scale == b->scole_scale && k->ras.depth_bias_clamp == b->depth_bias_clamp) drop = 1;
+            else { k->ras = *b; k->has_ras = 1; }
+            break;
+        }
+        case WMTRenderCommandSetViewport: {
+            struct wmtcmd_render_setviewport *b = (struct wmtcmd_render_setviewport *)c;
+            if (k->has_vp && !memcmp(&k->vp, &b->viewport, sizeof k->vp)) drop = 1;
+            else { k->vp = b->viewport; k->has_vp = 1; }
+            break;
+        }
+        case WMTRenderCommandSetScissorRect: {
+            struct wmtcmd_render_setscissorrect *b = (struct wmtcmd_render_setscissorrect *)c;
+            if (k->has_sc && !memcmp(&k->sc, &b->scissor_rect, sizeof k->sc)) drop = 1;
+            else { k->sc = b->scissor_rect; k->has_sc = 1; }
+            break;
+        }
+        case WMTRenderCommandSetVertexBuffer: case WMTRenderCommandSetFragmentBuffer: {
+            struct wmtcmd_render_setbuffer *b = (struct wmtcmd_render_setbuffer *)c;
+            int vs = c->type == WMTRenderCommandSetVertexBuffer;
+            obj_handle_t *kb = vs ? k->vbuf : k->fbuf; UINT64 *ko = vs ? k->voff : k->foff; UINT32 *ks = vs ? &k->vset : &k->fset;
+            UINT idx = b->index;
+            if (idx >= 31) break;
+            if ((*ks & (1u << idx)) && kb[idx] == b->buffer) {
+                if (ko[idx] == b->offset) drop = 1;
+                else if (e->rc_noff < 64) {   /* the same buffer at another offset */
+                    struct wmtcmd_render_setbufferoffset *o = &e->rc_off[e->rc_noff++];
+                    memset(o, 0, sizeof *o);
+                    o->type = vs ? WMTRenderCommandSetVertexBufferOffset : WMTRenderCommandSetFragmentBufferOffset;
+                    o->offset = b->offset; o->index = b->index;
+                    o->next.ptr = nx;
+                    prev->next.ptr = o; prev = (struct wmtcmd_base *)o;
+                    ko[idx] = b->offset;
+                    nout++;
+                    continue;
+                }
+                else ko[idx] = b->offset;
+            } else { kb[idx] = b->buffer; ko[idx] = b->offset; *ks |= 1u << idx; }
+            break;
+        }
+        default: break;
+        }
+        if (drop) prev->next.ptr = nx;
+        else { prev = c; nout++; }
+    }
+    InterlockedExchangeAdd64(&g_rf_in, nin); InterlockedExchangeAdd64(&g_rf_out, nout);
+    return (struct wmtcmd_base *)anchor.next.ptr;
+}
+
 static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     struct wmtcmd_render_setpso c_pso;
     struct wmtcmd_render_draw_indirect c_di;
@@ -5071,10 +5187,14 @@ tess_go:
             c_vis.next.ptr = &c_pso;
             e->vis_prev = want;
             tail->next.ptr = NULL;
+            c_vis.next.ptr = mad_rfilter(e, (struct wmtcmd_base *)&c_pso);   /* ml1310 */
             MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&c_vis);
         } else {
             tail->next.ptr = NULL;
-            MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&c_pso);
+            {   /* ml1310 */
+                const struct wmtcmd_base *h = mad_rfilter(e, (struct wmtcmd_base *)&c_pso);
+                if (h) MTLRenderCommandEncoder_encodeCommands(e->renc, h);
+            }
         }
         if (want != ~(UINT64)0) v->dirty = 1;
     }
@@ -5934,9 +6054,10 @@ static void mad_perf_present(void) {
                     LONG ck = InterlockedExchange(&g_carry_kept, 0), ca = InterlockedExchange(&g_carry_adopted, 0), cc = InterlockedExchange(&g_carry_closed, 0);
                     LONG cp = InterlockedExchange(&g_carry_passed, 0), cd = InterlockedExchange(&g_clear_deferred, 0), sr = InterlockedExchange(&g_st_refreshes, 0);
                     LONG rd = InterlockedExchange(&g_ro_dc, 0);
+                    LONG64 rfi = InterlockedExchange64(&g_rf_in, 0), rfo = InterlockedExchange64(&g_rf_out, 0);
                     d3d12_log("[perf] ml1304 render passes left open at a command list's end per frame: %.1f, continued by a later list %.1f "
-                              "(carried past %.1f lists that encode nothing), ended there %.1f; ml1305 clears kept for a later pass %.1f; ml1308 stencil copies %.1f; ml1309 passes not storing read-only depth %.1f\n",
-                              ck / np, ca / np, cp / np, cc / np, cd / np, sr / np, rd / np);
+                              "(carried past %.1f lists that encode nothing), ended there %.1f; ml1305 clears kept for a later pass %.1f; ml1308 stencil copies %.1f; ml1309 passes not storing read-only depth %.1f; ml1310 render commands %.0f -> %.0f a frame\n",
+                              ck / np, ca / np, cp / np, cc / np, cd / np, sr / np, rd / np, rfi / np, rfo / np);
                 }
             }
             if (g_f6_used && g_perf_presents) {   /* ml1137 */
