@@ -4869,7 +4869,8 @@ static struct wmtcmd_base *mad_rfilter(struct mad_exec *e, struct wmtcmd_base *h
         d3d12_log("[madeira-d3d12] ml1310 rstate-filter = %d (%s)\n", g_rfilter,
                   g_rfilter ? "render state the encoder already has is not sent again" : "every draw sends all of its render state");
     }
-    if (!g_rfilter || !e->renc) return head;
+    if (!g_rfilter) { k->enc = 0; return head; }   /* ml1320: a later switch-on starts from an empty cache */
+    if (!e->renc) return head;
     if (k->enc != e->renc) { memset(k, 0, sizeof *k); k->enc = e->renc; }
     e->rc_noff = 0;
     anchor.next.ptr = head;
@@ -6396,6 +6397,79 @@ static void mad_perf_cb(obj_handle_t cb, double wait_s) {
     }
     mad_perf_unlock();
 }
+/* ml1320: LIVE A/B. One device session tests several switches instead of one
+ * per build: madeira.cfg `ab = commit-early reset-detach ...` (up to 6 of the
+ * switches below) cycles phase 0 (every switch as configured) and phase k
+ * (switch k flipped, the rest as configured), `ab-windows` 5 s perf windows each
+ * (default 3), round and round, so heat and scene changes spread over all
+ * phases. A window counts only when it drew >= 200 draws a frame (a loading
+ * screen draws ~50). Every full cycle logs "[ab] ml1320" with each phase's fps,
+ * GPU and replay time per frame, and time the game sat in fence waits. Only
+ * switches that are read at use, never cached in a resource, are listed. */
+static double g_ab_draws_pf, g_ab_replay_pf;
+struct mad_ab_key { const char *key; int *var; };
+static const struct mad_ab_key g_ab_keys[] = {
+    { "commit-early", &g_commit_early }, { "reset-detach", &g_reset_detach }, { "pass-carry", &g_carry_on },
+    { "pass-carry-ecl", &g_carry_ecl }, { "clear-defer", &g_clear_defer }, { "f6-predict-sync", &g_f6_predict },
+    { "f6-list-overlap", &g_list_overlap }, { "fence-poll-wait", &g_fence_poll_wait }, { "rstate-filter", &g_rfilter },
+};
+#define MAD_AB_MAX 6
+static int g_ab_n = -1, g_ab_k[MAD_AB_MAX], g_ab_v[MAD_AB_MAX], g_ab_windows = 3, g_ab_phase, g_ab_win, g_ab_wins[MAD_AB_MAX + 1];
+static double g_ab_fr[MAD_AB_MAX + 1], g_ab_t[MAD_AB_MAX + 1], g_ab_gpu[MAD_AB_MAX + 1], g_ab_wait[MAD_AB_MAX + 1], g_ab_rep[MAD_AB_MAX + 1];
+static void mad_ab_apply(int phase) {
+    int i;
+    for (i = 0; i < g_ab_n; i++) *g_ab_keys[g_ab_k[i]].var = phase == i + 1 ? !g_ab_v[i] : g_ab_v[i];
+}
+static const char *mad_ab_label(int phase, char *buf, size_t n) {
+    if (!phase) snprintf(buf, n, "as configured");
+    else snprintf(buf, n, "%s=%d", g_ab_keys[g_ab_k[phase - 1]].key, !g_ab_v[phase - 1]);
+    return buf;
+}
+static void mad_ab_init(void) {
+    char v[256], *t, *ctx = NULL;
+    unsigned k;
+    g_ab_n = 0;
+    if (!mad_cfg_str_pe("ab", v, sizeof v) || !v[0]) return;
+    g_ab_windows = (int)mad_cfg_int_pe("ab-windows", 3);
+    if (g_ab_windows < 1) g_ab_windows = 1;
+    /* every listed switch must hold its configured value before it is overridden */
+    (void)mad_commit_early_on(); (void)mad_reset_detach_on();
+    if (g_carry_on < 0) g_carry_on = mad_cfg_int_pe("pass-carry", 1) ? 1 : 0;
+    if (g_carry_ecl < 0) g_carry_ecl = mad_cfg_int_pe("pass-carry-ecl", 1) ? 1 : 0;
+    if (g_clear_defer < 0) g_clear_defer = mad_cfg_int_pe("clear-defer", 1) ? 1 : 0;
+    if (g_f6_predict < 0) g_f6_predict = mad_cfg_int_pe("f6-predict-sync", 1) ? 1 : 0;
+    if (g_list_overlap < 0) g_list_overlap = mad_cfg_int_pe("f6-list-overlap", 0) ? 1 : 0;
+    if (g_fence_poll_wait < 0) g_fence_poll_wait = mad_cfg_int_pe("fence-poll-wait", 1) ? 1 : 0;
+    if (g_rfilter < 0) g_rfilter = mad_cfg_int_pe("rstate-filter", 1) ? 1 : 0;
+    for (t = strtok_s(v, " ,;", &ctx); t && g_ab_n < MAD_AB_MAX; t = strtok_s(NULL, " ,;", &ctx))
+        for (k = 0; k < sizeof g_ab_keys / sizeof g_ab_keys[0]; k++)
+            if (!strcmp(t, g_ab_keys[k].key)) { g_ab_k[g_ab_n] = (int)k; g_ab_v[g_ab_n] = *g_ab_keys[k].var ? 1 : 0; g_ab_n++; break; }
+    d3d12_log("[ab] ml1320 live A/B over %d switch(es), %d x 5 s per phase, gameplay windows only (>= 200 draws a frame)\n", g_ab_n, g_ab_windows);
+}
+static void mad_ab_window(double wall, double frames, double gpu_s, double wait_s) {
+    char lb[64];
+    int p;
+    if (g_ab_n < 0) mad_ab_init();
+    if (g_ab_n <= 0) return;
+    if (g_ab_draws_pf >= 200.0 && frames > 0) {
+        p = g_ab_phase;
+        g_ab_fr[p] += frames; g_ab_t[p] += wall; g_ab_gpu[p] += gpu_s; g_ab_wait[p] += wait_s; g_ab_rep[p] += g_ab_replay_pf * frames; g_ab_wins[p]++;
+    }
+    if (++g_ab_win < g_ab_windows) return;
+    g_ab_win = 0;
+    g_ab_phase = (g_ab_phase + 1) % (g_ab_n + 1);
+    mad_ab_apply(g_ab_phase);
+    d3d12_log("[ab] ml1320 phase now: %s\n", mad_ab_label(g_ab_phase, lb, sizeof lb));
+    if (!g_ab_phase) {
+        char line[1400]; int len = snprintf(line, sizeof line, "[ab] ml1320 so far (fps; GPU, replay and fence-wait ms per frame; gameplay seconds):");
+        for (p = 0; p <= g_ab_n; p++)
+            if (g_ab_t[p] > 0 && g_ab_fr[p] > 0)
+                len += snprintf(line + len, sizeof line - len, " | %s: %.1f fps; %.1f, %.1f, %.1f; %.0f s", mad_ab_label(p, lb, sizeof lb),
+                                g_ab_fr[p] / g_ab_t[p], g_ab_gpu[p] * 1000.0 / g_ab_fr[p], g_ab_rep[p] / g_ab_fr[p], g_ab_wait[p] * 1000.0 / g_ab_fr[p], g_ab_t[p]);
+            else len += snprintf(line + len, sizeof line - len, " | %s: no gameplay yet", mad_ab_label(p, lb, sizeof lb));
+        d3d12_log("%s\n", line);
+    }
+}
 static void mad_perf_present(void) {
     LARGE_INTEGER now, fq; double wall;
     if (g_perf_enabled <= 0) return;
@@ -6488,6 +6562,7 @@ static void mad_perf_present(void) {
             char line[1024]; int len = 0, k;
             for (k = 0; k < RK_N; k++) { t[k] = InterlockedExchange64(&g_rk_t[k], 0); n[k] = InterlockedExchange64(&g_rk_n[k], 0); tot += t[k]; }
             for (k = 0; k < DP_N; k++) { dt[k] = InterlockedExchange64(&g_dp_t[k], 0); dn[k] = InterlockedExchange64(&g_dp_n[k], 0); }
+            g_ab_draws_pf = n[RK_DRAW] / np; g_ab_replay_pf = tot * us / 1000.0 / np;   /* ml1320 */
             len += snprintf(line + len, sizeof line - len, "[perf] ml1316 replay per frame: %.2f ms;", tot * us / 1000.0 / np);
             for (k = 0; k < RK_N; k++)
                 if (n[k]) len += snprintf(line + len, sizeof line - len, " %s %.2f ms (%.0f x %.1f us)", rkn[k], t[k] * us / 1000.0 / np, n[k] / np, t[k] * us / n[k]);
@@ -6560,6 +6635,7 @@ static void mad_perf_present(void) {
                 d3d12_log("[perf] ml1317 list Resets per frame while the list was still being replayed: %.1f returned at once, %.1f waited\n",
                           (double)rd / g_perf_presents, (double)rw / g_perf_presents);
         }
+        mad_ab_window(wall, (double)g_perf_presents, g_perf_gpu_union, (double)g_perf_wait_ticks / (double)fq.QuadPart);   /* ml1320 */
         g_perf_t0 = now.QuadPart; g_perf_presents = 0; g_perf_cbs = 0; g_perf_gpu_sum = g_perf_gpu_union = g_perf_wait_s = 0; g_perf_first_start = 0;
         g_perf_ecl = g_perf_signals = g_perf_waits = g_perf_polls = g_perf_qwait_sleeps = 0; g_perf_wait_ticks = g_perf_sig_lat_ticks = 0; g_perf_sig_lat_n = 0;
     }
