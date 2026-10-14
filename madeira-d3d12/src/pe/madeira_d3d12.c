@@ -35,6 +35,10 @@
 
 #include "madeira_d3d12_stubs.h"
 #include "madeira_ir_abi.h"
+#include "ffx/ffx_upscale.h"   /* ml1314: AMD FidelityFX API 1.1 (MIT), for the FSR -> MetalFX bridge */
+/* ml1314: QueryInterface for this answers the Madeira object itself, so a
+ * command list or resource handed over through a wrapper is still found. */
+static const GUID IID_MadeiraSelf = { 0x6d616465, 0x6972, 0x4131, { 0x8f, 0x2a, 0x5c, 0x31, 0x0e, 0x7d, 0x94, 0x21 } };
 
 #define MADEIRA_D3D12_BUILD "madeira-d3d12 M2 " __DATE__ " " __TIME__
 
@@ -1393,6 +1397,7 @@ enum mad_ck {
     MC_CROOTSIG, MC_CROOT, MC_CROOT_CONST,
     MC_QUERY_BEGIN, MC_QUERY_END, MC_QUERY_RESOLVE,   /* ml1088: occlusion queries */
     MC_BARRIER,   /* ml1091: a ResourceBarrier; ends an open compute or blit encoder so the fence chain orders what follows */
+    MC_MFX,       /* ml1314: a temporal upscale by MetalFX (an FSR dispatch, see mad_ffx_hook_init) */
 };
 struct mad_cmd {
     enum mad_ck kind;
@@ -1424,6 +1429,8 @@ struct mad_cmd {
         struct { struct mad_resource *res; UINT level, sl0, nsl, bpp; obj_handle_t pattern; } filltex;   /* MC_FILL_TEX: mip, slices, texel size */
         struct { float rgba[4]; } blend;
         struct { struct mad_queryheap *heap; UINT type, index, count; struct mad_resource *dst; UINT64 off; } query;   /* ml1088 */
+        struct { struct mad_mfx_ent *ent; struct mad_resource *color, *depth, *mv, *out; obj_handle_t cview, mview;
+                 UINT rw, rh, ow, oh; float jx, jy, mx, my, pre; UINT8 reset, rev; } mfx;   /* ml1314 */
     } u;
 };
 
@@ -1487,7 +1494,7 @@ static HRESULT STDMETHODCALLTYPE list_QI(ID3D12GraphicsCommandList *This, REFIID
                 IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList1) || IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList2) ||
                 IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList3) || IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList4) ||
                 IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList5) || IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList6) ||
-                IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList7))) {
+                IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList7) || IsEqualGUID(riid, &IID_MadeiraSelf))) {   /* ml1314 */
         InterlockedIncrement(&o->refs);
         *out = o;
         return S_OK;
@@ -2103,6 +2110,10 @@ static void f7_store_census(struct mad_exec *e, const struct mad_resource *r, UI
             for (k = 0; k < c->u.barrier.n; k++)
                 if (c->u.barrier.res[k] == r) { cls = rebound ? &g_ac_st_rebound : c->u.barrier.cls[k] == BC_ALL ? &g_ac_st_write : &g_ac_st_read; goto done; }
             break;
+        case MC_MFX:   /* ml1314 */
+            if (c->u.mfx.color == r || c->u.mfx.depth == r || c->u.mfx.mv == r) { cls = &g_ac_st_read; goto done; }
+            if (c->u.mfx.out == r) { cls = &g_ac_st_write; goto done; }
+            break;
         case MC_COPY_T2T: case MC_RESOLVE:
             if (c->u.tt.src == r) { cls = &g_ac_st_read; goto done; }
             if (c->u.tt.dst == r) { cls = &g_ac_st_write; goto done; }
@@ -2578,7 +2589,7 @@ static int exec_barrier_ahead(const struct mad_exec *e) {
             for (k = 0; k < e->nrt; k++) if (c->u.rts.rt[k] != e->rt[k] || !mad_rtvp_eq(&c->u.rts.v[k], &e->rtp[k])) return 0;
             if (e->depth && !mad_rtvp_eq(&c->u.rts.dv, &e->dp)) return 0;
             break;
-        case MC_CLEAR_RT: case MC_CLEAR_DS: case MC_DISPATCH: case MC_DISPATCH_INDIRECT: case MC_RESOLVE:
+        case MC_CLEAR_RT: case MC_CLEAR_DS: case MC_DISPATCH: case MC_DISPATCH_INDIRECT: case MC_RESOLVE: case MC_MFX:
         case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX:
             return 0;
         default: break;
@@ -2622,7 +2633,7 @@ static int mad_dro_holds_from(const struct mad_list *l, unsigned start, struct m
             if (depth && !mad_rtvp_eq(&c->u.rts.dv, dp)) return 1;
             if ((c->u.rts.dro & need) != need) return 0;                  /* the same targets, made writable */
             break;
-        case MC_CLEAR_RT: case MC_CLEAR_DS: case MC_DISPATCH: case MC_DISPATCH_INDIRECT: case MC_RESOLVE:
+        case MC_CLEAR_RT: case MC_CLEAR_DS: case MC_DISPATCH: case MC_DISPATCH_INDIRECT: case MC_RESOLVE: case MC_MFX:
         case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX:
             return 1;
         default: break;
@@ -2741,7 +2752,7 @@ static int mad_carry_adoptable(const struct mad_carry *k, const struct mad_list 
             if (!mad_barrier_keeps_pass(c, k->rt, k->nrt, k->depth)) return 0;
             break;
         case MC_QUERY_BEGIN: case MC_QUERY_END: query = 1; break;   /* their slot boundaries need the encoder in hand */
-        case MC_CLEAR_RT: case MC_CLEAR_DS: case MC_DISPATCH: case MC_DISPATCH_INDIRECT: case MC_RESOLVE:
+        case MC_CLEAR_RT: case MC_CLEAR_DS: case MC_DISPATCH: case MC_DISPATCH_INDIRECT: case MC_RESOLVE: case MC_MFX:
         case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX:
             return 0;
         default: break;
@@ -2811,6 +2822,9 @@ static int exec_clear_folds_later(const struct mad_exec *e, unsigned k) {
         case MC_BARRIER:
             if (c->u.barrier.all) return 0;
             for (i = 0; i < c->u.barrier.n; i++) if (c->u.barrier.res[i] == r) return 0;
+            break;
+        case MC_MFX:   /* ml1314 */
+            if (c->u.mfx.color == r || c->u.mfx.depth == r || c->u.mfx.mv == r || c->u.mfx.out == r) return 0;
             break;
         case MC_COPY_T2T: case MC_RESOLVE:
             if (c->u.tt.src == r || c->u.tt.dst == r) return 0;
@@ -3062,6 +3076,115 @@ static void exec_st_refresh(struct mad_exec *e, struct mad_resource *r) {
     MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k2);
     exec_end(e);
     InterlockedIncrement(&g_st_refreshes);
+}
+
+/* ml1314: FSR -> METALFX TEMPORAL (madeira.cfg ffx-metalfx = 1). A temporal
+ * upscaler call of the application (AMD FidelityFX FSR 3.1, caught at its DLL's
+ * exports by mad_ffx_hook_init) is recorded as one MC_MFX and replayed here as
+ * Apple's MetalFX temporal scaler: the GPU's own upscaler, instead of FSR's
+ * chain of compute passes, and the same scaler for every game that ships FSR.
+ * MetalFX reads 2D textures (ours are arrays, ml932: 2D views made at record
+ * time), takes depth as Depth32Float (the depth plane of a Depth32Float_Stencil8
+ * texture goes through the stencil-copy scratch buffer into the scaler's own
+ * depth texture), and writes its own output texture, copied into the
+ * application's. Order: the depth copy syncs with everything before it; the
+ * scaler waits for that copy's fence and updates it; the output copy waits for
+ * the scaler; whatever follows syncs with the output copy. */
+struct mad_mfx_ent {
+    UINT in_w, in_h, out_w, out_h;
+    enum WMTPixelFormat cpf, opf, mpf;
+    obj_handle_t scaler, depth_tex, out_tex;
+};
+#define MAD_MFX_MAX 4   /* scalers are never released (each resolution keeps its history textures) */
+static struct mad_mfx_ent g_mfx[MAD_MFX_MAX];
+static unsigned g_nmfx;
+static SRWLOCK g_mfx_lock = SRWLOCK_INIT;
+static LONG g_mfx_runs;
+static int mad_ds_scratch_ensure(struct mad_device *dev, UINT64 img) {
+    int ok;
+    EnterCriticalSection(&dev->heap_lock);
+    if (dev->ds_scratch_size < img) {
+        struct WMTBufferInfo bi; UINT64 sz = img < (4u << 20) ? (4u << 20) : (img + 0xffff) & ~(UINT64)0xffff;
+        if (dev->ds_scratch) NSObject_release(dev->ds_scratch);   /* an in-flight command buffer keeps its own reference */
+        memset(&bi, 0, sizeof bi); bi.length = sz; bi.options = WMTResourceStorageModePrivate;
+        dev->ds_scratch = MTLDevice_newBuffer(dev->mtl_device, &bi);
+        dev->ds_scratch_size = dev->ds_scratch ? sz : 0;
+    }
+    ok = dev->ds_scratch != 0;
+    LeaveCriticalSection(&dev->heap_lock);
+    return ok;
+}
+static void exec_mfx(struct mad_exec *e, const struct mad_cmd *c) {
+    struct mad_device *dev = e->q->device;
+    const struct mad_mfx_ent *m = c->u.mfx.ent;
+    struct mad_resource *dr = c->u.mfx.depth, *orr = c->u.mfx.out;
+    struct WMTFXTemporalScalerProps p;
+    obj_handle_t fence = 0;
+    UINT dw, dh;
+    if (!m || !m->scaler || !dr || !dr->texture || !orr || !orr->texture || !c->u.mfx.cview || !c->u.mfx.mview) { MAD_SKIP(e); return; }
+    exec_end(e);
+    while (e->npend) exec_flush_clear(e, 0);
+    e->wr_all = 1;
+    dw = dr->width < m->in_w ? dr->width : m->in_w;
+    dh = dr->height < m->in_h ? dr->height : m->in_h;
+    /* 1. the depth plane into the scaler's Depth32Float texture: the sync point */
+    e->f6_sync_needed = 1; e->fence_needed = 1;
+    if (dr->tex_pf == WMTPixelFormatDepth32Float) {
+        struct wmtcmd_blit_copy_from_texture_to_texture k;
+        if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
+        memset(&k, 0, sizeof k);
+        k.type = WMTBlitCommandCopyFromTextureToTexture;
+        k.src = dr->texture;
+        k.src_size.width = dw; k.src_size.height = dh; k.src_size.depth = 1;
+        k.dst = m->depth_tex;
+        MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
+        exec_end(e);
+    } else {
+        UINT64 row = (UINT64)dw * 4, img = row * dh;
+        struct wmtcmd_blit_copy_from_texture_to_buffer k1; struct wmtcmd_blit_copy_from_buffer_to_texture k2;
+        if (!mad_ds_scratch_ensure(dev, img)) { MAD_SKIP(e); return; }
+        if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
+        memset(&k1, 0, sizeof k1);
+        k1.type = WMTBlitCommandCopyFromTextureToBuffer;
+        k1.src = dr->texture;
+        k1.size.width = dw; k1.size.height = dh; k1.size.depth = 1;
+        k1.dst = dev->ds_scratch; k1.bytes_per_row = (UINT32)row; k1.bytes_per_image = (UINT32)img;
+        k1.options = 1;   /* MTLBlitOptionDepthFromDepthStencil */
+        MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k1);
+        exec_end(e);
+        if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
+        memset(&k2, 0, sizeof k2);
+        k2.type = WMTBlitCommandCopyFromBufferToTexture;
+        k2.src = dev->ds_scratch; k2.bytes_per_row = (UINT32)row; k2.bytes_per_image = (UINT32)img;
+        k2.size.width = dw; k2.size.height = dh; k2.size.depth = 1;
+        k2.dst = m->depth_tex;
+        MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k2);
+        exec_end(e);
+    }
+    /* 2. the scaler: it waits for the copy's fence and updates it */
+    if (e->mode == 6) { if (e->q->f6_npend) fence = f6_fence(e->q, e->q->f6_pend[e->q->f6_npend - 1].idx); }
+    else if (e->mode) fence = mad_enc_fence_obj(dev);
+    memset(&p, 0, sizeof p);
+    p.input_content_width = c->u.mfx.rw; p.input_content_height = c->u.mfx.rh;
+    p.reset = c->u.mfx.reset != 0; p.depth_reversed = c->u.mfx.rev != 0;
+    p.motion_vector_scale_x = c->u.mfx.mx; p.motion_vector_scale_y = c->u.mfx.my;
+    p.jitter_offset_x = c->u.mfx.jx; p.jitter_offset_y = c->u.mfx.jy;
+    p.pre_exposure = c->u.mfx.pre;
+    MTLCommandBuffer_encodeTemporalScale(e->cb, m->scaler, c->u.mfx.cview, m->out_tex, m->depth_tex, c->u.mfx.mview, 0, fence, &p);
+    /* 3. into the application's output texture */
+    e->f6_sync_needed = 1; e->fence_needed = 1;
+    if (exec_begin_blit(e)) {
+        struct wmtcmd_blit_copy_from_texture_to_texture k;
+        memset(&k, 0, sizeof k);
+        k.type = WMTBlitCommandCopyFromTextureToTexture;
+        k.src = m->out_tex;
+        k.src_size.width = c->u.mfx.ow; k.src_size.height = c->u.mfx.oh; k.src_size.depth = 1;
+        k.dst = orr->texture;
+        MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
+        exec_end(e);
+    }
+    e->f6_sync_needed = 1; e->fence_needed = 1;
+    InterlockedIncrement(&g_mfx_runs);
 }
 
 /* One slot of root values for this draw, from the list's shared chunks. */
@@ -5810,6 +5933,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX: exec_copy(&e, c); break;
         case MC_BLEND_FACTOR: memcpy(e.blend, c->u.blend.rgba, sizeof e.blend); e.has_blend = 1; break;
         case MC_DISPATCH: exec_dispatch(&e, c); break;
+        case MC_MFX: exec_mfx(&e, c); break;   /* ml1314 */
         case MC_RESOLVE: exec_resolve(&e, c); break;
         }
     }
@@ -8316,7 +8440,7 @@ static struct mad_resource *mad_resolve_address_locked(struct mad_device *d, UIN
 
 static HRESULT STDMETHODCALLTYPE res_QI(ID3D12Resource *This, REFIID riid, void **out) {
     /* ml886: ID3D12Resource1/2 are the same object with more slots. */
-    if (out && riid && (IsEqualGUID(riid, &IID_ID3D12Resource1) || IsEqualGUID(riid, &IID_ID3D12Resource2))) {
+    if (out && riid && (IsEqualGUID(riid, &IID_ID3D12Resource1) || IsEqualGUID(riid, &IID_ID3D12Resource2) || IsEqualGUID(riid, &IID_MadeiraSelf))) {   /* ml1314 */
         InterlockedIncrement(&((struct mad_obj *)This)->refs);
         *out = This;
         return S_OK;
@@ -13426,6 +13550,7 @@ __declspec(dllexport) void MadeiraD3D12GetQueueStats(ID3D12CommandQueue *queue,
     if (rejected) *rejected = q->rejected;
 }
 
+static void mad_ffx_hook_init(void);
 __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
         D3D_FEATURE_LEVEL min_feature_level, REFIID riid, void **device) {
     build_vtables();
@@ -13443,6 +13568,7 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
     if (!d) return E_OUTOFMEMORY;
     d->vtbl = &g_device_vtbl; d->refs = 1; d->iid = &IID_ID3D12Device; d->name = "Device";
     g_last_device = d;
+    mad_ffx_hook_init();   /* ml1314 */
     {   /* the adapter's LUID, for GetAdapterLuid */
         IDXGIAdapter *a = NULL;
         if (adapter && SUCCEEDED(IUnknown_QueryInterface(adapter, &IID_IDXGIAdapter, (void **)&a)) && a) {
@@ -14975,3 +15101,477 @@ HRESULT WINAPI D3D12CoreCreateLayeredDevice(const void *a, DWORD b, const void *
 }
 SIZE_T WINAPI D3D12CoreGetLayeredDeviceSize(const void *a, DWORD b) { (void)a; (void)b; return 0; }
 HRESULT WINAPI D3D12CoreRegisterLayers(const void *a, DWORD b) { (void)a; (void)b; return E_NOTIMPL; }
+
+/* ml1314: FSR -> METALFX TEMPORAL, the recording half (exec_mfx replays it).
+ *
+ * Games that ship AMD FidelityFX FSR 3.1 call it through five exports of
+ * amd_fidelityfx_dx12.dll (the FFX API: ffxCreateContext, ffxDestroyContext,
+ * ffxConfigure, ffxQuery, ffxDispatch). With madeira.cfg ffx-metalfx = 1 those
+ * exports are redirected here when the DLL loads (mad_ffx_hook_init): an
+ * UPSCALE context becomes ours and each upscale dispatch is recorded into the
+ * game's command list as one MC_MFX; every other context (frame generation,
+ * its swap chain) and every other call goes on to AMD's code unchanged. If
+ * MetalFX cannot take a dispatch (formats, sizes, a command list that is not
+ * ours), the context falls back to a real FSR context for good and the log
+ * says why. madeira.cfg ffx-metalfx-flip (bits) negates jitter x (1) / y (2),
+ * motion vectors x (4) / y (8), or inverts the depth direction (16), for an
+ * engine whose conventions differ from FSR's documented ones. */
+static int g_ffx_metalfx = -1, g_ffx_flip;
+static int g_mfx_supported = -1;
+
+static struct mad_list *mad_self_list(void *p) {
+    void *q = NULL;
+    if (!p) return NULL;
+    if (((struct mad_list *)p)->vtbl == &g_list_vtbl) return p;
+    if (SUCCEEDED(IUnknown_QueryInterface((IUnknown *)p, &IID_MadeiraSelf, &q)) && q) {
+        IUnknown_Release((IUnknown *)q);
+        if (((struct mad_list *)q)->vtbl == &g_list_vtbl) return q;
+    }
+    return NULL;
+}
+static struct mad_resource *mad_self_res(void *p) {
+    void *q = NULL;
+    if (!p) return NULL;
+    if (((struct mad_resource *)p)->vtbl == &g_res_vtbl) return p;
+    if (SUCCEEDED(IUnknown_QueryInterface((IUnknown *)p, &IID_MadeiraSelf, &q)) && q) {
+        IUnknown_Release((IUnknown *)q);
+        if (((struct mad_resource *)q)->vtbl == &g_res_vtbl) return q;
+    }
+    return NULL;
+}
+/* A 2D, single-level view of r (owned by r, released with it), or r itself. */
+static obj_handle_t mad_tex2d(struct mad_device *d, struct mad_resource *r) {
+    UINT64 id; unsigned k; obj_handle_t t = 0;
+    if (!r->texture) return 0;
+    if (r->tex_type == WMTTextureType2D && r->tex_mips <= 1) return r->texture;
+    id = mad_texture_view_id(d, r, WMTTextureType2D, 0, 1, 0, 1, r->tex_pf, 0);
+    if (!id || id == r->gpu_resource_id) return 0;
+    EnterCriticalSection(&d->view_lock);
+    for (k = 0; k < r->nxview; k++) if (r->xview[k].id == id) { t = r->xview[k].tex; break; }
+    LeaveCriticalSection(&d->view_lock);
+    return t;
+}
+
+struct mad_tscale_in {
+    void *color, *depth, *mv, *out;   /* ID3D12Resource */
+    UINT rw, rh, ow, oh;              /* rendered size (read from the inputs), upscaled size (written to out) */
+    float jx, jy, mx, my, pre;        /* jitter in pixels, motion vector scale, pre-exposure */
+    int reset, rev;                   /* history reset; reversed depth */
+};
+static HRESULT mad_tscale_record(void *list, const struct mad_tscale_in *t, char *why, size_t nwhy) {
+    struct mad_list *l = mad_self_list(list);
+    struct mad_resource *cr, *dr, *mr, *orr;
+    struct mad_device *d;
+    struct mad_mfx_ent *ent = NULL;
+    struct mad_cmd *c;
+    enum WMTPixelFormat mpf;
+    obj_handle_t cview, mview;
+    UINT in_w, in_h, ow, oh, k;
+    static LONG said;
+#define MAD_TS_FAIL(...) do { snprintf(why, nwhy, __VA_ARGS__); return E_FAIL; } while (0)
+    if (!l) MAD_TS_FAIL("the command list %p is not one of Madeira's", list);
+    if (l->closed) MAD_TS_FAIL("the command list is closed");
+    d = l->device;
+    if (!d || !d->mtl_device) MAD_TS_FAIL("the command list has no device");
+    cr = mad_self_res(t->color); dr = mad_self_res(t->depth); mr = mad_self_res(t->mv); orr = mad_self_res(t->out);
+    if (!cr || !dr || !mr || !orr)
+        MAD_TS_FAIL("an input is missing or not Madeira's (color %p, depth %p, motion %p, output %p)", t->color, t->depth, t->mv, t->out);
+    if (!cr->texture || !dr->texture || !mr->texture || !orr->texture) MAD_TS_FAIL("an input is not a texture");
+    if (cr->samples > 1 || dr->samples > 1 || mr->samples > 1 || orr->samples > 1 ||
+        cr->tex_type == WMTTextureType3D || mr->tex_type == WMTTextureType3D || orr->tex_type == WMTTextureType3D)
+        MAD_TS_FAIL("a multisampled or 3D input");
+    if (cr->tex_pf != WMTPixelFormatRGBA16Float) MAD_TS_FAIL("color is Metal format %u, not RGBA16Float", (unsigned)cr->tex_pf);
+    if (orr->tex_pf != WMTPixelFormatRGBA16Float) MAD_TS_FAIL("the output is Metal format %u, not RGBA16Float", (unsigned)orr->tex_pf);
+    if (dr->tex_pf != WMTPixelFormatDepth32Float && dr->tex_pf != WMTPixelFormatDepth32Float_Stencil8)
+        MAD_TS_FAIL("depth is Metal format %u", (unsigned)dr->tex_pf);
+    switch (mr->tex_pf) {
+    case WMTPixelFormatRG16Float: case WMTPixelFormatRG32Float: case WMTPixelFormatRGBA16Float: mpf = mr->tex_pf; break;
+    default: MAD_TS_FAIL("motion vectors are Metal format %u", (unsigned)mr->tex_pf);
+    }
+    ow = t->ow ? t->ow : orr->width; oh = t->oh ? t->oh : orr->height;
+    if (ow > orr->width || oh > orr->height) MAD_TS_FAIL("upscale size %ux%u exceeds the output texture (%ux%u)", ow, oh, orr->width, orr->height);
+    in_w = cr->width < mr->width ? cr->width : mr->width; in_h = cr->height < mr->height ? cr->height : mr->height;
+    if (in_w > ow) in_w = ow;
+    if (in_h > oh) in_h = oh;
+    if (!t->rw || !t->rh || t->rw > in_w || t->rh > in_h)
+        MAD_TS_FAIL("render size %ux%u is outside the inputs (%ux%u color, %ux%u motion) or the output (%ux%u)",
+                    t->rw, t->rh, cr->width, cr->height, mr->width, mr->height, ow, oh);
+    if (ow > 3 * t->rw || oh > 3 * t->rh) MAD_TS_FAIL("upscale ratio above 3 (%ux%u -> %ux%u)", t->rw, t->rh, ow, oh);
+    if (g_mfx_supported < 0) g_mfx_supported = MTLDevice_supportsFXTemporalScaler(d->mtl_device) ? 1 : 0;
+    if (!g_mfx_supported) MAD_TS_FAIL("this GPU has no MetalFX temporal scaler");
+    AcquireSRWLockExclusive(&g_mfx_lock);
+    for (k = 0; k < g_nmfx; k++) {
+        struct mad_mfx_ent *x = &g_mfx[k];
+        if (x->in_w == in_w && x->in_h == in_h && x->out_w == ow && x->out_h == oh && x->cpf == cr->tex_pf && x->opf == orr->tex_pf && x->mpf == mpf) { ent = x; break; }
+    }
+    if (!ent && g_nmfx < MAD_MFX_MAX) {
+        struct mad_mfx_ent n; struct WMTFXTemporalScalerInfo si; struct WMTTextureInfo ti;
+        LONG64 t0 = mad_qpc();
+        memset(&n, 0, sizeof n);
+        n.in_w = in_w; n.in_h = in_h; n.out_w = ow; n.out_h = oh; n.cpf = cr->tex_pf; n.opf = orr->tex_pf; n.mpf = mpf;
+        memset(&ti, 0, sizeof ti);
+        ti.pixel_format = WMTPixelFormatDepth32Float; ti.width = in_w; ti.height = in_h; ti.depth = 1; ti.array_length = 1;
+        ti.type = WMTTextureType2D; ti.mipmap_level_count = 1; ti.sample_count = 1;
+        ti.usage = (enum WMTTextureUsage)(WMTTextureUsageShaderRead | WMTTextureUsageRenderTarget);
+        ti.options = WMTResourceStorageModePrivate;
+        n.depth_tex = MTLDevice_newTexture(d->mtl_device, &ti);
+        memset(&ti, 0, sizeof ti);
+        ti.pixel_format = n.opf; ti.width = ow; ti.height = oh; ti.depth = 1; ti.array_length = 1;
+        ti.type = WMTTextureType2D; ti.mipmap_level_count = 1; ti.sample_count = 1;
+        ti.usage = (enum WMTTextureUsage)(WMTTextureUsageRenderTarget | WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite);
+        ti.options = WMTResourceStorageModePrivate;
+        n.out_tex = MTLDevice_newTexture(d->mtl_device, &ti);
+        memset(&si, 0, sizeof si);
+        si.color_format = n.cpf; si.output_format = n.opf; si.depth_format = WMTPixelFormatDepth32Float; si.motion_format = n.mpf;
+        si.input_width = in_w; si.input_height = in_h; si.output_width = ow; si.output_height = oh;
+        si.input_content_min_scale = 1.0f; si.input_content_max_scale = 3.0f;
+        si.auto_exposure = 1; si.input_content_properties_enabled = 1; si.requires_synchronous_initialization = 1;
+        if (n.depth_tex && n.out_tex) n.scaler = MTLDevice_newTemporalScaler(d->mtl_device, &si);
+        if (n.scaler) {
+            LARGE_INTEGER fq;
+            QueryPerformanceFrequency(&fq);
+            mad_resident(d, n.depth_tex); mad_resident(d, n.out_tex);
+            g_mfx[g_nmfx] = n; ent = &g_mfx[g_nmfx++];
+            d3d12_log("[madeira-d3d12] ml1314 MetalFX temporal scaler #%u: %ux%u -> %ux%u, color %u, motion %u, made in %.0f ms\n",
+                      g_nmfx, in_w, in_h, ow, oh, (unsigned)n.cpf, (unsigned)n.mpf,
+                      (double)(mad_qpc() - t0) * 1000.0 / (double)(fq.QuadPart ? fq.QuadPart : 1));
+        } else {
+            if (n.depth_tex) NSObject_release(n.depth_tex);
+            if (n.out_tex) NSObject_release(n.out_tex);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_mfx_lock);
+    if (!ent) MAD_TS_FAIL("no MetalFX temporal scaler for %ux%u -> %ux%u (%u made, at most %u)", in_w, in_h, ow, oh, g_nmfx, MAD_MFX_MAX);
+    cview = mad_tex2d(cr->owner ? cr->owner : d, cr);
+    mview = mad_tex2d(mr->owner ? mr->owner : d, mr);
+    if (!cview || !mview) MAD_TS_FAIL("no 2D view of the color (%p) or motion (%p) texture", (void *)cview, (void *)mview);
+    c = mad_list_push(l, MC_MFX);
+    if (!c) MAD_TS_FAIL("the command could not be recorded");
+    c->u.mfx.ent = ent; c->u.mfx.color = cr; c->u.mfx.depth = dr; c->u.mfx.mv = mr; c->u.mfx.out = orr;
+    c->u.mfx.cview = cview; c->u.mfx.mview = mview;
+    c->u.mfx.rw = t->rw; c->u.mfx.rh = t->rh; c->u.mfx.ow = ow; c->u.mfx.oh = oh;
+    c->u.mfx.jx = t->jx; c->u.mfx.jy = t->jy; c->u.mfx.mx = t->mx; c->u.mfx.my = t->my; c->u.mfx.pre = t->pre;
+    c->u.mfx.reset = (UINT8)(t->reset != 0); c->u.mfx.rev = (UINT8)(t->rev != 0);
+    k = (UINT)InterlockedIncrement(&said);
+    if (k <= 4 || !(k % 3600))
+        d3d12_log("[madeira-d3d12] ml1314 MetalFX upscale #%u: %ux%u (textures %ux%u, depth %ux%u fmt %u) -> %ux%u, jitter %.3f,%.3f, motion scale %.1f,%.1f, "
+                  "pre-exposure %.3f, depth %s%s; %ld run on the GPU so far\n",
+                  k, t->rw, t->rh, cr->width, cr->height, dr->width, dr->height, (unsigned)dr->tex_pf, ow, oh, t->jx, t->jy, t->mx, t->my,
+                  t->pre, t->rev ? "reversed" : "forward", t->reset ? ", reset" : "", (long)g_mfx_runs);
+    return S_OK;
+#undef MAD_TS_FAIL
+}
+
+/* The FidelityFX side: contexts, the five redirected exports, the hook. */
+#define MAD_FFX_DESC_BACKEND_DX12 0x0000002u   /* FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12 (ffx_api_dx12.h) */
+struct mad_ffx_backend_dx12 { ffxCreateContextDescHeader header; void *device; };
+struct mad_ffx_ctx {
+    struct ffxCreateContextDescUpscale desc;   /* as created, for a fallback FSR context */
+    void *device; int have_backend;
+    UINT64 version_id; int have_version;
+    ffxContext amd;          /* AMD's own upscale context once this one fell back */
+    int fallback, reset_next;
+    UINT64 frames;
+};
+#define MAD_FFX_LIVE 16
+static struct mad_ffx_ctx *g_ffx_live[MAD_FFX_LIVE];
+static SRWLOCK g_ffx_live_lock = SRWLOCK_INIT;
+static PfnFfxCreateContext o_ffx_create;
+static PfnFfxDestroyContext o_ffx_destroy;
+static PfnFfxConfigure o_ffx_configure;
+static PfnFfxQuery o_ffx_query;
+static PfnFfxDispatch o_ffx_dispatch;
+
+/* Only a pointer found in the live table is ever dereferenced as ours. */
+static struct mad_ffx_ctx *mad_ffx_ours(ffxContext *pc) {
+    struct mad_ffx_ctx *m;
+    unsigned i;
+    if (!pc || !*pc) return NULL;
+    m = (struct mad_ffx_ctx *)*pc;
+    AcquireSRWLockShared(&g_ffx_live_lock);
+    for (i = 0; i < MAD_FFX_LIVE; i++) if (g_ffx_live[i] == m) break;
+    ReleaseSRWLockShared(&g_ffx_live_lock);
+    return i < MAD_FFX_LIVE ? m : NULL;
+}
+/* The FSR context this one stands for, made from the creation description. */
+static ffxReturnCode_t mad_ffx_amd(struct mad_ffx_ctx *m) {
+    struct ffxCreateContextDescUpscale up = m->desc;
+    struct mad_ffx_backend_dx12 be;
+    struct ffxOverrideVersion ov;
+    ffxApiHeader **tail = &up.header.pNext;
+    ffxReturnCode_t rc;
+    if (m->amd) return FFX_API_RETURN_OK;
+    if (!o_ffx_create) return FFX_API_RETURN_NO_PROVIDER;
+    memset(&be, 0, sizeof be); memset(&ov, 0, sizeof ov);
+    up.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE; up.header.pNext = NULL;
+    if (m->have_backend) { be.header.type = MAD_FFX_DESC_BACKEND_DX12; be.device = m->device; *tail = &be.header; tail = &be.header.pNext; }
+    if (m->have_version) { ov.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION; ov.versionId = m->version_id; *tail = &ov.header; }
+    rc = o_ffx_create(&m->amd, &up.header, NULL);
+    d3d12_log("[madeira-d3d12] ml1314 FSR upscale context made for the fallback: %u (%p)\n", (unsigned)rc, m->amd);
+    return rc;
+}
+static ffxReturnCode_t mad_ffx_create(ffxContext *pc, ffxCreateContextDescHeader *desc, const ffxAllocationCallbacks *cb) {
+    if (pc && desc && desc->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE) {
+        const struct ffxCreateContextDescUpscale *u = (const struct ffxCreateContextDescUpscale *)desc;
+        struct mad_ffx_ctx *m = calloc(1, sizeof *m);
+        const ffxApiHeader *h;
+        unsigned i;
+        if (!m) return FFX_API_RETURN_ERROR_MEMORY;
+        m->desc = *u; m->desc.header.pNext = NULL; m->reset_next = 1;
+        for (h = desc->pNext; h; h = h->pNext) {
+            if (h->type == MAD_FFX_DESC_BACKEND_DX12) { m->device = ((const struct mad_ffx_backend_dx12 *)h)->device; m->have_backend = 1; }
+            else if (h->type == FFX_API_DESC_TYPE_OVERRIDE_VERSION) { m->version_id = ((const struct ffxOverrideVersion *)h)->versionId; m->have_version = 1; }
+            else d3d12_log("[madeira-d3d12] ml1314 FSR upscale context: chained description %#llx not kept\n", (unsigned long long)h->type);
+        }
+        if (u->flags & FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) {   /* MetalFX takes render-resolution motion only */
+            ffxReturnCode_t rc = mad_ffx_amd(m);
+            if (rc != FFX_API_RETURN_OK) { free(m); return rc; }
+            m->fallback = 1;
+            d3d12_log("[madeira-d3d12] ml1314 display-resolution motion vectors: this context stays FSR's\n");
+        }
+        AcquireSRWLockExclusive(&g_ffx_live_lock);
+        for (i = 0; i < MAD_FFX_LIVE && g_ffx_live[i]; i++) ;
+        if (i < MAD_FFX_LIVE) g_ffx_live[i] = m;
+        ReleaseSRWLockExclusive(&g_ffx_live_lock);
+        if (i == MAD_FFX_LIVE) {
+            if (m->amd && o_ffx_destroy) o_ffx_destroy(&m->amd, NULL);
+            free(m);
+            return o_ffx_create ? o_ffx_create(pc, desc, cb) : FFX_API_RETURN_NO_PROVIDER;
+        }
+        *pc = (ffxContext)m;
+        d3d12_log("[madeira-d3d12] ml1314 FSR upscale context %p -> MetalFX: flags %#x, max render %ux%u, max upscale %ux%u%s\n",
+                  (void *)m, u->flags, u->maxRenderSize.width, u->maxRenderSize.height, u->maxUpscaleSize.width, u->maxUpscaleSize.height,
+                  m->fallback ? " (FSR keeps it)" : "");
+        return FFX_API_RETURN_OK;
+    }
+    return o_ffx_create ? o_ffx_create(pc, desc, cb) : FFX_API_RETURN_NO_PROVIDER;
+}
+static ffxReturnCode_t mad_ffx_destroy(ffxContext *pc, const ffxAllocationCallbacks *cb) {
+    struct mad_ffx_ctx *m = mad_ffx_ours(pc);
+    unsigned i;
+    if (!m) return o_ffx_destroy ? o_ffx_destroy(pc, cb) : FFX_API_RETURN_NO_PROVIDER;
+    AcquireSRWLockExclusive(&g_ffx_live_lock);
+    for (i = 0; i < MAD_FFX_LIVE; i++) if (g_ffx_live[i] == m) g_ffx_live[i] = NULL;
+    ReleaseSRWLockExclusive(&g_ffx_live_lock);
+    if (m->amd && o_ffx_destroy) o_ffx_destroy(&m->amd, NULL);
+    d3d12_log("[madeira-d3d12] ml1314 FSR upscale context %p destroyed after %llu MetalFX frames\n", (void *)m, (unsigned long long)m->frames);
+    free(m);
+    *pc = NULL;
+    return FFX_API_RETURN_OK;
+}
+static ffxReturnCode_t mad_ffx_configure(ffxContext *pc, const ffxConfigureDescHeader *desc) {
+    struct mad_ffx_ctx *m = mad_ffx_ours(pc);
+    if (!m) return o_ffx_configure ? o_ffx_configure(pc, desc) : FFX_API_RETURN_NO_PROVIDER;
+    if (m->fallback) return o_ffx_configure(&m->amd, desc);
+    if (!desc) return FFX_API_RETURN_ERROR_PARAMETER;
+    if (desc->type == FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE || desc->type == FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1)
+        return FFX_API_RETURN_OK;   /* FSR tuning keys: nothing in MetalFX to tune */
+    return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
+}
+static float mad_ffx_ratio(uint32_t q) {
+    switch (q) {
+    case FFX_UPSCALE_QUALITY_MODE_NATIVEAA: return 1.0f;
+    case FFX_UPSCALE_QUALITY_MODE_QUALITY: return 1.5f;
+    case FFX_UPSCALE_QUALITY_MODE_BALANCED: return 1.7f;
+    case FFX_UPSCALE_QUALITY_MODE_PERFORMANCE: return 2.0f;
+    case FFX_UPSCALE_QUALITY_MODE_ULTRA_PERFORMANCE: return 3.0f;
+    default: return 0.0f;
+    }
+}
+static float mad_ffx_halton(int32_t index, int32_t base) {   /* as FSR's own jitter sequence */
+    float f = 1.0f, r = 0.0f;
+    int32_t i = index;
+    while (i > 0) { f /= (float)base; r += f * (float)(i % base); i = (int32_t)floorf((float)i / (float)base); }
+    return r;
+}
+static ffxReturnCode_t mad_ffx_query(ffxContext *pc, ffxQueryDescHeader *desc) {
+    struct mad_ffx_ctx *m = mad_ffx_ours(pc);
+    if (!m) return o_ffx_query ? o_ffx_query(pc, desc) : FFX_API_RETURN_NO_PROVIDER;
+    if (m->fallback) return o_ffx_query(&m->amd, desc);
+    if (!desc) return FFX_API_RETURN_ERROR_PARAMETER;
+    switch (desc->type) {
+    case FFX_API_QUERY_DESC_TYPE_UPSCALE_GETUPSCALERATIOFROMQUALITYMODE: {
+        struct ffxQueryDescUpscaleGetUpscaleRatioFromQualityMode *q = (void *)desc;
+        float r = mad_ffx_ratio(q->qualityMode);
+        if (!r) return FFX_API_RETURN_ERROR_PARAMETER;
+        if (q->pOutUpscaleRatio) *q->pOutUpscaleRatio = r;
+        return FFX_API_RETURN_OK;
+    }
+    case FFX_API_QUERY_DESC_TYPE_UPSCALE_GETRENDERRESOLUTIONFROMQUALITYMODE: {
+        struct ffxQueryDescUpscaleGetRenderResolutionFromQualityMode *q = (void *)desc;
+        float r = mad_ffx_ratio(q->qualityMode);
+        if (!r) return FFX_API_RETURN_ERROR_PARAMETER;
+        if (q->pOutRenderWidth) *q->pOutRenderWidth = (uint32_t)((float)q->displayWidth / r);
+        if (q->pOutRenderHeight) *q->pOutRenderHeight = (uint32_t)((float)q->displayHeight / r);
+        return FFX_API_RETURN_OK;
+    }
+    case FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT: {
+        struct ffxQueryDescUpscaleGetJitterPhaseCount *q = (void *)desc;
+        if (!q->renderWidth) return FFX_API_RETURN_ERROR_PARAMETER;
+        if (q->pOutPhaseCount) *q->pOutPhaseCount = (int32_t)(8.0f * powf((float)q->displayWidth / (float)q->renderWidth, 2.0f));
+        return FFX_API_RETURN_OK;
+    }
+    case FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET: {
+        struct ffxQueryDescUpscaleGetJitterOffset *q = (void *)desc;
+        int32_t i;
+        if (q->phaseCount <= 0) return FFX_API_RETURN_ERROR_PARAMETER;
+        i = (q->index % q->phaseCount) + 1;
+        if (q->pOutX) *q->pOutX = mad_ffx_halton(i, 2) - 0.5f;
+        if (q->pOutY) *q->pOutY = mad_ffx_halton(i, 3) - 0.5f;
+        return FFX_API_RETURN_OK;
+    }
+    case FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE: {
+        struct ffxQueryDescUpscaleGetGPUMemoryUsage *q = (void *)desc;
+        if (q->gpuMemoryUsageUpscaler) memset(q->gpuMemoryUsageUpscaler, 0, sizeof *q->gpuMemoryUsageUpscaler);
+        return FFX_API_RETURN_OK;
+    }
+    case FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION: {
+        struct ffxQueryGetProviderVersion *q = (void *)desc;
+        q->versionId = m->have_version ? m->version_id : 0;
+        q->versionName = "MetalFX temporal (Madeira)";
+        return FFX_API_RETURN_OK;
+    }
+    default:
+        return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
+    }
+}
+static ffxReturnCode_t mad_ffx_dispatch(ffxContext *pc, const ffxDispatchDescHeader *desc) {
+    struct mad_ffx_ctx *m = mad_ffx_ours(pc);
+    if (!m) return o_ffx_dispatch ? o_ffx_dispatch(pc, desc) : FFX_API_RETURN_NO_PROVIDER;
+    if (m->fallback) return o_ffx_dispatch(&m->amd, desc);
+    if (!desc) return FFX_API_RETURN_ERROR_PARAMETER;
+    if (desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
+        const struct ffxDispatchDescUpscale *u = (const struct ffxDispatchDescUpscale *)desc;
+        struct mad_tscale_in t;
+        char why[320];
+        ffxReturnCode_t rc;
+        memset(&t, 0, sizeof t);
+        t.color = u->color.resource; t.depth = u->depth.resource; t.mv = u->motionVectors.resource; t.out = u->output.resource;
+        t.rw = u->renderSize.width; t.rh = u->renderSize.height; t.ow = u->upscaleSize.width; t.oh = u->upscaleSize.height;
+        t.jx = (g_ffx_flip & 1) ? -u->jitterOffset.x : u->jitterOffset.x;
+        t.jy = (g_ffx_flip & 2) ? -u->jitterOffset.y : u->jitterOffset.y;
+        t.mx = (g_ffx_flip & 4) ? -u->motionVectorScale.x : u->motionVectorScale.x;
+        t.my = (g_ffx_flip & 8) ? -u->motionVectorScale.y : u->motionVectorScale.y;
+        t.pre = u->preExposure > 0.0f ? u->preExposure : 1.0f;
+        t.reset = u->reset || m->reset_next;
+        t.rev = ((m->desc.flags & FFX_UPSCALE_ENABLE_DEPTH_INVERTED) != 0) ^ ((g_ffx_flip & 16) != 0);
+        why[0] = 0;
+        if (SUCCEEDED(mad_tscale_record(u->commandList, &t, why, sizeof why))) { m->reset_next = 0; m->frames++; return FFX_API_RETURN_OK; }
+        d3d12_log("[madeira-d3d12] ml1314 MetalFX cannot take this FSR dispatch (%s): FSR runs this context from now on\n", why);
+        rc = mad_ffx_amd(m);
+        if (rc != FFX_API_RETURN_OK) return rc;
+        m->fallback = 1;
+        return o_ffx_dispatch(&m->amd, desc);
+    }
+    if (desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK) return FFX_API_RETURN_OK;   /* MetalFX takes no reactive mask */
+    return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
+}
+
+/* The redirect: each of the five export-table entries is pointed at a 14-byte
+ * x64 stub (jmp [rip+0]; target) in a page next to the module, since an export
+ * is an offset from the module's base; the stub's jump lands in the function
+ * above like any x64 call into this ARM64EC DLL. Done when the DLL loads,
+ * before its loader returns to the game (the game looks the exports up after
+ * that); all five entries or none. */
+static const char *const g_ffx_names[5] = { "ffxCreateContext", "ffxDestroyContext", "ffxConfigure", "ffxQuery", "ffxDispatch" };
+static void mad_ffx_hook_module(HMODULE mod) {
+    static LONG hooked;
+    BYTE *base = (BYTE *)mod, *tramp = NULL, *lo, *hi;
+    IMAGE_DOS_HEADER *dh = (IMAGE_DOS_HEADER *)base;
+    IMAGE_NT_HEADERS64 *nt;
+    IMAGE_DATA_DIRECTORY *dd;
+    IMAGE_EXPORT_DIRECTORY *ex;
+    DWORD *funcs, *names, *slot[5] = { 0 }, i, k, old = 0, old2;
+    WORD *ords;
+    ULONG_PTR hint;
+    void *targets[5];
+    targets[0] = (void *)mad_ffx_create; targets[1] = (void *)mad_ffx_destroy; targets[2] = (void *)mad_ffx_configure;
+    targets[3] = (void *)mad_ffx_query; targets[4] = (void *)mad_ffx_dispatch;
+    if (!base || dh->e_magic != IMAGE_DOS_SIGNATURE) return;
+    nt = (IMAGE_NT_HEADERS64 *)(base + dh->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return;
+    dd = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dd->VirtualAddress || !dd->Size) return;
+    ex = (IMAGE_EXPORT_DIRECTORY *)(base + dd->VirtualAddress);
+    funcs = (DWORD *)(base + ex->AddressOfFunctions); names = (DWORD *)(base + ex->AddressOfNames); ords = (WORD *)(base + ex->AddressOfNameOrdinals);
+    for (i = 0; i < ex->NumberOfNames; i++) {
+        const char *nm = (const char *)(base + names[i]);
+        for (k = 0; k < 5; k++) if (!strcmp(nm, g_ffx_names[k]) && ords[i] < ex->NumberOfFunctions) slot[k] = &funcs[ords[i]];
+    }
+    for (k = 0; k < 5; k++) {
+        if (!slot[k]) { d3d12_log("[madeira-d3d12] ml1314 FidelityFX DLL at %p has no %s export; not bridged\n", base, g_ffx_names[k]); return; }
+        if (*slot[k] >= dd->VirtualAddress && *slot[k] < dd->VirtualAddress + dd->Size) {
+            d3d12_log("[madeira-d3d12] ml1314 FidelityFX DLL at %p forwards %s; not bridged\n", base, g_ffx_names[k]);
+            return;
+        }
+    }
+    if (InterlockedCompareExchange(&hooked, 1, 0)) {
+        d3d12_log("[madeira-d3d12] ml1314 a second FidelityFX DLL at %p; only the first is bridged\n", base);
+        return;
+    }
+    hint = ((ULONG_PTR)base + nt->OptionalHeader.SizeOfImage + 0xffff) & ~(ULONG_PTR)0xffff;
+    for (i = 0; i < 4096 && !tramp; i++, hint += 0x10000)
+        tramp = VirtualAlloc((void *)hint, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!tramp || (ULONG_PTR)tramp + 0x1000 - (ULONG_PTR)base > 0xffffffffull) {
+        d3d12_log("[madeira-d3d12] ml1314 no page within 4 GB above the FidelityFX DLL (%p); not bridged\n", (void *)tramp);
+        if (tramp) VirtualFree(tramp, 0, MEM_RELEASE);
+        return;
+    }
+    for (k = 0; k < 5; k++) {
+        BYTE *t = tramp + k * 16;
+        t[0] = 0xff; t[1] = 0x25; t[2] = t[3] = t[4] = t[5] = 0;   /* jmp qword ptr [rip+0] */
+        memcpy(t + 6, &targets[k], 8);
+    }
+    VirtualProtect(tramp, 0x1000, PAGE_EXECUTE_READ, &old2);
+    FlushInstructionCache(GetCurrentProcess(), tramp, 0x1000);
+    lo = hi = (BYTE *)slot[0];
+    for (k = 0; k < 5; k++) { if ((BYTE *)slot[k] < lo) lo = (BYTE *)slot[k]; if ((BYTE *)slot[k] + 4 > hi) hi = (BYTE *)slot[k] + 4; }
+    if (!VirtualProtect(lo, (SIZE_T)(hi - lo), PAGE_READWRITE, &old)) {
+        d3d12_log("[madeira-d3d12] ml1314 the FidelityFX export table at %p is not writable (%lu); not bridged\n", (void *)lo, GetLastError());
+        return;
+    }
+    o_ffx_create = (PfnFfxCreateContext)(void *)(base + *slot[0]);
+    o_ffx_destroy = (PfnFfxDestroyContext)(void *)(base + *slot[1]);
+    o_ffx_configure = (PfnFfxConfigure)(void *)(base + *slot[2]);
+    o_ffx_query = (PfnFfxQuery)(void *)(base + *slot[3]);
+    o_ffx_dispatch = (PfnFfxDispatch)(void *)(base + *slot[4]);
+    for (k = 0; k < 5; k++) *slot[k] = (DWORD)((ULONG_PTR)(tramp + k * 16) - (ULONG_PTR)base);
+    VirtualProtect(lo, (SIZE_T)(hi - lo), old, &old2);
+    d3d12_log("[madeira-d3d12] ml1314 FidelityFX DLL at %p: FSR upscaling now runs on MetalFX's temporal scaler (exports through %p); "
+              "frame generation and the rest stay FSR's\n", base, (void *)tramp);
+}
+struct mad_ustr { USHORT len, max; WCHAR *buf; };
+struct mad_ldr_loaded { ULONG flags; const struct mad_ustr *full, *base; void *dll_base; ULONG size; };
+static int mad_ffx_dll_name(const WCHAR *s, size_t n) {
+    static const WCHAR *const names[] = { L"amd_fidelityfx_dx12.dll", L"amd_fidelityfx_loader_dx12.dll" };
+    unsigned i;
+    for (i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (wcslen(names[i]) == n && !_wcsnicmp(s, names[i], n)) return 1;
+    return 0;
+}
+static void CALLBACK mad_ffx_ldr_notify(ULONG reason, const struct mad_ldr_loaded *d, void *ctx) {
+    (void)ctx;
+    if (reason != 1 /* LDR_DLL_NOTIFICATION_REASON_LOADED */ || !d || !d->base || !d->base->buf) return;
+    if (mad_ffx_dll_name(d->base->buf, d->base->len / sizeof(WCHAR))) mad_ffx_hook_module((HMODULE)d->dll_base);
+}
+static void mad_ffx_hook_init(void) {
+    typedef LONG (WINAPI *reg_fn)(ULONG, void *, void *, void **);
+    static LONG once;
+    reg_fn reg;
+    HMODULE m;
+    void *cookie = NULL;
+    LONG st;
+    if (InterlockedExchange(&once, 1)) return;
+    g_ffx_metalfx = mad_cfg_int_pe("ffx-metalfx", 0) ? 1 : 0;
+    g_ffx_flip = (int)mad_cfg_int_pe("ffx-metalfx-flip", 0);
+    d3d12_log("[madeira-d3d12] ml1314 ffx-metalfx = %d (%s)\n", g_ffx_metalfx,
+              g_ffx_metalfx ? "a game's FSR 3.1 upscaling runs on MetalFX's temporal scaler" : "FSR runs as the game ships it");
+    if (!g_ffx_metalfx) return;
+    if ((m = GetModuleHandleW(L"amd_fidelityfx_dx12.dll")) || (m = GetModuleHandleW(L"amd_fidelityfx_loader_dx12.dll"))) {
+        d3d12_log("[madeira-d3d12] ml1314 the FidelityFX DLL was loaded before the device; calls the game resolved already stay FSR's\n");
+        mad_ffx_hook_module(m);
+    }
+    reg = (reg_fn)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification");
+    st = reg ? reg(0, (void *)mad_ffx_ldr_notify, NULL, &cookie) : -1;
+    if (st) d3d12_log("[madeira-d3d12] ml1314 LdrRegisterDllNotification failed (%#lx): FSR is not bridged\n", (unsigned long)st);
+}
