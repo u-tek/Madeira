@@ -35,6 +35,7 @@ CC_FLAGS=(
     -include stdarg.h
     -include "$BUILD_DIR/unicode_fix.h"
     -include "$BUILD_DIR/wineserver_ios_kill.h"
+    -include "$BUILD_DIR/thread_policy_ios.h"
     -DBINDIR=\"/usr/local/bin\" -DDATADIR=\"/usr/local/share\"
     -D__WINESRC__ -DWINE_IOS=1
     -Dmain=wineserver_main
