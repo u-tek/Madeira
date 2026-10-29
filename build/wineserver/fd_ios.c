@@ -45,6 +45,35 @@ void ios_wineserver_wake(void)
     if (ios_srv_wake_sem) semaphore_signal( ios_srv_wake_sem );
 }
 
+/* ml1331: request pickup by hint. Because the loop can't learn which client
+ * pipe has data, every wake used to try a read on the request pipe of every
+ * thread of every pseudo-process (~100 with Steam and a game): ~25 us of
+ * syscalls per request, and at CS2's 24,000 requests/s that was 70% of a
+ * core and the latency every server call paid. A client now also marks its
+ * thread id here before signalling, and the loop reads only the marked
+ * threads' pipes (main_loop, ios_srv_hint_drain); the full scan still runs,
+ * at most every MADEIRA_SRV_SCAN_US (default 1000 us, the old idle tick), for
+ * everything that isn't a marked request. Ids past the bitmap force a full
+ * scan. Bits: one per tid/4 (tids are multiples of 4 and never reused here,
+ * process.c alloc_ptid), with a summary word per 64 words. */
+#define IOS_SRV_HINT_WORDS 256
+static uint64_t ios_srv_hint[IOS_SRV_HINT_WORDS];
+static uint64_t ios_srv_hint_sum[IOS_SRV_HINT_WORDS / 64];
+static int ios_srv_hint_far;
+
+void ios_wineserver_wake_tid( unsigned int tid )
+{
+    unsigned int b = tid >> 2;
+
+    if (b < IOS_SRV_HINT_WORDS * 64)
+    {
+        __atomic_fetch_or( &ios_srv_hint[b >> 6], 1ull << (b & 63), __ATOMIC_RELEASE );
+        __atomic_fetch_or( &ios_srv_hint_sum[b >> 12], 1ull << ((b >> 6) & 63), __ATOMIC_RELEASE );
+    }
+    else __atomic_store_n( &ios_srv_hint_far, 1, __ATOMIC_RELEASE );
+    ios_wineserver_wake();
+}
+
 /* __WINESRC__ must be defined via -D flag so unicode_fix.h can see it */
 
 #include <assert.h>
@@ -1232,6 +1261,72 @@ static signed char ios_fd_is_inet( int user, int fd )
     return cache_val[user];
 }
 
+/* ml1331: the consumer half of ios_wineserver_wake_tid (top of file). */
+static int ios_srv_hints_mode = -1;
+static unsigned long long ios_srv_scan_ticks;   /* full-scan interval, mach ticks */
+static unsigned long long ios_srv_ms_ticks;     /* mach ticks per ms */
+
+static int ios_srv_hints_on(void)
+{
+    if (ios_srv_hints_mode < 0)
+    {
+        const char *e = getenv( "MADEIRA_SRV_HINTS" );
+        const char *s = getenv( "MADEIRA_SRV_SCAN_US" );
+        mach_timebase_info_data_t tb;
+        long us = s ? atol( s ) : 1000;
+
+        if (us <= 0) us = 1000;
+        mach_timebase_info( &tb );
+        ios_srv_ms_ticks = 1000000ull * tb.denom / tb.numer;
+        ios_srv_scan_ticks = (unsigned long long)us * ios_srv_ms_ticks / 1000ull;
+        if (!ios_srv_scan_ticks) ios_srv_scan_ticks = 1;
+        ios_srv_hints_mode = !(e && e[0] == '0');
+        fprintf( stderr, "[srv-poll] ml1331 request pickup by hint %s, full scan every %ld us "
+                 "(MADEIRA_SRV_HINTS, MADEIRA_SRV_SCAN_US)\n", ios_srv_hints_mode ? "on" : "off", us );
+    }
+    return ios_srv_hints_mode;
+}
+
+/* Read the request of every thread marked since the last call: exactly what
+ * the full scan does for a client pipe (a synthetic POLLIN, then a
+ * non-blocking read), for the marked threads only. Returns how many. */
+static int ios_srv_hint_drain(void)
+{
+    int s, n = 0;
+
+    for (s = 0; s < IOS_SRV_HINT_WORDS / 64; s++)
+    {
+        uint64_t sum = __atomic_exchange_n( &ios_srv_hint_sum[s], 0, __ATOMIC_ACQUIRE );
+
+        while (sum)
+        {
+            int w = s * 64 + __builtin_ctzll( sum );
+            uint64_t bits = __atomic_exchange_n( &ios_srv_hint[w], 0, __ATOMIC_ACQUIRE );
+
+            sum &= sum - 1;
+            while (bits)
+            {
+                thread_id_t tid = (thread_id_t)((w * 64 + __builtin_ctzll( bits )) << 2);
+                struct thread *thread = get_thread_from_id( tid );
+                struct fd *fd;
+
+                bits &= bits - 1;
+                if (!thread) { clear_error(); continue; }
+                fd = thread->request_fd;
+                if (fd && fd->poll_index > 0 && fd->poll_index < nb_users &&
+                    poll_users[fd->poll_index] == fd && pollfd[fd->poll_index].fd >= 0 &&
+                    (pollfd[fd->poll_index].events & POLLIN))
+                {
+                    fd_poll_event( fd, POLLIN );
+                    n++;
+                }
+                release_object( thread );
+            }
+        }
+    }
+    return n;
+}
+
 void main_loop(void)
 {
     int i, ret, timeout;
@@ -1270,6 +1365,7 @@ void main_loop(void)
     {
         static int ios_iter = 0;
         static int ios_events_fired = 0;
+        int ios_full_scan = 1;           /* ml1331: this iteration scans every poll user */
         /* ml585 poll-loop census. AGGREGATE ONLY — emitted at the existing
          * 50k-iteration heartbeat, never per event, so the probe cannot
          * perturb the loop it measures (ml582 ran 2,935 iter/s; a per-event
@@ -1545,12 +1641,40 @@ void main_loop(void)
                 }
             }
 
+            /* ml1331: marked requests first; the full scan below only when due. */
+            {
+                static unsigned long long scan_last, stat_last, stat_iter, stat_hinted, stat_full;
+                unsigned long long now = mach_absolute_time();
+
+                ios_full_scan = 1;
+                stat_iter++;
+                if (ios_srv_hints_on())
+                {
+                    stat_hinted += ios_srv_hint_drain();
+                    /* 7/8: an idle loop wakes once per tick, a hair under the
+                     * interval after the last scan, and must still scan */
+                    if (!__atomic_exchange_n( &ios_srv_hint_far, 0, __ATOMIC_ACQUIRE ) &&
+                        now - scan_last < ios_srv_scan_ticks - ios_srv_scan_ticks / 8)
+                        ios_full_scan = 0;
+                }
+                if (ios_full_scan) { scan_last = now; stat_full++; }
+                if (now - stat_last >= ios_srv_ms_ticks * 10000)   /* every 10 s */
+                {
+                    if (stat_last && ios_srv_hints_mode > 0)
+                        fprintf( stderr, "[srv-poll] ml1331 last %.1f s: %llu iterations, %llu marked requests read, "
+                                 "%llu full scans over %d poll users\n",
+                                 (double)(now - stat_last) / ios_srv_ms_ticks / 1000.0,
+                                 stat_iter, stat_hinted, stat_full, nb_users );
+                    stat_last = now; stat_iter = stat_hinted = stat_full = 0;
+                }
+            }
+
             /* Check non-master fds for events.
              * Init fds (signal pipes, files): use ioctl(FIONREAD) — works for pipes/files.
              * Client fds (socketpair, request pipe): always try non-blocking read —
              * ioctl(FIONREAD) is broken for AF_UNIX sockets on iOS.
              * INET sockets: handled by the real poll() above — skip here. */
-            for (i = 1; i < nb_users; i++)
+            for (i = 1; ios_full_scan && i < nb_users; i++)
             {
                 if (pollfd[i].fd >= 0 && pollfd[i].events)
                 {

@@ -1872,10 +1872,11 @@ unsigned int server_call_unlocked( void *req_ptr )
     if ((ret = send_request( req ))) return ret;
     /* iOS-Madeira 2026-07-05: kick the in-process server loop out of its
      * tick sleep so the request is picked up in ~50us instead of waiting
-     * for the next 1ms iteration (fd_ios.c ios_srv_wake_sem). */
+     * for the next 1ms iteration (fd_ios.c ios_srv_wake_sem). ml1331: and
+     * name this thread, so the loop reads this pipe instead of all of them. */
     {
-        extern void ios_wineserver_wake(void);
-        ios_wineserver_wake();
+        extern void ios_wineserver_wake_tid( unsigned int tid );
+        ios_wineserver_wake_tid( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );
     }
     return wait_reply( req );
 }
