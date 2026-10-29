@@ -6515,14 +6515,15 @@ static void mad_ab_init(void) {
     for (t = strtok_s(v, " ,;", &ctx); t && g_ab_n < MAD_AB_MAX; t = strtok_s(NULL, " ,;", &ctx))
         for (k = 0; k < sizeof g_ab_keys / sizeof g_ab_keys[0]; k++)
             if (!strcmp(t, g_ab_keys[k].key)) { g_ab_k[g_ab_n] = (int)k; g_ab_v[g_ab_n] = *g_ab_keys[k].var ? 1 : 0; g_ab_n++; break; }
-    d3d12_log("[ab] ml1320 live A/B over %d switch(es), %d x 5 s per phase, gameplay windows only (>= 200 draws a frame)\n", g_ab_n, g_ab_windows);
+    d3d12_log("[ab] ml1320 live A/B over %d switch(es), %d x 5 s per phase, gameplay windows only (>= 200 draws a frame, >= 10 frames)\n", g_ab_n, g_ab_windows);
 }
 static void mad_ab_window(double wall, double frames, double gpu_s, double wait_s) {
     char lb[64];
     int p;
     if (g_ab_n < 0) mad_ab_init();
     if (g_ab_n <= 0) return;
-    if (g_ab_draws_pf >= 200.0 && frames > 0) {
+    /* >= 10 frames: a loading screen can draw 12,000 times in its one frame of a window */
+    if (g_ab_draws_pf >= 200.0 && frames >= 10.0) {
         p = g_ab_phase;
         g_ab_fr[p] += frames; g_ab_t[p] += wall; g_ab_gpu[p] += gpu_s; g_ab_wait[p] += wait_s; g_ab_rep[p] += g_ab_replay_pf * frames; g_ab_wins[p]++;
     }
