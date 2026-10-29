@@ -192,6 +192,11 @@ for src in $WINE_SRC/dlls/ntdll/unix/*.c; do
         thread)
             compile_one "$BUILD_DIR/thread_ios.c" "thread"
             ;;
+        socket)
+            # ml1330: upstream socket.c plus the local IOCTL_AFD_GET_EVENTS answer
+            patch -s -o "$OBJ_DIR/socket_ios.c" "$src" "$BUILD_DIR/socket-ml1330.patch"
+            compile_one "$OBJ_DIR/socket_ios.c" "socket"
+            ;;
         *)
             compile_one "$src" "$name"
             ;;

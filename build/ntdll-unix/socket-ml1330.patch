@@ -1,0 +1,94 @@
+--- a/dlls/ntdll/unix/socket.c
++++ b/dlls/ntdll/unix/socket.c
+@@ -150,6 +150,12 @@
+         return LongToHandle( (LONG)(ULONG)(value - base) );
+     return in_buffer;
+ }
++
++/* ml1330: the AFD event mask each socket handle was last given by
++ * IOCTL_AFD_EVENT_SELECT, kept per pseudo-process in server_ios.c and
++ * forgotten there when the handle is closed. -1 means not known. */
++extern void ios_sock_mask_note( HANDLE handle, int mask );
++extern int ios_sock_mask_get( HANDLE handle );
+ #else
+ #define afd_is_wow64_caller()   in_wow64_call()
+ static inline void *afd_guest_ptr( ULONG64 addr ) { return u64_to_user_ptr( addr ); }
+@@ -2136,6 +2142,9 @@
+ 
+     TRACE( "handle %p, code %#x, in_buffer %p, in_size %u, out_buffer %p, out_size %u\n",
+            handle, code, in_buffer, in_size, out_buffer, out_size );
++#ifdef WINE_IOS
++    if (code == IOCTL_AFD_WINE_MESSAGE_SELECT) ios_sock_mask_note( handle, -1 );
++#endif
+ 
+     /* many of the below internal codes return success but don't completely
+      * fill the iosb or signal completion; such sockopts are only called
+@@ -2178,6 +2187,10 @@
+ 
+             TRACE( "event %p, mask %#x\n", params->event, params->mask );
+             if (out_size) FIXME( "unexpected output size %u\n", out_size );
++#ifdef WINE_IOS
++            ios_sock_mask_note( handle, (in_size >= sizeof(*params) && !afd_is_wow64_caller())
++                                        ? params->mask : -1 );
++#endif
+ 
+             status = STATUS_BAD_DEVICE_TYPE;
+             break;
+@@ -2203,6 +2216,57 @@
+ 
+             if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, &options )))
+                 return status;
++#ifdef WINE_IOS
++            /* ml1330: WSAEnumNetworkEvents without an event to reset, on a
++             * socket whose mask watches reads only, reports FD_READ or nothing.
++             * The server sets a pending read only when the socket is readable
++             * and every recv clears it, so with no data, error or hangup on the
++             * socket right now the server's answer is "nothing" too, and the
++             * server round trip (~30 us here, ~1 us on Windows) is skipped.
++             * GameNetworkingSockets' service thread (CS2 and other games built on
++             * it) asks this of every UDP socket on every
++             * wake while it holds the library's global lock; through the
++             * server that was 23,000 requests/s, and the game's main thread
++             * waited seconds for the lock. Anything else, an event to reset
++             * among it (resetting it here could lose a wake), goes to the
++             * server. MADEIRA_AFD_FAST_EVENTS=0 turns this off. */
++            if (!reset_event)
++            {
++                static int enabled = -1;
++                static unsigned int fast, slow;
++                int mode, mask;
++
++                if ((mode = __atomic_load_n( &enabled, __ATOMIC_RELAXED )) < 0)
++                {
++                    const char *env = getenv( "MADEIRA_AFD_FAST_EVENTS" );
++                    mode = !(env && env[0] == '0');
++                    __atomic_store_n( &enabled, mode, __ATOMIC_RELAXED );
++                    dprintf( 2, "[afd-fast] ml1330 local WSAEnumNetworkEvents answers %s "
++                                "(MADEIRA_AFD_FAST_EVENTS)\n", mode ? "on" : "off" );
++                }
++                if (mode && (mask = ios_sock_mask_get( handle )) >= 0 && !(mask & ~AFD_POLL_READ))
++                {
++                    struct pollfd pfd;
++
++                    pfd.fd = fd;
++                    pfd.events = POLLIN | POLLPRI;
++                    pfd.revents = 0;
++                    if (!poll( &pfd, 1, 0 ))
++                    {
++                        unsigned int n = __atomic_add_fetch( &fast, 1, __ATOMIC_RELAXED );
++
++                        if (needs_close) close( fd );
++                        memset( params, 0, sizeof(*params) );
++                        if (!(n & (n - 1)) && n >= 1024)
++                            dprintf( 2, "[afd-fast] ml1330 %u answered locally, %u went to the server\n",
++                                     n, __atomic_load_n( &slow, __ATOMIC_RELAXED ) );
++                        file_complete_async( handle, options, event, apc, apc_user, io, STATUS_SUCCESS, 0 );
++                        return STATUS_SUCCESS;
++                    }
++                }
++                __atomic_add_fetch( &slow, 1, __ATOMIC_RELAXED );
++            }
++#endif
+             if (needs_close) close( fd );
+ 
+             SERVER_START_REQ( socket_get_events )

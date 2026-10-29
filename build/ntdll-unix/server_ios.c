@@ -3117,6 +3117,52 @@ static inline NTSTATUS get_cached_fd( HANDLE handle, int *fd, enum server_fd_typ
 }
 
 
+/* ml1330: the AFD event mask a socket handle was last given by
+ * IOCTL_AFD_EVENT_SELECT (socket.c, build/ntdll-unix/socket-ml1330.patch),
+ * so IOCTL_AFD_GET_EVENTS can tell when the server's answer can only be
+ * "nothing". Keyed by (pseudo-process, handle) like the fd cache above, since
+ * handles of different pseudo-processes collide; direct-mapped, so a
+ * collision only makes the older handle unknown again (server path). A
+ * handle's entry goes when the handle is closed (remove_fd_from_cache). */
+#define IOS_SOCK_MASK_SLOTS 1024
+static struct { void *peb; HANDLE handle; int mask; } ios_sock_masks[IOS_SOCK_MASK_SLOTS];
+static pthread_mutex_t ios_sock_mask_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void ios_sock_mask_note( HANDLE handle, int mask )
+{
+    unsigned int i = ((ULONG_PTR)handle >> 2) & (IOS_SOCK_MASK_SLOTS - 1);
+    void *peb;
+
+    /* every NtClose comes through here: skip the lock unless the slot holds this handle */
+    if (mask < 0 && __atomic_load_n( &ios_sock_masks[i].handle, __ATOMIC_RELAXED ) != handle) return;
+    peb = ios_jit_current_peb();
+    pthread_mutex_lock( &ios_sock_mask_lock );
+    if (mask >= 0)
+    {
+        ios_sock_masks[i].peb = peb;
+        ios_sock_masks[i].handle = handle;
+        ios_sock_masks[i].mask = mask;
+    }
+    else if (ios_sock_masks[i].handle == handle && ios_sock_masks[i].peb == peb)
+        ios_sock_masks[i].handle = 0;
+    pthread_mutex_unlock( &ios_sock_mask_lock );
+}
+
+int ios_sock_mask_get( HANDLE handle )
+{
+    unsigned int i = ((ULONG_PTR)handle >> 2) & (IOS_SOCK_MASK_SLOTS - 1);
+    void *peb = ios_jit_current_peb();
+    int mask = -1;
+
+    if (!handle) return -1;
+    pthread_mutex_lock( &ios_sock_mask_lock );
+    if (ios_sock_masks[i].handle == handle && ios_sock_masks[i].peb == peb)
+        mask = ios_sock_masks[i].mask;
+    pthread_mutex_unlock( &ios_sock_mask_lock );
+    return mask;
+}
+
+
 /***********************************************************************
  *           remove_fd_from_cache
  */
@@ -3125,6 +3171,7 @@ static int remove_fd_from_cache( HANDLE handle )
     unsigned int entry, idx = handle_to_index( handle, &entry );
     int fd = -1;
 
+    ios_sock_mask_note( handle, -1 );   /* ml1330 */
     if (entry < FD_CACHE_ENTRIES && fd_cache[entry])
     {
         union fd_cache_entry cache;
